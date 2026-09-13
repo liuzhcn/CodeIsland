@@ -2404,9 +2404,6 @@ private struct SessionCard: View {
                     Spacer(minLength: 8)
 
                     HStack(spacing: 4) {
-                        if let remote = session.remoteDisplayName {
-                            SessionTag("@\(remote)", color: Color(red: 0.45, green: 0.72, blue: 1.0))
-                        }
                         if !session.subagents.isEmpty {
                             SessionTag("+\(session.subagents.count) Sub", color: Color(red: 0.65, green: 0.55, blue: 0.95))
                         }
@@ -2877,7 +2874,7 @@ private struct TerminalBadge: View {
         session.terminalBadgeLabel
     }
 
-    private let remoteColor = Color(red: 0.3, green: 0.75, blue: 0.5)
+    private let remoteColor = Color(red: 0.45, green: 0.72, blue: 1.0)
 
     /// Small chip naming the multiplexer the CLI sits in (tmux, zellij), shown
     /// next to — never instead of — the terminal it runs inside. Same chip
