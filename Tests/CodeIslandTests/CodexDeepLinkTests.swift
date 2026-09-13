@@ -4,6 +4,24 @@ import XCTest
 
 @MainActor
 final class CodexDeepLinkTests: XCTestCase {
+    func testCompactSelectionSkipsStaleIdlePointers() {
+        let state = AppState()
+        var idle = SessionSnapshot()
+        idle.status = .idle
+        var working = SessionSnapshot()
+        working.status = .processing
+        state.sessions = ["idle": idle, "working": working]
+        state.activeSessionId = "idle"
+        state.rotatingSessionId = "idle"
+        XCTAssertEqual(state.compactSessionId, "working")
+        state.sessions["another"] = working
+        state.rotatingSessionId = "another"
+        XCTAssertEqual(state.compactSessionId, "another")
+        state.sessions["working"]?.status = .idle
+        state.sessions["another"]?.status = .idle
+        XCTAssertEqual(state.sessions[state.compactSessionId!]!.status, .idle)
+    }
+
     func testLocalAndRemoteUseProviderUUIDAndKeepOtherSourcesUnchanged() throws {
         let id = "00000000-0000-4000-8000-000000000001"
         var local = SessionSnapshot()

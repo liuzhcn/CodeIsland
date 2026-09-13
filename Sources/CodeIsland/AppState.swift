@@ -301,6 +301,13 @@ final class AppState {
     }
 
     var rotatingSessionId: String?
+    var compactSessionId: String? {
+        for id in [rotatingSessionId, activeSessionId].compactMap({ $0 }) {
+            if let session = sessions[id], session.status != .idle { return id }
+        }
+        return mostActiveSessionId()
+    }
+
     var rotatingSession: SessionSnapshot? {
         guard let rid = rotatingSessionId else { return nil }
         return sessions[rid]

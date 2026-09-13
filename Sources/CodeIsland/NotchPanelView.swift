@@ -444,7 +444,7 @@ private struct CompactLeftWing: View {
     @AppStorage(SettingsKey.defaultSource) private var settingsDefaultSource = SettingsDefaults.defaultSource
 
     private var displaySession: SessionSnapshot? {
-        let sid = appState.rotatingSessionId ?? appState.activeSessionId ?? appState.sessions.keys.sorted().first
+        let sid = appState.compactSessionId
         guard let sid else { return nil }
         return appState.sessions[sid]
     }
@@ -563,7 +563,7 @@ private struct CompactRightWing: View {
     }
 
     private var displaySessionId: String? {
-        appState.rotatingSessionId ?? appState.activeSessionId ?? appState.sessions.keys.sorted().first
+        appState.compactSessionId
     }
     private var projectName: String? {
         guard let sid = displaySessionId, let cwd = appState.sessions[sid]?.cwd, !cwd.isEmpty else { return nil }
@@ -668,7 +668,7 @@ private struct CompactToolStatus: View {
 
     /// Single source of truth: all fields derive from the same session.
     private var displaySessionId: String? {
-        appState.rotatingSessionId ?? appState.activeSessionId ?? appState.sessions.keys.sorted().first
+        appState.compactSessionId
     }
     private var displaySession: SessionSnapshot? {
         guard let sid = displaySessionId else { return nil }
@@ -697,8 +697,8 @@ private struct CompactToolStatus: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            // Keep the identity visible when rotation lands on an idle session.
-            if let project = projectName {
+            // Show the selected active session; idle sessions keep the original empty center.
+            if displayStatus != .idle, let project = projectName {
                 Text(project)
                     .foregroundStyle(.white.opacity(0.8))
                     .truncationMode(.tail)
