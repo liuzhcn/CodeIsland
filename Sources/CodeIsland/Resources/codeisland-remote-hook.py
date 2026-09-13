@@ -2,10 +2,12 @@
 import json
 import os
 import socket
+import sqlite3
+from pathlib import Path
 import subprocess
 import sys
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 # Per-user socket path (#193): CodeIsland injects CODEISLAND_SOCKET_PATH via the hook
 # command, but fall back to a uid-scoped path so multiple users on a shared host never
 # collide on a single /tmp/codeisland.sock.
@@ -252,6 +254,16 @@ def _get_tty():
     return None
 
 
+def _codex_title(session_id, codex_home=None):
+    home = Path(codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        with sqlite3.connect((home / "state_5.sqlite").as_uri() + "?mode=ro", uri=True, timeout=0.2) as connection:
+            row = connection.execute("SELECT name, title FROM threads WHERE id = ?", (session_id,)).fetchone()
+            return next((value.strip() for value in (row or ()) if isinstance(value, str) and value.strip()), None)
+    except (sqlite3.Error, ValueError, OSError):
+        return None
+
+
 def main():
     if "--version" in sys.argv:
         print(VERSION)
@@ -277,6 +289,11 @@ def main():
     payload["_remote_host_id"] = payload.get("_remote_host_id") or REMOTE_HOST_ID
     payload["_remote_host_name"] = payload.get("_remote_host_name") or REMOTE_HOST_NAME
     payload["_tty"] = payload.get("_tty") or _get_tty()
+
+    if SOURCE == "codex":
+        title = _codex_title(session_id)
+        if title:
+            payload["session_title"] = title
 
     if SOURCE == "claude":
         extras = _scan_claude_jsonl(session_id, cwd)
