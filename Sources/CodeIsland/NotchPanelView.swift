@@ -678,8 +678,8 @@ private struct CompactToolStatus: View {
     private var liveDesc: String? { displaySession?.toolDescription }
     private var displayStatus: AgentStatus { displaySession?.status ?? .idle }
     private var projectName: String? {
-        guard let cwd = displaySession?.cwd, !cwd.isEmpty else { return nil }
-        return (cwd as NSString).lastPathComponent
+        guard let session = displaySession else { return nil }
+        return session.sessionLabel ?? session.projectDisplayName
     }
 
     @State private var shownTool: String?
@@ -695,15 +695,14 @@ private struct CompactToolStatus: View {
         return trimmed
     }
 
-    /// Whether the current session is doing any work (not idle)
-    private var isWorking: Bool { displayStatus != .idle }
-
     var body: some View {
         HStack(spacing: 5) {
-            // Project name — shown whenever the session is not idle
-            if isWorking, let project = projectName {
+            // Keep the identity visible when rotation lands on an idle session.
+            if let project = projectName {
                 Text(project)
                     .foregroundStyle(.white.opacity(0.8))
+                    .truncationMode(.tail)
+                    .help(project)
                     .id("center-project-\(displaySessionId ?? "")")
                     .transition(.opacity)
             }
