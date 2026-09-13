@@ -29,6 +29,16 @@ final class CodexPromptTests: XCTestCase {
         XCTAssertNil(SessionTitleStore.codexProjectName(sessionId: "unassigned", state: state))
     }
 
+    func testBrowserContextPreview() {
+        let context = "<in-app-browser-context source=\"ambient-ui-state\">\nAutomatically supplied context\n</in-app-browser-context>"
+        XCTAssertEqual(ChatMessageTextFormatter.userPreview(context + "\n\n## My request:\n可以优化么？"), "可以优化么？")
+        XCTAssertEqual(ChatMessageTextFormatter.userPreview("# Files mentioned by the user:\nimage.png\n" + context + "\n## My request:\n检查图片"), "检查图片")
+        XCTAssertEqual(ChatMessageTextFormatter.userPreview(context + "\n继续处理"), "继续处理")
+        let quoted = "请解释这个标签：" + context
+        XCTAssertTrue(ChatMessageTextFormatter.userPreview(quoted).contains("<in-app-browser-context"))
+        XCTAssertEqual(ChatMessageTextFormatter.userPreview("## My request: 普通正文"), "## My request: 普通正文")
+    }
+
     func testAttachedPromptPreview() {
         XCTAssertEqual(ChatMessageTextFormatter.userPreview("\n# Files mentioned by the user:\nfile.png\n\n## My request:\n检查图片\n说明原因"), "检查图片 说明原因")
         XCTAssertEqual(ChatMessageTextFormatter.userPreview("\n正常问题\n"), "正常问题")

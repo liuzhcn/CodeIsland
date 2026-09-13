@@ -14,6 +14,14 @@ public enum ChatMessageTextFormatter {
            let request = value.range(of: "## My request:") {
             value = String(value[request.upperBound...])
         }
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("<in-app-browser-context source=\"ambient-ui-state\">"),
+           let end = value.range(of: "</in-app-browser-context>") {
+            value = String(value[end.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.hasPrefix("## My request:") {
+                value = String(value.dropFirst("## My request:".count))
+            }
+        }
         return value.split(whereSeparator: { $0.isNewline }).joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
