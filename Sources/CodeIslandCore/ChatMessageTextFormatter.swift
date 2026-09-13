@@ -8,6 +8,16 @@ public enum ChatMessageTextFormatter {
         message.isUser ? literalText(message.text) : inlineMarkdown(message.text)
     }
 
+    public static func userPreview(_ text: String) -> String {
+        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("# Files mentioned by the user:"),
+           let request = value.range(of: "## My request:") {
+            value = String(value[request.upperBound...])
+        }
+        return value.split(whereSeparator: { $0.isNewline }).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public static func literalText(_ text: String) -> AttributedString {
         AttributedString(text)
     }

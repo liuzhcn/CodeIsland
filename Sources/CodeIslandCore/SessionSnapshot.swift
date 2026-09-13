@@ -639,6 +639,14 @@ public struct SessionSnapshot: Sendable {
         }
     }
 
+    public var codexDesktopURL: URL? {
+        guard source == "codex",
+              termBundleId == "com.openai.codex" || remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true,
+              let id = providerSessionId, UUID(uuidString: id) != nil else { return nil }
+        return URL(string: "codex://threads/" + id)
+    }
+    public var canActivateSession: Bool { !isRemote || codexDesktopURL != nil }
+
     public var isCodex: Bool { source == "codex" }
     public var isClaude: Bool { source == "claude" }
 

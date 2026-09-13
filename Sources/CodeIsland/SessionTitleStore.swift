@@ -28,6 +28,24 @@ enum SessionTitleStore {
         }
     }
 
+    static func codexProjectName(sessionId: String, state: [String: Any]) -> String? {
+        let assignments = state["thread-project-assignments"] as? [String: [String: Any]]
+        guard let assignment = assignments?[sessionId], let id = assignment["projectId"] as? String else { return nil }
+        let locals = state["local-projects"] as? [String: [String: Any]]
+        let remotes = state["remote-projects"] as? [[String: Any]]
+        let name = assignment["projectKind"] as? String == "local"
+            ? locals?[id]?["name"] as? String
+            : remotes?.first(where: { $0["id"] as? String == id })?["label"] as? String
+        return trimmedTitle(name)
+    }
+
+    static func codexProjectName(sessionId: String) -> String? {
+        let url = URL(fileURLWithPath: NSHomeDirectory() + "/.codex/.codex-global-state.json")
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return codexProjectName(sessionId: sessionId, state: state)
+    }
+
     static func codexThreadName(sessionId: String) -> String? {
         let path = NSHomeDirectory() + "/.codex/session_index.jsonl"
         guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {

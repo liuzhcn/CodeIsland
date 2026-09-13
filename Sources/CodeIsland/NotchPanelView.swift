@@ -1189,7 +1189,7 @@ private struct QuestionBar: View {
     /// focus, so the affordance stays hidden rather than dead.
     private var canJumpToTerminal: Bool {
         guard let session else { return false }
-        return !session.isRemote
+        return session.canActivateSession
     }
 
     var body: some View {
@@ -2027,52 +2027,57 @@ private struct SessionIdentityLine: View {
 
     private var displaySessionId: String { session.displaySessionId(sessionId: sessionId) }
 
+    @State private var codexProject: String?
+    @State private var codexTitle: String?
+
+    private var title: String {
+        session.sessionLabel ?? codexTitle ?? (session.isCodex ? "未命名会话" : session.projectDisplayName)
+    }
+
+    private var project: String? {
+        session.isCodex ? codexProject : (session.sessionLabel == nil ? nil : session.projectDisplayName)
+    }
+
     var body: some View {
-        HStack(spacing: 4) {
-            ProjectNameLink(
-                name: session.projectDisplayName,
-                cwd: session.cwd,
-                isInteractive: !session.isRemote,
-                fontSize: projectFontSize,
-                color: projectColor
-            )
-            .layoutPriority(2)
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: projectFontSize, weight: .bold, design: .monospaced))
+                .foregroundStyle(projectColor)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(2)
+                .help("\(title)\n会话 ID：\(displaySessionId)")
+
+            if let project {
+                Text(project)
+                    .font(.system(size: sessionFontSize, weight: .medium))
+                    .foregroundStyle(.gray)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(.gray.opacity(0.12), in: RoundedRectangle(cornerRadius: 5))
+                    .frame(maxWidth: 140)
+                    .help("项目：\(project)")
+                    .layoutPriority(1)
+            }
 
             if showGitBranch, let branch = session.gitBranch {
                 HStack(spacing: 2) {
                     Image(systemName: "arrow.triangle.branch")
-                        .font(.system(size: max(sessionFontSize - 1, 8), weight: .semibold))
                     Text(session.gitIsWorktree ? "\(branch) ⧉" : branch)
-                        .font(.system(size: sessionFontSize, weight: .medium, design: .monospaced))
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
+                .font(.system(size: sessionFontSize, weight: .medium, design: .monospaced))
                 .foregroundStyle(sessionColor.opacity(0.85))
-                .layoutPriority(1)
+                .help(branch)
             }
-
-            if let sessionLabel = session.sessionLabel {
-                Text("#\(sessionLabel)")
-                    .font(.system(size: sessionFontSize, weight: .medium, design: .monospaced))
-                    .foregroundStyle(sessionColor)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .layoutPriority(1)
-
-                Text("·")
-                    .font(.system(size: sessionFontSize, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(dividerColor)
-
-                Text("#\(shortSessionId(displaySessionId))")
-                    .font(.system(size: sessionFontSize, weight: .medium, design: .monospaced))
-                    .foregroundStyle(sessionColor.opacity(0.6))
-                    .fixedSize()
-            } else {
-                Text("#\(shortSessionId(displaySessionId))")
-                    .font(.system(size: sessionFontSize, weight: .medium, design: .monospaced))
-                    .foregroundStyle(sessionColor.opacity(0.6))
-                    .fixedSize()
-            }
+        }
+        .task(id: displaySessionId) {
+            guard session.isCodex else { return }
+            codexProject = SessionTitleStore.codexProjectName(sessionId: displaySessionId)
+            codexTitle = SessionTitleStore.codexThreadName(sessionId: displaySessionId)
         }
     }
 }
@@ -2204,7 +2209,10 @@ let sessionJumpValidationDelays: [UInt64] = [120_000_000, 320_000_000, 640_000_0
 func sessionJumpSucceeded(_ session: SessionSnapshot) async -> Bool {
     await withCheckedContinuation { continuation in
         DispatchQueue.global(qos: .userInitiated).async {
-            let succeeded = TerminalVisibilityDetector.isSessionTabVisible(session)
+            let codexIsFrontmost = session.codexDesktopURL.map {
+                NSWorkspace.shared.urlForApplication(toOpen: $0) == NSWorkspace.shared.frontmostApplication?.bundleURL
+            } ?? false
+            let succeeded = codexIsFrontmost || TerminalVisibilityDetector.isSessionTabVisible(session)
                 || TerminalVisibilityDetector.isTerminalFrontmostForSession(session)
             continuation.resume(returning: succeeded)
         }
@@ -2238,7 +2246,7 @@ func startNotchCardJump(
     }
 
     // Remote sessions have no local terminal to focus
-    guard !session.isRemote else { return nil }
+    guard session.canActivateSession else { return nil }
 
     TerminalActivator.activate(session: session, sessionId: sessionId)
 
@@ -2535,6 +2543,11 @@ private struct SessionCard: View {
                     let visibleMessages = session.status != .idle
                         ? Array(session.recentMessages.suffix(2))
                         : session.recentMessages
+                    if session.isCodex, !visibleMessages.contains(where: { $0.isUser }),
+                       let prompt = session.lastUserPrompt,
+                       !ChatMessageTextFormatter.userPreview(prompt).isEmpty {
+                        ChatMessageRow(text: prompt, isUser: true, fontSize: fontSize, aiLineLimit: aiLineLimit)
+                    }
                     ForEach(visibleMessages) { msg in
                         // Extracted to separate view so SwiftUI skips re-rendering
                         // when only the parent's hover state changes (#52 perf).
@@ -2591,7 +2604,7 @@ private struct SessionCard: View {
     private func handleSessionClick() {
         TerminalActivator.activate(session: session, sessionId: sessionId)
 
-        guard autoCollapseAfterSessionJump, !session.isRemote else { return }
+        guard autoCollapseAfterSessionJump, session.canActivateSession else { return }
 
         jumpValidationTask?.cancel()
         jumpValidationTask = Task {
@@ -2628,13 +2641,7 @@ private struct SessionCard: View {
     }
 
     private func checkJumpSucceeded() async -> Bool {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let succeeded = TerminalVisibilityDetector.isSessionTabVisible(session)
-                    || TerminalVisibilityDetector.isTerminalFrontmostForSession(session)
-                continuation.resume(returning: succeeded)
-            }
-        }
+        await sessionJumpSucceeded(session)
     }
 
     @MainActor
@@ -3299,7 +3306,7 @@ private struct ChatMessageRow: View, Equatable {
                 Text(">")
                     .font(.system(size: fontSize, weight: .bold, design: .monospaced))
                     .foregroundStyle(Color(red: 0.3, green: 0.85, blue: 0.4))
-                Text(ChatMessageTextFormatter.literalText(text))
+                Text(ChatMessageTextFormatter.literalText(ChatMessageTextFormatter.userPreview(text)))
                     .font(.system(size: fontSize, weight: .medium, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.9))
                     .lineLimit(1)

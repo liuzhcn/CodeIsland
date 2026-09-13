@@ -87,6 +87,7 @@ struct TerminalActivator {
         sessionId: String? = nil,
         allowHerdr: Bool = true
     ) {
+        if let url = session.codexDesktopURL, NSWorkspace.shared.open(url) { return }
         guard !session.isRemote else { return }
         if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
             return

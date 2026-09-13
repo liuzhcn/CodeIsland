@@ -7130,8 +7130,8 @@ final class AppState {
     }
 
     /// Read model and recent messages from a Codex transcript file
-    private nonisolated static func readRecentFromCodexTranscript(path: String) -> (String?, [ChatMessage]) {
-        guard let text = readTranscriptTail(path: path) else { return (nil, []) }
+    nonisolated static func readRecentFromCodexTranscript(path: String) -> (String?, [ChatMessage]) {
+        guard let text = readTranscriptTail(path: path, maxBytes: 1048576) else { return (nil, []) }
 
         var model: String?
         var userMessages: [(Int, String)] = []
@@ -7175,8 +7175,8 @@ final class AppState {
                     for item in content {
                         let itemType = item["type"] as? String ?? ""
                         if let t = item["text"] as? String, !t.isEmpty {
-                            if role == "user" && itemType == "input_text" && userMessages.isEmpty {
-                                // Only use response_item for user messages if no event_msg was found
+                            if role == "user" && itemType == "input_text" && userMessages.last?.1 != t {
+                                // Keep the latest distinct user message from response items too.
                                 userMessages.append((index, t))
                             } else if role == "assistant" && itemType == "output_text" && assistantMessages.last?.1 != t {
                                 // Only add if not a duplicate of the last event_msg entry
@@ -7191,10 +7191,10 @@ final class AppState {
         }
 
         var combined: [(Int, ChatMessage)] = []
-        for (i, text) in userMessages.suffix(3) {
+        for (i, text) in userMessages.suffix(1) {
             combined.append((i, ChatMessage(isUser: true, text: text)))
         }
-        for (i, text) in assistantMessages.suffix(3) {
+        for (i, text) in assistantMessages.suffix(2) {
             combined.append((i, ChatMessage(isUser: false, text: text)))
         }
         combined.sort { $0.0 < $1.0 }

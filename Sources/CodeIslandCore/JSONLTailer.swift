@@ -411,7 +411,7 @@ public final class JSONLTailer: @unchecked Sendable {
         // meta rows we don't care about. Skipping the JSON parse for those saves a
         // measurable chunk of CPU per byte during streaming bursts.
         let kind = quickTypeProbe(lineBytes: lineData)
-        guard kind != .irrelevant else { return }
+        guard kind != .irrelevant || lineData.range(of: Data("response_item".utf8)) != nil else { return }
 
         guard let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { return }
         if json["isMeta"] as? Bool == true { return }
@@ -435,6 +435,15 @@ public final class JSONLTailer: @unchecked Sendable {
                     delta.lastAssistantMessage = trimmed
                 }
             }
+        case "response_item":
+            guard let payload = json["payload"] as? [String: Any],
+                  payload["type"] as? String == "message",
+                  payload["role"] as? String == "user",
+                  let content = payload["content"] as? [[String: Any]] else { return }
+            let text = content.filter { $0["type"] as? String == "input_text" }
+                .compactMap { $0["text"] as? String }.joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { delta.lastUserPrompt = text }
         case "event_msg":
             delta.hasActivity = true
             guard let payload = json["payload"] as? [String: Any],

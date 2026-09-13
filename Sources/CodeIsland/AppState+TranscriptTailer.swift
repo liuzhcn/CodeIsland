@@ -26,6 +26,8 @@ extension AppState {
         if let source = sessions[sessionId]?.source,
            source == "cursor" || source == "cursor-cli" {
             messages = Self.readRecentFromCursorTranscript(path: path).1
+        } else if sessions[sessionId]?.source == "codex" {
+            messages = Self.readRecentFromCodexTranscript(path: path).1
         } else {
             messages = Self.readRecentFromTranscript(path: path).1
         }
