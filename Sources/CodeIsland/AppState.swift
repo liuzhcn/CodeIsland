@@ -2878,6 +2878,11 @@ final class AppState {
                ) {
                 continue
             }
+            // Older filename parsing could persist a suffix as a bogus desktop thread ID.
+            if source == "codex", snapshot.termBundleId == Self.codexAppBundleId,
+               let id = snapshot.providerSessionId, UUID(uuidString: id) == nil {
+                continue
+            }
             sessions[restoredSessionId] = snapshot
             refreshProviderTitle(for: restoredSessionId)
             // Branch is re-read, not persisted — it may have changed between runs.
@@ -6834,19 +6839,13 @@ final class AppState {
         return sessionCwd
     }
 
-    /// Extract session ID from Codex filename: rollout-2026-04-04T20-54-48-{uuid}.jsonl
-    private nonisolated static func extractCodexSessionId(from filename: String) -> String {
-        // Format: rollout-YYYY-MM-DDThh-mm-ss-{uuid}.jsonl
-        let name = filename.replacingOccurrences(of: ".jsonl", with: "")
-        // The UUID is the last 36 chars (8-4-4-4-12)
-        // Pattern: after the datetime portion, everything from the 4th dash group onwards is the UUID
+    /// Rollouts may append an underscore and a second UUID after the thread UUID.
+    nonisolated static func extractCodexSessionId(from filename: String) -> String {
+        let name = (filename as NSString).deletingPathExtension
         let parts = name.split(separator: "-")
-        // rollout-YYYY-MM-DDThh-mm-ss-{8}-{4}-{4}-{4}-{12}
-        // That's: [rollout, YYYY, MM, DDThh, mm, ss, uuid1, uuid2, uuid3, uuid4, uuid5]
-        if parts.count >= 11 {
-            return parts.suffix(5).joined(separator: "-")
-        }
-        return name
+        guard name.hasPrefix("rollout-"), parts.count >= 11 else { return "" }
+        let candidate = parts.dropFirst(6).joined(separator: "-").split(separator: "_").first.map(String.init) ?? ""
+        return UUID(uuidString: candidate) == nil ? "" : candidate
     }
 
     private nonisolated static func extractTextContent(from rawContent: Any?) -> String? {

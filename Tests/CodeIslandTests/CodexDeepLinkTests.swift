@@ -4,6 +4,14 @@ import XCTest
 
 @MainActor
 final class CodexDeepLinkTests: XCTestCase {
+    func testRolloutFilenameWithSuffixUsesThreadUUID() {
+        let id = "00000000-0000-4000-8000-000000000001"
+        let prefix = "rollout-2026-09-14T08-32-49-" + id
+        XCTAssertEqual(AppState.extractCodexSessionId(from: prefix + ".jsonl"), id)
+        XCTAssertEqual(AppState.extractCodexSessionId(from: prefix + "_00000000-0000-4000-8000-000000000002.jsonl"), id)
+        XCTAssertEqual(AppState.extractCodexSessionId(from: "rollout-invalid.jsonl"), "")
+    }
+
     func testCompactSelectionSkipsStaleIdlePointers() {
         let state = AppState()
         var idle = SessionSnapshot()
