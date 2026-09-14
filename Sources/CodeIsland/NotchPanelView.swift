@@ -159,7 +159,7 @@ struct NotchPanelView: View {
         let toolExtra: CGFloat = displayedToolStatus ? (hasNotch ? screenWidth * 0.03 : screenWidth * 0.04) : 0
         // Immediate hover acknowledgement: a slight widen while the expand delay runs
         let prehoverExtra: CGFloat = shouldShowPrehover ? NotchHoverInteraction.prehoverWidthDelta : 0
-        return nw + wing * 2 + extra + toolExtra + prehoverExtra
+        return nw + wing * 2 + extra + toolExtra + prehoverExtra + (hasNotch && displayedToolStatus ? 240 : 0)
     }
 
     var body: some View {
@@ -169,6 +169,7 @@ struct NotchPanelView: View {
                     // Active: compact bar — wider version when expanded
                     HStack(spacing: 0) {
                         CompactLeftWing(appState: appState, expanded: shouldShowExpanded, mascotSize: mascotSize, hasNotch: hasNotch, showToolStatus: showToolStatus)
+                            .frame(width: hasNotch && !shouldShowExpanded ? (panelWidth - effectiveNotchW) / 2 : nil, alignment: .leading)
                         if hasNotch && !shouldShowExpanded {
                             Spacer(minLength: effectiveNotchW)
                         } else if !shouldShowExpanded && showToolStatus {
@@ -178,6 +179,7 @@ struct NotchPanelView: View {
                             Spacer(minLength: 0)
                         }
                         CompactRightWing(appState: appState, expanded: shouldShowExpanded, hasNotch: hasNotch)
+                            .frame(width: hasNotch && !shouldShowExpanded ? (panelWidth - effectiveNotchW) / 2 : nil, alignment: .trailing)
                     }
                     .frame(height: notchHeight)
                 } else if showIdleIndicator {
@@ -566,8 +568,8 @@ private struct CompactRightWing: View {
         appState.compactSessionId
     }
     private var projectName: String? {
-        guard let sid = displaySessionId, let cwd = appState.sessions[sid]?.cwd, !cwd.isEmpty else { return nil }
-        return (cwd as NSString).lastPathComponent
+        guard let sid = displaySessionId, let session = appState.sessions[sid], session.status != .idle else { return nil }
+        return session.sessionLabel ?? session.projectDisplayName
     }
 
     var body: some View {
@@ -583,6 +585,14 @@ private struct CompactRightWing: View {
                     NSApplication.shared.terminate(nil)
                 }
             } else {
+                if hasNotch, showToolStatus, let name = projectName {
+                    Text(name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(name)
+                }
                 // Quiet hours active — explains why event sounds are silent.
                 if inQuietHours {
                     Image(systemName: "moon.fill")
