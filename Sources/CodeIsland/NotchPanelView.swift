@@ -296,14 +296,29 @@ struct NotchPanelView: View {
             }
             .frame(width: panelWidth)
             .clipped()
-            .background(
-                NotchPanelShape(
-                    topExtension: shouldShowExpanded ? 14 : 3,
-                    bottomRadius: shouldShowExpanded ? 24 : 12,
-                    minHeight: notchHeight
-                )
-                .fill(.black)
-            )
+            .background {
+                if hasNotch {
+                    NotchPanelShape(
+                        topExtension: shouldShowExpanded ? 14 : 3,
+                        bottomRadius: shouldShowExpanded ? 24 : 12,
+                        minHeight: notchHeight
+                    )
+                    .fill(.black)
+                } else {
+                    RoundedRectangle(cornerRadius: shouldShowExpanded ? 24 : notchHeight / 2, style: .continuous)
+                        .fill(.black)
+                }
+            }
+            .mask {
+                if hasNotch { Rectangle().padding(-24) }
+                else { UnevenRoundedRectangle(
+                topLeadingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2),
+                bottomLeadingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2),
+                bottomTrailingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2),
+                topTrailingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2)
+                ) }
+            }
+            .padding(.top, hasNotch ? 0 : 6)
             .offset(y: curtainOffset)
             .opacity(curtainOpacity)
             .onChange(of: showToolStatus) { _, newValue in
