@@ -111,6 +111,13 @@ struct NotchPanelView: View {
     @State private var curtainOffset: CGFloat = 0
     @State private var curtainOpacity: Double = 1
     @State private var displayedToolStatus: Bool = SettingsDefaults.showToolStatus
+    @State private var leftContentWidth: CGFloat = 0
+    @State private var rightContentWidth: CGFloat = 0
+
+    // Equal wings keep the reserved camera area centered on the physical notch.
+    private var fittedWingWidth: CGFloat {
+        ceil(max(leftContentWidth, rightContentWidth, compactWingWidth)) + 6
+    }
 
     private var isActive: Bool { !appState.sessions.isEmpty }
     /// First launch / no-session state should still render a visible marker so the app
@@ -159,6 +166,7 @@ struct NotchPanelView: View {
         let toolExtra: CGFloat = displayedToolStatus ? (hasNotch ? screenWidth * 0.03 : screenWidth * 0.04) : 0
         // Immediate hover acknowledgement: a slight widen while the expand delay runs
         let prehoverExtra: CGFloat = shouldShowPrehover ? NotchHoverInteraction.prehoverWidthDelta : 0
+        if hasNotch { return notchW + fittedWingWidth * 2 + prehoverExtra }
         return nw + wing * 2 + extra + toolExtra + prehoverExtra
     }
 
@@ -169,8 +177,13 @@ struct NotchPanelView: View {
                     // Active: compact bar — wider version when expanded
                     HStack(spacing: 0) {
                         CompactLeftWing(appState: appState, expanded: shouldShowExpanded, mascotSize: mascotSize, hasNotch: hasNotch, showToolStatus: showToolStatus)
+                            .fixedSize(horizontal: hasNotch && !shouldShowExpanded, vertical: false)
+                            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                                if hasNotch && !shouldShowExpanded { leftContentWidth = width }
+                            }
+                            .frame(width: hasNotch && !shouldShowExpanded ? fittedWingWidth : nil, alignment: .leading)
                         if hasNotch && !shouldShowExpanded {
-                            Spacer(minLength: effectiveNotchW)
+                            Spacer(minLength: 0).frame(width: notchW)
                         } else if !shouldShowExpanded && showToolStatus {
                             CompactToolStatus(appState: appState)
                             Spacer(minLength: 0)
@@ -178,6 +191,11 @@ struct NotchPanelView: View {
                             Spacer(minLength: 0)
                         }
                         CompactRightWing(appState: appState, expanded: shouldShowExpanded, hasNotch: hasNotch)
+                            .fixedSize(horizontal: hasNotch && !shouldShowExpanded, vertical: false)
+                            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                                if hasNotch && !shouldShowExpanded { rightContentWidth = width }
+                            }
+                            .frame(width: hasNotch && !shouldShowExpanded ? fittedWingWidth : nil, alignment: .trailing)
                     }
                     .frame(height: notchHeight)
                 } else if showIdleIndicator {
