@@ -113,6 +113,7 @@ struct NotchPanelView: View {
     @State private var displayedToolStatus: Bool = SettingsDefaults.showToolStatus
     @State private var leftContentWidth: CGFloat = 0
     @State private var rightContentWidth: CGFloat = 0
+    @State private var centerContentWidth: CGFloat = 0
 
     // Equal wings keep the reserved camera area centered on the physical notch.
     private var fittedWingWidth: CGFloat {
@@ -160,14 +161,10 @@ struct NotchPanelView: View {
         if showIdleIndicator { return idleHovered ? nw + compactWingWidth * 2 + 80 : nw + compactWingWidth * 2 }
         if !isActive { return hasNotch ? nw - 20 : nw }
         if shouldShowExpanded { return min(max(nw + 200, 580), maxWidth) }
-        let wing = compactWingWidth
-        let extra: CGFloat = appState.status == .idle ? 0 : 20
-        // Reserve space for tool status — proportional to screen width
-        let toolExtra: CGFloat = displayedToolStatus ? (hasNotch ? screenWidth * 0.03 : screenWidth * 0.04) : 0
-        // Immediate hover acknowledgement: a slight widen while the expand delay runs
         let prehoverExtra: CGFloat = shouldShowPrehover ? NotchHoverInteraction.prehoverWidthDelta : 0
         if hasNotch { return notchW + fittedWingWidth * 2 + prehoverExtra }
-        return nw + wing * 2 + extra + toolExtra + prehoverExtra
+        let center = showToolStatus ? centerContentWidth : 0
+        return max(64, ceil(leftContentWidth + center + rightContentWidth) + 12) + prehoverExtra
     }
 
     var body: some View {
@@ -177,23 +174,29 @@ struct NotchPanelView: View {
                     // Active: compact bar — wider version when expanded
                     HStack(spacing: 0) {
                         CompactLeftWing(appState: appState, expanded: shouldShowExpanded, mascotSize: mascotSize, hasNotch: hasNotch, showToolStatus: showToolStatus)
-                            .fixedSize(horizontal: hasNotch && !shouldShowExpanded, vertical: false)
+                            .fixedSize(horizontal: !shouldShowExpanded, vertical: false)
                             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
-                                if hasNotch && !shouldShowExpanded { leftContentWidth = width }
+                                if !shouldShowExpanded { leftContentWidth = width }
                             }
                             .frame(width: hasNotch && !shouldShowExpanded ? fittedWingWidth : nil, alignment: .leading)
                         if hasNotch && !shouldShowExpanded {
                             Spacer(minLength: 0).frame(width: notchW)
                         } else if !shouldShowExpanded && showToolStatus {
                             CompactToolStatus(appState: appState)
+                                .frame(maxWidth: min(320, screenWidth * 0.4))
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 6)
+                                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                                    centerContentWidth = width
+                                }
                             Spacer(minLength: 0)
                         } else {
                             Spacer(minLength: 0)
                         }
                         CompactRightWing(appState: appState, expanded: shouldShowExpanded, hasNotch: hasNotch)
-                            .fixedSize(horizontal: hasNotch && !shouldShowExpanded, vertical: false)
+                            .fixedSize(horizontal: !shouldShowExpanded, vertical: false)
                             .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
-                                if hasNotch && !shouldShowExpanded { rightContentWidth = width }
+                                if !shouldShowExpanded { rightContentWidth = width }
                             }
                             .frame(width: hasNotch && !shouldShowExpanded ? fittedWingWidth : nil, alignment: .trailing)
                     }
