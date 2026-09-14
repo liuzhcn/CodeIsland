@@ -139,8 +139,11 @@ struct NotchPanelView: View {
         showBar && !shouldShowExpanded && hoverPhase == .prehover
     }
 
-    /// Mascot size — fits within the menu bar height
-    private var mascotSize: CGFloat { min(27, notchHeight - 6) }
+    private var islandInset: CGFloat { hasNotch ? 0 : 3 }
+    private var barHeight: CGFloat { max(1, notchHeight - islandInset * 2) }
+
+    /// Keep the mascot inside the capsule with three points above and below.
+    private var mascotSize: CGFloat { min(27, max(1, barHeight - 6)) }
 
     /// Minimum wing width needed to display compact bar content
     private var compactWingWidth: CGFloat { mascotSize + 14 }
@@ -200,20 +203,20 @@ struct NotchPanelView: View {
                             }
                             .frame(width: hasNotch && !shouldShowExpanded ? fittedWingWidth : nil, alignment: .trailing)
                     }
-                    .frame(height: notchHeight)
+                    .frame(height: barHeight)
                 } else if showIdleIndicator {
                     IdleIndicatorBar(
                         mascotSize: mascotSize,
                         compactWingWidth: compactWingWidth,
                         notchW: effectiveNotchW,
-                        notchHeight: notchHeight,
+                        notchHeight: barHeight,
                         hasNotch: hasNotch,
                         hovered: idleHovered
                     )
                 } else {
                     // Idle: just the notch shell
                     Spacer()
-                        .frame(height: notchHeight)
+                        .frame(height: barHeight)
                 }
 
                 // Below-notch expanded content
@@ -305,20 +308,20 @@ struct NotchPanelView: View {
                     )
                     .fill(.black)
                 } else {
-                    RoundedRectangle(cornerRadius: shouldShowExpanded ? 24 : notchHeight / 2, style: .continuous)
+                    RoundedRectangle(cornerRadius: shouldShowExpanded ? 24 : barHeight / 2, style: .continuous)
                         .fill(.black)
                 }
             }
             .mask {
                 if hasNotch { Rectangle().padding(-24) }
                 else { UnevenRoundedRectangle(
-                topLeadingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2),
-                bottomLeadingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2),
-                bottomTrailingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2),
-                topTrailingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : notchHeight / 2)
+                topLeadingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : barHeight / 2),
+                bottomLeadingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : barHeight / 2),
+                bottomTrailingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : barHeight / 2),
+                topTrailingRadius: hasNotch ? 0 : (shouldShowExpanded ? 24 : barHeight / 2)
                 ) }
             }
-            .padding(.top, hasNotch ? 0 : 6)
+            .padding(.top, islandInset)
             .offset(y: curtainOffset)
             .opacity(curtainOpacity)
             .onChange(of: showToolStatus) { _, newValue in
