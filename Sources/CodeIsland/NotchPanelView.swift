@@ -114,6 +114,7 @@ struct NotchPanelView: View {
     @State private var leftContentWidth: CGFloat = 0
     @State private var rightContentWidth: CGFloat = 0
     @State private var centerContentWidth: CGFloat = 0
+    @State private var idleContentWidth: CGFloat = 0
 
     // Equal wings keep the reserved camera area centered on the physical notch.
     private var fittedWingWidth: CGFloat {
@@ -161,7 +162,10 @@ struct NotchPanelView: View {
     private var panelWidth: CGFloat {
         let nw = effectiveNotchW
         let maxWidth = min(620, screenWidth - 40)
-        if showIdleIndicator { return idleHovered ? nw + compactWingWidth * 2 + 80 : nw + compactWingWidth * 2 }
+        if showIdleIndicator {
+            if !hasNotch { return max(mascotSize + 12, ceil(idleContentWidth)) }
+            return idleHovered ? nw + compactWingWidth * 2 + 80 : nw + compactWingWidth * 2
+        }
         if !isActive { return hasNotch ? nw - 20 : nw }
         if shouldShowExpanded { return min(max(nw + 200, 580), maxWidth) }
         let prehoverExtra: CGFloat = shouldShowPrehover ? NotchHoverInteraction.prehoverWidthDelta : 0
@@ -213,6 +217,11 @@ struct NotchPanelView: View {
                         hasNotch: hasNotch,
                         hovered: idleHovered
                     )
+                    .fixedSize(horizontal: !hasNotch, vertical: false)
+                    .padding(.trailing, !hasNotch && !idleHovered ? 6 : 0)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                        if !hasNotch { idleContentWidth = width }
+                    }
                 } else {
                     // Idle: just the notch shell
                     Spacer()
