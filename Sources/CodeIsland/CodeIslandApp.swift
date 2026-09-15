@@ -7,7 +7,16 @@ struct CodeIslandApp: App {
 
     var body: some Scene {
         Settings {
-            EmptyView()
+            SettingsView(appState: appDelegate.appState)
+                .frame(minWidth: 560, minHeight: 420)
+        }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button(l10n["settings_ellipsis"]) {
+                    SettingsWindowController.shared.show()
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
         }
     }
 }
