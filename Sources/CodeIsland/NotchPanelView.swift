@@ -218,7 +218,6 @@ struct NotchPanelView: View {
                         hovered: idleHovered
                     )
                     .fixedSize(horizontal: !hasNotch, vertical: false)
-                    .padding(.trailing, !hasNotch && !idleHovered ? 6 : 0)
                     .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
                         if !hasNotch { idleContentWidth = width }
                     }
@@ -857,15 +856,15 @@ private struct IdleIndicatorBar: View {
             }
             .padding(.leading, 6)
 
-            Spacer(minLength: hasNotch ? notchW : 0)
+            Spacer(minLength: hasNotch ? notchW : 8)
 
-            // Right: expanded shows text + buttons, collapsed shows nothing
-            if hovered {
-                HStack(spacing: 8) {
-                    Text("0")
-                        .font(.system(size: 13, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.4))
+            // Keep the zero count visible; reveal actions only on hover.
+            HStack(spacing: 8) {
+                Text("0")
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.4))
 
+                if hovered {
                     HStack(spacing: 4) {
                         NotchIconButton(icon: soundEnabled ? "speaker.wave.2" : "speaker.slash", tooltip: soundEnabled ? l10n["mute"] : l10n["enable_sound_tooltip"]) {
                             soundEnabled.toggle()
@@ -878,9 +877,8 @@ private struct IdleIndicatorBar: View {
                         }
                     }
                 }
-                .padding(.trailing, 6)
-                .transition(.opacity)
             }
+            .padding(.trailing, 6)
         }
         .frame(height: notchHeight)
         .animation(NotchAnimation.micro, value: hovered)
