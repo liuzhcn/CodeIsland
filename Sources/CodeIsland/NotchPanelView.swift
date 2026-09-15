@@ -162,11 +162,11 @@ struct NotchPanelView: View {
     private var panelWidth: CGFloat {
         let nw = effectiveNotchW
         let maxWidth = min(620, screenWidth - 40)
-        if showIdleIndicator {
-            if !hasNotch { return max(mascotSize + 12, ceil(idleContentWidth)) }
+        if showIdleIndicator && idleHovered {
+            if !hasNotch { return max(64, ceil(idleContentWidth)) }
             return idleHovered ? nw + compactWingWidth * 2 + 80 : nw + compactWingWidth * 2
         }
-        if !isActive { return hasNotch ? nw - 20 : nw }
+        if !isActive && !showIdleIndicator { return hasNotch ? nw - 20 : nw }
         if shouldShowExpanded { return min(max(nw + 200, 580), maxWidth) }
         let prehoverExtra: CGFloat = shouldShowPrehover ? NotchHoverInteraction.prehoverWidthDelta : 0
         if hasNotch { return notchW + fittedWingWidth * 2 + prehoverExtra }
@@ -177,7 +177,7 @@ struct NotchPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 0) {
-                if showBar {
+                if showBar || (showIdleIndicator && !idleHovered) {
                     // Active: compact bar — wider version when expanded
                     HStack(spacing: 0) {
                         CompactLeftWing(appState: appState, expanded: shouldShowExpanded, mascotSize: mascotSize, hasNotch: hasNotch, showToolStatus: showToolStatus)
@@ -667,7 +667,7 @@ private struct CompactRightWing: View {
                                 .foregroundStyle(.white.opacity(0.4))
                         }
                         Text("\(total)")
-                            .foregroundStyle(.white.opacity(0.9))
+                            .foregroundStyle(.white.opacity(total == 0 ? 0.4 : 0.9))
                     }
                     .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 } else {
@@ -682,7 +682,7 @@ private struct CompactRightWing: View {
                                 .foregroundStyle(.white.opacity(0.4))
                         }
                         Text("\(total)")
-                            .foregroundStyle(.white.opacity(0.9))
+                            .foregroundStyle(.white.opacity(total == 0 ? 0.4 : 0.9))
                     }
                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                 }
