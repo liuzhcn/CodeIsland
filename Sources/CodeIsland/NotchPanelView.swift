@@ -587,6 +587,7 @@ private struct CompactLeftWing: View {
 
 /// Right side: project name + session count (detailed) or just count (simple)
 private struct CompactRightWing: View {
+    @ObservedObject private var remoteManager = RemoteManager.shared
     var appState: AppState
     let expanded: Bool
     let hasNotch: Bool
@@ -630,6 +631,18 @@ private struct CompactRightWing: View {
                     NSApplication.shared.terminate(nil)
                 }
             } else {
+                if remoteManager.hosts.contains(where: { remoteManager.connectionStatus[$0.id] != .connected }) {
+                    Button {
+                        SettingsWindowController.shared.show()
+                    } label: {
+                        Image(systemName: "network.slash")
+                            .foregroundStyle(.orange)
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .help("远程提醒未连接（含正在重连）；打开设置查看状态或手动重连")
+                }
+
                 // Quiet hours active — explains why event sounds are silent.
                 if inQuietHours {
                     Image(systemName: "moon.fill")

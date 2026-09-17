@@ -3,6 +3,17 @@ import XCTest
 
 @MainActor
 final class RemoteManagerTests: XCTestCase {
+    func testRecoverySkipsManualDisconnectAndInFlightConnections() {
+        for status in [SSHForwarder.Status.disconnected, .failed("network down")] {
+            XCTAssertTrue(RemoteManager.shouldRetry(autoConnect: true, manuallyDisconnected: false, status: status))
+            XCTAssertFalse(RemoteManager.shouldRetry(autoConnect: true, manuallyDisconnected: true, status: status))
+            XCTAssertFalse(RemoteManager.shouldRetry(autoConnect: false, manuallyDisconnected: false, status: status))
+        }
+        for status in [SSHForwarder.Status.connecting, .connected] {
+            XCTAssertFalse(RemoteManager.shouldRetry(autoConnect: true, manuallyDisconnected: false, status: status))
+        }
+    }
+
     func testReconnectDelayFollowsExpectedBackoff() {
         XCTAssertEqual(RemoteManager.reconnectDelay(attempt: 1), 5)
         XCTAssertEqual(RemoteManager.reconnectDelay(attempt: 2), 15)

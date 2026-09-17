@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import Network
 
 @MainActor
 final class RemoteManager: ObservableObject {
@@ -25,7 +27,9 @@ final class RemoteManager: ObservableObject {
     private var reconnectAttempts: [String: Int] = [:]
 
     private static let reconnectBackoffSeconds: [Int] = [5, 15, 45, 120, 300]
-    private static let reconnectMaxAttempts = 10
+    private let pathMonitor = NWPathMonitor()
+    private var wakeObserver: NSObjectProtocol?
+    private var manuallyDisconnected: Set<String> = []
 
     /// Delay (seconds) before the nth reconnect attempt (1-based). Clamped to the
     /// last entry for attempts beyond the table.
@@ -40,12 +44,37 @@ final class RemoteManager: ObservableObject {
     }
 
     func startup() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor in self?.retryAvailableHosts() }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "CodeIsland.remote-network"))
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.retryAvailableHosts() }
+        }
         for host in hosts where host.autoConnect {
             connect(id: host.id)
         }
     }
 
+    private func retryAvailableHosts() {
+        for host in hosts where Self.shouldRetry(
+            autoConnect: host.autoConnect, manuallyDisconnected: manuallyDisconnected.contains(host.id),
+            status: connectionStatus[host.id] ?? .disconnected
+        ) {
+            connect(id: host.id)
+        }
+    }
+
+    static func shouldRetry(autoConnect: Bool, manuallyDisconnected: Bool, status: SSHForwarder.Status) -> Bool {
+        autoConnect && !manuallyDisconnected && status != .connected && status != .connecting
+    }
+
     func shutdown() {
+        pathMonitor.cancel()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
         for host in hosts {
             disconnect(id: host.id)
         }
@@ -90,6 +119,8 @@ final class RemoteManager: ObservableObject {
     }
 
     func connect(id: String) {
+        manuallyDisconnected.remove(id)
+        guard connectionStatus[id] != .connecting else { return }
         // User-initiated connect (or autoConnect at startup): clear any pending
         // reconnect countdown and reset the backoff attempt counter.
         cancelScheduledReconnect(id: id)
@@ -107,9 +138,10 @@ final class RemoteManager: ObservableObject {
 
         let forwarder = forwarders[id] ?? SSHForwarder()
         forwarders[id] = forwarder
-        forwarder.onStatusChange = { [weak self] status in
+        forwarder.onStatusChange = { [weak self, weak forwarder] status in
             Task { @MainActor in
-                self?.handleStatusChange(status, for: host)
+                guard let self, self.forwarders[host.id] === forwarder else { return }
+                self.handleStatusChange(status, for: host)
             }
         }
 
@@ -119,6 +151,7 @@ final class RemoteManager: ObservableObject {
         Task {
             let remoteSocketPath = await RemoteInstaller.prepareRemoteSocketPath(host: host)
             await MainActor.run {
+                guard self.forwarders[host.id] === forwarder else { return }
                 self.remoteSocketPaths[host.id] = remoteSocketPath
                 forwarder.connect(host: host, localSocketPath: HookServer.socketPath, remoteSocketPath: remoteSocketPath)
             }
@@ -126,6 +159,8 @@ final class RemoteManager: ObservableObject {
     }
 
     func disconnect(id: String) {
+        manuallyDisconnected.insert(id)
+        forwarders[id]?.onStatusChange = nil
         cancelScheduledReconnect(id: id)
         reconnectAttempts[id] = nil
         forwarders[id]?.disconnect()
@@ -163,17 +198,13 @@ final class RemoteManager: ObservableObject {
     private func scheduleReconnect(for host: RemoteHost) {
         // Only auto-reconnect hosts the user opted into; otherwise a failing
         // manually-triggered connect would keep retrying forever.
-        guard host.autoConnect else { return }
+        guard host.autoConnect, !manuallyDisconnected.contains(host.id) else { return }
 
         cancelScheduledReconnect(id: host.id)
         let nextAttempt = (reconnectAttempts[host.id] ?? 0) + 1
-        guard nextAttempt <= Self.reconnectMaxAttempts else {
-            lastMessage[host.id] = "Gave up after \(Self.reconnectMaxAttempts) reconnect attempts"
-            return
-        }
         reconnectAttempts[host.id] = nextAttempt
         let delay = Self.reconnectDelay(attempt: nextAttempt)
-        lastMessage[host.id] = "Reconnecting in \(delay)s (attempt \(nextAttempt)/\(Self.reconnectMaxAttempts))"
+        lastMessage[host.id] = "Reconnecting in \(delay)s (attempt \(nextAttempt))"
 
         let hostId = host.id
         reconnectTasks[hostId] = Task { [weak self] in
