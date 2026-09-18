@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import json
+import fcntl
+import time
+import uuid
 import os
 import socket
 import sqlite3
@@ -7,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 # Per-user socket path (#193): CodeIsland injects CODEISLAND_SOCKET_PATH via the hook
 # command, but fall back to a uid-scoped path so multiple users on a shared host never
 # collide on a single /tmp/codeisland.sock.
@@ -206,19 +209,44 @@ def _read_stdin_json():
         return None
 
 
+def _trace(payload, phase, error=None):
+    # Bounded metadata only; never persist prompts, tool arguments or responses.
+    row = {"time": time.time(), "trace": payload.get("_diagnostic_id"),
+           "session": str(payload.get("session_id", ""))[:160],
+           "event": str(payload.get("hook_event_name", ""))[:80], "phase": phase}
+    if error is not None:
+        row["error"] = type(error).__name__
+        row["errno"] = getattr(error, "errno", None)
+    try:
+        directory = Path.home() / ".codeisland"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(directory / "hook-diagnostics.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            if os.fstat(stream.fileno()).st_size >= 1024 * 1024:
+                stream.truncate(0)
+            stream.write(json.dumps(row) + "\n")
+    except OSError:
+        pass  # Diagnostics must never prevent a hook from running.
+
+
 def _send_event(payload, expects_response):
+    payload["_diagnostic_id"] = uuid.uuid4().hex
+    _trace(payload, "attempt")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(BLOCKING_TIMEOUT_SECONDS if expects_response else TIMEOUT_SECONDS)
     try:
         sock.connect(SOCKET_PATH)
         sock.sendall(json.dumps(payload).encode("utf-8"))
         sock.shutdown(socket.SHUT_WR)
+        _trace(payload, "sent")
         if expects_response:
             response = sock.recv(65536)
             return response.decode("utf-8") if response else None
         return None
-    except (OSError, socket.error):
-        # Socket may not exist or server may have shut down — fail silently (#45)
+    except (OSError, socket.error) as error:
+        _trace(payload, "failed", error)
+        # Preserve the existing non-blocking failure behavior.
         return None
     finally:
         try:

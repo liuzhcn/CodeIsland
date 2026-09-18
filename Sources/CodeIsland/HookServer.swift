@@ -652,6 +652,11 @@ class HookServer {
     }
 
     private func processRequest(data: Data, connection: NWConnection) {
+        if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let trace = raw["_diagnostic_id"] as? String {
+            log.notice("hook_trace received trace=\(String(trace.prefix(64)), privacy: .public) session=\(String((raw["session_id"] as? String ?? "").prefix(160)), privacy: .public) event=\(String((raw["hook_event_name"] as? String ?? "").prefix(80)), privacy: .public)")
+        }
+
         // Sub-session pre-filter (#123, #151): plugin, Codex, or Cursor Task hooks
         // (Cursor: transcript parent ≠ session_id) follow Agent Sub-Sessions —
         // merge into the parent, hide, or keep separate.
@@ -796,7 +801,12 @@ class HookServer {
             }
 
         case .event:
+            let before = event.sessionId.flatMap { appState.sessions[$0].map { String(describing: $0.status) } } ?? "absent"
             appState.handleEvent(event)
+            if let trace = event.rawJSON["_diagnostic_id"] as? String {
+                let after = event.sessionId.flatMap { appState.sessions[$0].map { String(describing: $0.status) } } ?? "absent"
+                log.notice("hook_trace applied trace=\(String(trace.prefix(64)), privacy: .public) before=\(before, privacy: .public) after=\(after, privacy: .public)")
+            }
             sendResponse(connection: connection, data: Data("{}".utf8))
         }
     }
