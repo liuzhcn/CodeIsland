@@ -9,6 +9,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var panelController: PanelWindowController?
     private var hookServer: HookServer?
+    private var codexFailureWatcher: CodexFailureWatcher?
     private var hookRecoveryTimer: Timer?
     private var lastHookCheck: Date = .distantPast
     private let hotKeyManager = GlobalHotKeyManager()
@@ -60,6 +61,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appState.startSessionDiscovery()
         appState.startCodexAppServerWatcher()
         RemoteManager.shared.startup()
+        codexFailureWatcher = CodexFailureWatcher(state: appState)
+        codexFailureWatcher?.start()
 
         // Buddy bridge (opt-in): mirrors the Dynamic Island onto the companion
         // device and routes its button press back to TerminalActivator.
