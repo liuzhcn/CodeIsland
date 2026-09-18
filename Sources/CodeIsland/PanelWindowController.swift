@@ -297,6 +297,7 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
+                ScreenDetector.frontmostAppChanged()
                 self.refreshCurrentScreen()
                 if !self.fullscreenLatch { self.updateVisibility() }
             }
@@ -309,19 +310,23 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         observeSettingsChanges()
         configureAutoScreenPolling()
 
-        // Global click monitor: close panel + repost click when clicking outside
+        // Follow desktop clicks as well as window focus; collapse when clicking outside.
         globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            let clickLocation = NSEvent.mouseLocation
             Task { @MainActor in
-                guard let self = self, self.appState.surface.isExpanded else { return }
+                guard let self else { return }
+                if self.appState.surface.isExpanded && self.panel?.frame.contains(clickLocation) == true { return }
+                ScreenDetector.recordClick(at: clickLocation)
+                self.refreshCurrentScreen()
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(ScreenDetector.clickSettleInterval * 1_000_000_000))
+                    self?.refreshCurrentScreen()
+                }
+                guard self.appState.surface.isExpanded else { return }
                 // Don't close during approval/question
                 switch self.appState.surface {
                 case .approvalCard, .questionCard: return
                 default: break
-                }
-                // Don't collapse if click is within the panel frame (event leaked on external display)
-                if let panelFrame = self.panel?.frame {
-                    let clickLocation = NSEvent.mouseLocation
-                    if panelFrame.contains(clickLocation) { return }
                 }
                 withAnimation(NotchAnimation.close) {
                     self.appState.surface = .collapsed
@@ -433,6 +438,8 @@ class PanelWindowController: NSObject, NSWindowDelegate {
                         Task { @MainActor [weak self] in
                             self?.lastChosenScreenSignature = targetSignature
                             self?.isAnimatingScreenHop = false
+                            // Focus/click notifications during the animation may have changed the target.
+                            self?.refreshCurrentScreen()
                         }
                     }
                 }
@@ -592,7 +599,7 @@ class PanelWindowController: NSObject, NSWindowDelegate {
             return NSScreen.screens[index]
         }
 
-        // "auto" — prefer notch screen, fallback to main
+        // "auto" — follow the active window or clicked desktop
         return ScreenDetector.preferredScreen
     }
 
