@@ -68,6 +68,44 @@ final class CodexNativeSubagentRoutingTests: XCTestCase {
         XCTAssertEqual(sessions["parent"]?.status, .processing)
     }
 
+    func testInTurnSessionStartPreservesStateAndIsSilentLocallyAndRemotely() throws {
+        for remote in [false, true] {
+            for status in [AgentStatus.processing, .running, .waitingApproval, .waitingQuestion] {
+                var session = SessionSnapshot()
+                session.source = "codex"
+                session.status = status
+                session.currentTool = "shell"
+                session.lastUserPrompt = "original task"
+                session.sessionTitle = "Task title"
+                session.addRecentMessage(ChatMessage(isUser: true, text: "original task"))
+                if remote { session.remoteHostId = "remote-host" }
+                var sessions = ["parent": session]
+                let event = try decode([
+                    "hook_event_name": "SessionStart", "session_id": "parent",
+                    "_source": "codex", "source": "compact", "cwd": "/repo"
+                ])
+                let effects = reduceEvent(sessions: &sessions, event: event, maxHistory: 10)
+                XCTAssertEqual(sessions["parent"]?.status, status)
+                XCTAssertEqual(sessions["parent"]?.currentTool, "shell")
+                XCTAssertEqual(sessions["parent"]?.startTime, session.startTime)
+                XCTAssertEqual(sessions["parent"]?.lastUserPrompt, "original task")
+                XCTAssertEqual(sessions["parent"]?.recentMessages.map(\.text), ["original task"])
+                XCTAssertEqual(sessions["parent"]?.sessionTitle, "Task title")
+                XCTAssertEqual(sessions["parent"]?.cwd, "/repo")
+                XCTAssertEqual(sessions["parent"]?.remoteHostId, session.remoteHostId)
+                XCTAssertTrue(effects.isEmpty)
+                let stop = try decode(["hook_event_name": "Stop", "session_id": "parent", "_source": "codex"])
+                let completed = reduceEvent(sessions: &sessions, event: stop, maxHistory: 10)
+                XCTAssertEqual(sessions["parent"]?.status, .idle)
+                XCTAssertTrue(completed.contains(.enqueueCompletion(sessionId: "parent")))
+                XCTAssertTrue(completed.contains(.playSound("Stop")))
+            }
+        }
+        var fresh: [String: SessionSnapshot] = [:]
+        let start = try decode(["hook_event_name": "SessionStart", "session_id": "new", "_source": "codex"])
+        XCTAssertTrue(reduceEvent(sessions: &fresh, event: start, maxHistory: 10).contains(.playSound("SessionStart")))
+    }
+
     private func decode(_ payload: [String: Any]) throws -> HookEvent {
         let data = try JSONSerialization.data(withJSONObject: payload)
         guard let event = HookEvent(from: data) else {

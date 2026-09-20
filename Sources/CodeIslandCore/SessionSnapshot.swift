@@ -1002,6 +1002,14 @@ public func reduceEvent(
         if handled { return effects }
     }
 
+    // Codex emits SessionStart again after in-turn context compaction. Metadata
+    // above may be refreshed, but an active turn must not be reset or play a start sound.
+    if eventName == "SessionStart", sessions[sessionId]?.source == "codex",
+       sessions[sessionId]?.status != .idle {
+        sessions[sessionId]?.lastActivity = Date()
+        return effects
+    }
+
     // Preserve actionable states: don't let activity updates overwrite waiting states
     let isWaiting = sessions[sessionId]?.status == .waitingApproval
         || sessions[sessionId]?.status == .waitingQuestion
