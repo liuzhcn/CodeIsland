@@ -583,7 +583,7 @@ public struct SessionSnapshot: Sendable {
     public var sessionLabel: String? {
         guard let sessionTitle else { return nil }
         let trimmed = sessionTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        return trimmed.isEmpty || trimmed.hasPrefix("# Files mentioned by the user:") ? nil : trimmed
     }
 
     /// Shortened model name: "claude-opus-4-6" → "opus"

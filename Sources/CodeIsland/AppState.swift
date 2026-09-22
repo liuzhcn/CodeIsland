@@ -1520,7 +1520,7 @@ final class AppState {
             session.providerSessionId = record.id
             session.remoteHostId = hostId
             session.remoteHostName = hostName
-            if let title = record.title, !title.isEmpty, session.sessionTitle == nil {
+            if let title = record.title, !title.isEmpty {
                 session.sessionTitle = title
             }
             let newerTurn = record.startedAt > session.lastActivity.timeIntervalSince1970

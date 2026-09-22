@@ -19,6 +19,24 @@ final class RemoteManagerTests: XCTestCase {
         XCTAssertEqual(state.activeSessionCount, 0)
     }
 
+    func testRemoteCodexTitleRecoversAfterAttachmentMetadata() {
+        let state = AppState()
+        let now = Date().timeIntervalSince1970
+        let session = RemoteCodexSession(
+            id: "remote-title-test", cwd: "/home/leo/projects/hr", model: nil,
+            title: "# Files mentioned by the user:\nimage.png", modifiedAt: now, startedAt: now
+        )
+        state.reconcileRemoteCodexSessions([session], hostId: "remote-test", hostName: "server", cwdFilter: "")
+        XCTAssertNil(state.sessions[session.id]?.sessionLabel)
+
+        let renamed = RemoteCodexSession(
+            id: session.id, cwd: session.cwd, model: nil,
+            title: "评估前端兼容方案", modifiedAt: now + 1, startedAt: now
+        )
+        state.reconcileRemoteCodexSessions([renamed], hostId: "remote-test", hostName: "server", cwdFilter: "")
+        XCTAssertEqual(state.sessions[session.id]?.sessionLabel, "评估前端兼容方案")
+    }
+
     func testFailedRemoteTurnIsNotRevivedByScan() {
         let state = AppState()
         let started = Date().timeIntervalSince1970 - 10
