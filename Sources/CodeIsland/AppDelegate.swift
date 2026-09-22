@@ -32,6 +32,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         RemoteManager.shared.onDisconnect = { [weak appState] hostId in
             appState?.removeRemoteSessions(hostId: hostId)
         }
+        RemoteManager.shared.onCodexSessions = { [weak appState] hostId, hostName, cwdFilter, sessions in
+            appState?.reconcileRemoteCodexSessions(sessions, hostId: hostId, hostName: hostName, cwdFilter: cwdFilter)
+        }
 
         // Prewarm the usage footer off the launch path — first panel expansion
         // then shows data immediately instead of popping in a beat later.

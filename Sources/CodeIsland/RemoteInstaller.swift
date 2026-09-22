@@ -5,6 +5,15 @@ struct RemoteInstallResult: Sendable {
     let message: String
 }
 
+struct RemoteCodexSession: Decodable, Sendable {
+    let id: String
+    let cwd: String
+    let model: String?
+    let title: String?
+    let modifiedAt: TimeInterval
+    let startedAt: TimeInterval
+}
+
 private struct RemoteCommandResult: Sendable {
     let stdout: String
     let stderr: String
@@ -46,8 +55,8 @@ enum RemoteInstaller {
 
     /// Probe the remote user's UID and return a per-user socket path so that multiple
     /// OS users on a shared host don't collide on a single `/tmp/codeisland.sock` (#193).
-    /// Falls back to the legacy shared path when the probe fails (older / restricted host).
-    static func prepareRemoteSocketPath(host: RemoteHost) async -> String {
+    /// A failed probe must not silently switch an existing host to a different socket.
+    static func prepareRemoteSocketPath(host: RemoteHost) async -> String? {
         // `id -u` is a bare external command, so it returns the remote uid identically
         // under any login shell (bash / zsh / fish / csh). A fancier `$(...)` pipeline
         // would break under non-POSIX login shells like fish and silently fall back.
@@ -56,11 +65,56 @@ enum RemoteInstaller {
         if probe.ok, !uid.isEmpty, uid.allSatisfy({ $0.isNumber }) {
             return "/tmp/codeisland-\(uid).sock"
         }
-        // Probe failed (old / restricted host) — fall back to the legacy shared path.
-        // StreamLocalBindUnlink=yes on the forward already clears any stale socket, so
-        // we avoid a second SSH round-trip here (it would just add latency on a host
-        // that's likely failing to connect anyway).
-        return host.remoteSocketPath
+        return nil
+    }
+
+    /// Read active remote Codex turns when desktop sessions do not fire hooks.
+    static func recentCodexSessions(host: RemoteHost) async -> [RemoteCodexSession]? {
+        let script = """
+import datetime, json, pathlib, sqlite3, sys, time
+home = pathlib.Path.home()
+db = home / '.codex/state_5.sqlite'
+now = time.time()
+try:
+    connection = sqlite3.connect(f'file:{db}?mode=ro', uri=True, timeout=0.2)
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+    updated = 'COALESCE(NULLIF(updated_at_ms, 0) / 1000.0, updated_at)' if 'updated_at_ms' in columns else 'updated_at'
+    rows = connection.execute(f'''SELECT id, cwd, rollout_path, model, title, name, {updated}
+        FROM threads WHERE archived = 0 AND source IN ('vscode', 'appServer')
+        AND {updated} >= ? ORDER BY {updated} DESC LIMIT 50''', (now - 3600,))
+    result = []
+    for sid, cwd, path, model, title, name, changed in rows:
+        try:
+            transcript = pathlib.Path(path)
+            modified = max(changed, transcript.stat().st_mtime)
+            if now - modified > 300: continue
+            with transcript.open('rb') as stream:
+                stream.seek(max(0, transcript.stat().st_size - 4 * 1024 * 1024))
+                lines = stream.read().splitlines()
+            status = None
+            started = 0
+            for line in reversed(lines):
+                try:
+                    item = json.loads(line)
+                    event = item.get('payload') or {}
+                    if item.get('type') == 'event_msg' and event.get('type') in ('task_started', 'task_complete', 'turn_aborted'):
+                        status = event['type']
+                        if status == 'task_started':
+                            started = datetime.datetime.fromisoformat(item['timestamp'].replace('Z', '+00:00')).timestamp()
+                        break
+                except (ValueError, TypeError, KeyError): pass
+            if status == 'task_started' or status is None:
+                result.append(dict(id=sid, cwd=cwd or '', model=model, title=(name or title or '')[:200], modifiedAt=modified, startedAt=started))
+        except (OSError, ValueError, TypeError): pass
+    print(json.dumps(result))
+except (OSError, sqlite3.Error):
+    sys.exit(1)
+"""
+        let encoded = Data(script.utf8).base64EncodedString()
+        let command = "python3 -c 'import base64;exec(base64.b64decode(\"\(encoded)\"))'"
+        let result = await runSSH(host: host, command: command, timeout: 8)
+        guard result.ok, let data = result.stdout.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode([RemoteCodexSession].self, from: data)
     }
 
     private static func remoteHookSource() -> String? {
@@ -964,13 +1018,6 @@ print(" · ".join(parts))
             process.standardError = stderr
             process.standardInput = FileHandle.nullDevice
 
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: RemoteCommandResult(stdout: "", stderr: error.localizedDescription, exitCode: -1))
-                return
-            }
-
             let timeoutTask = Task.detached {
                 let ns = UInt64(timeout * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: ns)
@@ -978,15 +1025,21 @@ print(" · ".join(parts))
                     process.terminate()
                 }
             }
-
-            Task.detached {
-                process.waitUntilExit()
+            process.terminationHandler = { process in
                 timeoutTask.cancel()
                 let outData = stdout.fileHandleForReading.readDataToEndOfFile()
                 let errData = stderr.fileHandleForReading.readDataToEndOfFile()
                 let out = String(data: outData, encoding: .utf8) ?? ""
                 let err = String(data: errData, encoding: .utf8) ?? ""
                 continuation.resume(returning: RemoteCommandResult(stdout: out, stderr: err, exitCode: process.terminationStatus))
+            }
+            do {
+                try process.run()
+                stdout.fileHandleForWriting.closeFile()
+                stderr.fileHandleForWriting.closeFile()
+            } catch {
+                timeoutTask.cancel()
+                continuation.resume(returning: RemoteCommandResult(stdout: "", stderr: error.localizedDescription, exitCode: -1))
             }
         }
     }

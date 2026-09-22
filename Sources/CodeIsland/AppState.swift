@@ -116,6 +116,8 @@ final class AppState {
     }
 
     var sessions: [String: SessionSnapshot] = [:]
+    @ObservationIgnored
+    private var remoteDiscoveredCodexIds: [String: Set<String>] = [:]
     var activeSessionId: String?
     var permissionQueue: [PermissionRequest] = []
     var questionQueue: [QuestionRequest] = []
@@ -1480,12 +1482,59 @@ final class AppState {
     }
 
     func removeRemoteSessions(hostId: String) {
+        remoteDiscoveredCodexIds[hostId] = nil
         let ids = sessions.compactMap { key, session in
             session.remoteHostId == hostId ? key : nil
         }
         for id in ids {
             removeSession(id)
         }
+        refreshDerivedState()
+    }
+
+    func reconcileRemoteCodexSessions(
+        _ records: [RemoteCodexSession], hostId: String, hostName: String, cwdFilter: String
+    ) {
+        let visible = records.filter {
+            HookServer.remoteEventPassesCwdFilter(cwd: $0.cwd, filterCSV: cwdFilter)
+        }
+        let activeIds = Set(visible.map(\.id))
+        var discoveredIds = remoteDiscoveredCodexIds[hostId] ?? []
+        if visible.isEmpty && discoveredIds.isEmpty { return }
+        for id in discoveredIds.subtracting(activeIds) where sessions[id]?.remoteHostId == hostId {
+            removeSession(id)
+        }
+        discoveredIds.formIntersection(activeIds)
+        for record in visible {
+            guard !record.id.isEmpty, !record.cwd.isEmpty,
+                  sessions[record.id] == nil || sessions[record.id]?.remoteHostId == hostId else { continue }
+            if sessions[record.id] == nil {
+                discoveredIds.insert(record.id)
+            }
+            let turnStart = Date(timeIntervalSince1970: record.startedAt > 0 ? record.startedAt : record.modifiedAt)
+            var session = sessions[record.id] ?? SessionSnapshot(startTime: turnStart)
+            if sessions[record.id] == nil { session.lastActivity = turnStart }
+            session.source = "codex"
+            session.cwd = record.cwd
+            session.model = record.model ?? session.model
+            session.providerSessionId = record.id
+            session.remoteHostId = hostId
+            session.remoteHostName = hostName
+            if let title = record.title, !title.isEmpty, session.sessionTitle == nil {
+                session.sessionTitle = title
+            }
+            let newerTurn = record.startedAt > session.lastActivity.timeIntervalSince1970
+            if session.interrupted && !newerTurn { continue }
+            session.lastActivity = max(session.lastActivity, turnStart)
+            if session.status != .waitingApproval && session.status != .waitingQuestion {
+                session.status = .running
+                session.interrupted = false
+            }
+            sessions[record.id] = session
+            if activeSessionId == nil { activeSessionId = record.id }
+        }
+        remoteDiscoveredCodexIds[hostId] = discoveredIds
+        scheduleSave()
         refreshDerivedState()
     }
 

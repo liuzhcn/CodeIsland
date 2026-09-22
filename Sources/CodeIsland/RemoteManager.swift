@@ -12,8 +12,10 @@ final class RemoteManager: ObservableObject {
     @Published private(set) var lastMessage: [String: String] = [:]
 
     var onDisconnect: ((String) -> Void)?
+    var onCodexSessions: ((String, String, String, [RemoteCodexSession]) -> Void)?
 
     private var forwarders: [String: SSHForwarder] = [:]
+    private var codexScanTasks: [String: Task<Void, Never>] = [:]
     // Per-user remote socket path resolved at connect time (#193). Keyed by host id;
     // reused by installHooks so the SSH -R forward and the remote hooks agree.
     private var remoteSocketPaths: [String: String] = [:]
@@ -152,6 +154,10 @@ final class RemoteManager: ObservableObject {
             let remoteSocketPath = await RemoteInstaller.prepareRemoteSocketPath(host: host)
             await MainActor.run {
                 guard self.forwarders[host.id] === forwarder else { return }
+                guard let remoteSocketPath else {
+                    self.handleStatusChange(.failed("remote UID probe failed"), for: host)
+                    return
+                }
                 self.remoteSocketPaths[host.id] = remoteSocketPath
                 forwarder.connect(host: host, localSocketPath: HookServer.socketPath, remoteSocketPath: remoteSocketPath)
             }
@@ -160,6 +166,8 @@ final class RemoteManager: ObservableObject {
 
     func disconnect(id: String) {
         manuallyDisconnected.insert(id)
+        codexScanTasks[id]?.cancel()
+        codexScanTasks[id] = nil
         forwarders[id]?.onStatusChange = nil
         cancelScheduledReconnect(id: id)
         reconnectAttempts[id] = nil
@@ -180,12 +188,27 @@ final class RemoteManager: ObservableObject {
             reconnectAttempts[host.id] = nil
             cancelScheduledReconnect(id: host.id)
             Task { await installHooks(for: host) }
+            codexScanTasks[host.id]?.cancel()
+            codexScanTasks[host.id] = Task { [weak self] in
+                while !Task.isCancelled {
+                    if let sessions = await RemoteInstaller.recentCodexSessions(host: host),
+                       !Task.isCancelled,
+                       self?.connectionStatus[host.id] == .connected {
+                        self?.onCodexSessions?(host.id, host.name, host.cwdFilter, sessions)
+                    }
+                    try? await Task.sleep(for: .seconds(10))
+                }
+            }
         case .failed(let message):
+            codexScanTasks[host.id]?.cancel()
+            codexScanTasks[host.id] = nil
             installRunning[host.id] = false
             lastMessage[host.id] = message
             onDisconnect?(host.id)
             scheduleReconnect(for: host)
         case .disconnected:
+            codexScanTasks[host.id]?.cancel()
+            codexScanTasks[host.id] = nil
             // User-initiated disconnects go through disconnect(id:) which already
             // cleared reconnect state before we get here.
             installRunning[host.id] = false

@@ -9,6 +9,12 @@ import XCTest
 final class RemoteInstallerHookMergeTests: XCTestCase {
     private var sandboxHome: URL!
 
+    func testFailedUIDProbeDoesNotFallBackToSharedSocket() async {
+        let host = RemoteHost(name: "unreachable", host: "127.0.0.1", port: 1)
+        let path = await RemoteInstaller.prepareRemoteSocketPath(host: host)
+        XCTAssertNil(path)
+    }
+
     override func setUpWithError() throws {
         sandboxHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("codeisland-remote-merge-\(UUID().uuidString)")

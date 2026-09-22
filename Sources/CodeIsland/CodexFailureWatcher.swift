@@ -172,6 +172,7 @@ extension AppState {
               session.lastActivity <= ended else { return }
         sessions[sessionId]?.status = .idle
         sessions[sessionId]?.interrupted = true
+        sessions[sessionId]?.lastActivity = ended
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil
         refreshDerivedState()
