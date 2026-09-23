@@ -1725,7 +1725,7 @@ final class AppState {
         let visible = records.filter {
             HookServer.remoteEventPassesCwdFilter(cwd: $0.cwd, filterCSV: cwdFilter)
         }
-        let activeIds = Set(visible.map(\.id))
+        let activeIds = Set(visible.map { "remote:\(hostId):\($0.id)" })
         var discoveredIds = remoteDiscoveredCodexIds[hostId] ?? []
         if visible.isEmpty && discoveredIds.isEmpty { return }
         for id in discoveredIds.subtracting(activeIds) where sessions[id]?.remoteHostId == hostId {
@@ -1733,14 +1733,16 @@ final class AppState {
         }
         discoveredIds.formIntersection(activeIds)
         for record in visible {
+            // Use the same host-scoped identity as HookEvent.
+            let sessionId = "remote:\(hostId):\(record.id)"
             guard !record.id.isEmpty, !record.cwd.isEmpty,
-                  sessions[record.id] == nil || sessions[record.id]?.remoteHostId == hostId else { continue }
-            if sessions[record.id] == nil {
-                discoveredIds.insert(record.id)
+                  sessions[sessionId] == nil || sessions[sessionId]?.remoteHostId == hostId else { continue }
+            if sessions[sessionId] == nil {
+                discoveredIds.insert(sessionId)
             }
             let turnStart = Date(timeIntervalSince1970: record.startedAt > 0 ? record.startedAt : record.modifiedAt)
-            var session = sessions[record.id] ?? SessionSnapshot(startTime: turnStart)
-            if sessions[record.id] == nil { session.lastActivity = turnStart }
+            var session = sessions[sessionId] ?? SessionSnapshot(startTime: turnStart)
+            if sessions[sessionId] == nil { session.lastActivity = turnStart }
             session.source = "codex"
             session.cwd = record.cwd
             session.model = record.model ?? session.model
@@ -1757,8 +1759,8 @@ final class AppState {
                 session.status = .running
                 session.interrupted = false
             }
-            sessions[record.id] = session
-            if activeSessionId == nil { activeSessionId = record.id }
+            sessions[sessionId] = session
+            if activeSessionId == nil { activeSessionId = sessionId }
         }
         remoteDiscoveredCodexIds[hostId] = discoveredIds
         scheduleSave()

@@ -1,4 +1,5 @@
 import XCTest
+import CodeIslandCore
 @testable import CodeIsland
 
 @MainActor
@@ -12,10 +13,10 @@ final class RemoteManagerTests: XCTestCase {
         )
         state.reconcileRemoteCodexSessions([session], hostId: "remote-test", hostName: "server", cwdFilter: "")
         XCTAssertEqual(state.activeSessionCount, 1)
-        XCTAssertEqual(state.sessions[session.id]?.remoteHostId, "remote-test")
+        XCTAssertEqual(state.sessions["remote:remote-test:\(session.id)"]?.remoteHostId, "remote-test")
 
         state.reconcileRemoteCodexSessions([], hostId: "remote-test", hostName: "server", cwdFilter: "")
-        XCTAssertNil(state.sessions[session.id])
+        XCTAssertNil(state.sessions["remote:remote-test:\(session.id)"])
         XCTAssertEqual(state.activeSessionCount, 0)
     }
 
@@ -27,14 +28,14 @@ final class RemoteManagerTests: XCTestCase {
             title: "# Files mentioned by the user:\nimage.png", modifiedAt: now, startedAt: now
         )
         state.reconcileRemoteCodexSessions([session], hostId: "remote-test", hostName: "server", cwdFilter: "")
-        XCTAssertNil(state.sessions[session.id]?.sessionLabel)
+        XCTAssertNil(state.sessions["remote:remote-test:\(session.id)"]?.sessionLabel)
 
         let renamed = RemoteCodexSession(
             id: session.id, cwd: session.cwd, model: nil,
             title: "评估前端兼容方案", modifiedAt: now + 1, startedAt: now
         )
         state.reconcileRemoteCodexSessions([renamed], hostId: "remote-test", hostName: "server", cwdFilter: "")
-        XCTAssertEqual(state.sessions[session.id]?.sessionLabel, "评估前端兼容方案")
+        XCTAssertEqual(state.sessions["remote:remote-test:\(session.id)"]?.sessionLabel, "评估前端兼容方案")
     }
 
     func testFailedRemoteTurnIsNotRevivedByScan() {
@@ -45,9 +46,9 @@ final class RemoteManagerTests: XCTestCase {
             title: nil, modifiedAt: started + 5, startedAt: started
         )
         state.reconcileRemoteCodexSessions([session], hostId: "remote-test", hostName: "server", cwdFilter: "")
-        state.reconcileCodexFailure(sessionId: session.id, ended: Date(timeIntervalSince1970: started + 6))
+        state.reconcileCodexFailure(sessionId: "remote:remote-test:\(session.id)", ended: Date(timeIntervalSince1970: started + 6))
         state.reconcileRemoteCodexSessions([session], hostId: "remote-test", hostName: "server", cwdFilter: "")
-        XCTAssertEqual(state.sessions[session.id]?.status, .idle)
+        XCTAssertEqual(state.sessions["remote:remote-test:\(session.id)"]?.status, .idle)
         XCTAssertEqual(state.activeSessionCount, 0)
 
         let nextTurn = RemoteCodexSession(
@@ -55,8 +56,36 @@ final class RemoteManagerTests: XCTestCase {
             modifiedAt: started + 9, startedAt: started + 8
         )
         state.reconcileRemoteCodexSessions([nextTurn], hostId: "remote-test", hostName: "server", cwdFilter: "")
-        XCTAssertEqual(state.sessions[session.id]?.status, .running)
+        XCTAssertEqual(state.sessions["remote:remote-test:\(session.id)"]?.status, .running)
         XCTAssertEqual(state.activeSessionCount, 1)
+    }
+
+    func testRemoteScanAndHooksShareOneRunningCardInEitherOrder() throws {
+        for hookFirst in [false, true] {
+            let state = AppState()
+            let now = Date().timeIntervalSince1970
+            let record = RemoteCodexSession(
+                id: "same-thread", cwd: "/remote/project", model: nil,
+                title: "Remote task", modifiedAt: now, startedAt: now
+            )
+            func hook(_ name: String) throws -> HookEvent {
+                let data = try JSONSerialization.data(withJSONObject: [
+                    "hook_event_name": name, "session_id": record.id,
+                    "_source": "codex", "_remote_host_id": "remote-test",
+                    "cwd": record.cwd
+                ])
+                return try XCTUnwrap(HookEvent(from: data))
+            }
+            if hookFirst { state.handleEvent(try hook("UserPromptSubmit")) }
+            state.reconcileRemoteCodexSessions([record], hostId: "remote-test", hostName: "server", cwdFilter: "")
+            if !hookFirst { state.handleEvent(try hook("UserPromptSubmit")) }
+            XCTAssertEqual(state.sessions.count, 1)
+            XCTAssertEqual(state.activeSessionCount, 1)
+            XCTAssertEqual(state.sessions["remote:remote-test:same-thread"]?.providerSessionId, record.id)
+            state.handleEvent(try hook("Stop"))
+            state.reconcileRemoteCodexSessions([], hostId: "remote-test", hostName: "server", cwdFilter: "")
+            XCTAssertEqual(state.activeSessionCount, 0)
+        }
     }
 
     func testRecoverySkipsManualDisconnectAndInFlightConnections() {
