@@ -63,6 +63,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         appState.startSessionDiscovery()
         appState.startCodexAppServerWatcher()
+        appState.startAiWorkWatcher()
         RemoteManager.shared.startup()
         codexFailureWatcher = CodexFailureWatcher(state: appState)
         codexFailureWatcher?.start()
@@ -175,6 +176,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         RemoteManager.shared.shutdown()
         hookServer?.stop()
         appState.stopCodexAppServerWatcher()
+        appState.stopAiWorkWatcher()
         appState.stopSessionDiscovery()
     }
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-VERSION = "0.1.6"
+VERSION = "0.3.0"
 # Per-user socket path (#193): CodeIsland injects CODEISLAND_SOCKET_PATH via the hook
 # command, but fall back to a uid-scoped path so multiple users on a shared host never
 # collide on a single /tmp/codeisland.sock.
@@ -24,6 +24,7 @@ TIMEOUT_SECONDS = 300
 # agent side, and a socket timeout of 5 minutes would silently drop the decision
 # of anyone who stepped away (#306).
 BLOCKING_TIMEOUT_SECONDS = 86400
+TRANSCRIPT_TAIL_BYTES = 262144
 
 
 def _normalize_event(name):
@@ -115,12 +116,28 @@ def _normalize_event(name):
     return name
 
 
+def _claude_config_dir():
+    """Claude Code's config dir: $CLAUDE_CONFIG_DIR when set, else ~/.claude (#271).
+
+    The hook runs as a child of Claude Code, so the variable here is the one that
+    Claude Code itself used — authoritative, with no fallback to ~/.claude when it
+    is set. Same rules as _claude_config_dir() in the remote install script, and
+    deliberately NO Unicode normalization: ext4/xfs are byte-preserving, so an
+    NFC-normalized path can name a directory that does not exist.
+    """
+    raw = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if raw:
+        expanded = os.path.expanduser(raw)
+        if os.path.isabs(expanded) and expanded.strip("/") != "":
+            return expanded
+    return os.path.join(os.path.expanduser("~"), ".claude")
+
+
 def _claude_jsonl_path(session_id, cwd):
     if not session_id or not cwd:
         return None
-    home = os.path.expanduser("~")
     project_dir = cwd.replace("/", "-").replace(".", "-")
-    path = os.path.join(home, ".claude", "projects", project_dir, f"{session_id}.jsonl")
+    path = os.path.join(_claude_config_dir(), "projects", project_dir, f"{session_id}.jsonl")
     return path if os.path.exists(path) else None
 
 
@@ -146,6 +163,29 @@ def _codebuddy_jsonl_path(session_id, cwd):
     return path if os.path.exists(path) else None
 
 
+def _extract_text(content):
+    """Mirror of the Mac-side JSONLTailer.extractText: a bare string (minus any
+    <USER_REQUEST> wrapper), or every `text` block of a content array joined by
+    newlines. tool_use / tool_result / thinking blocks carry no chat text."""
+    if isinstance(content, str):
+        text = content
+        start = text.find("<USER_REQUEST>")
+        if start != -1:
+            end = text.find("</USER_REQUEST>", start + len("<USER_REQUEST>"))
+            if end != -1:
+                text = text[start + len("<USER_REQUEST>"):end]
+        return text.strip() or None
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                text = block["text"].strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts) if parts else None
+    return None
+
+
 def _scan_session_jsonl(path):
     if not path:
         return {}
@@ -165,21 +205,44 @@ def _scan_session_jsonl(path):
                     payload = json.loads(line)
                 except Exception:
                     continue
-
-                msg_type = payload.get("type")
-                role = payload.get("role")
-                content = payload.get("content")
-                if not isinstance(content, str) or not content.strip():
+                # isMeta rows (local-command caveats etc.) are not chat — the Mac
+                # side skips them too.
+                if not isinstance(payload, dict) or payload.get("isMeta") is True:
                     continue
 
-                if msg_type == "summary" and not summary:
-                    summary = content
-                if role == "user":
-                    if not first_user:
+                # Current Claude Code (and Qoder) rows nest the chat message:
+                # {"type":"assistant","message":{"role":"assistant","content":[...]}}.
+                # The older top-level {"role":..,"content":".."} shape stays as the
+                # fallback. Same resolution as the Mac-side Claude transcript reader.
+                msg_type = payload.get("type")
+                message = payload.get("message")
+                nested = isinstance(message, dict)
+                if not nested:
+                    message = payload
+                role = message.get("role") or msg_type
+                role = role.lower() if isinstance(role, str) else None
+                content = message.get("content")
+
+                if not nested and isinstance(content, str) and content.strip():
+                    # Legacy shape only, unchanged: its summary / first prompt
+                    # titles the session. Nested Claude rows never do — the Mac
+                    # titles Claude sessions from custom-title / ai-title records,
+                    # never from the first prompt.
+                    if msg_type == "summary" and not summary:
+                        summary = content
+                    if role == "user" and not first_user:
                         first_user = content
-                    last_user = content
+
+                if role == "user":
+                    text = _extract_text(content)
+                    if text:
+                        last_user = text
                 elif role == "assistant":
-                    last_assistant = content
+                    text = _extract_text(content)
+                    if not text and isinstance(message.get("thinking"), str):
+                        text = message["thinking"].strip() or None
+                    if text:
+                        last_assistant = text
     except Exception:
         return {}
 
@@ -200,6 +263,91 @@ def _scan_qoder_jsonl(session_id, cwd):
 
 def _scan_codebuddy_jsonl(session_id, cwd):
     return _scan_session_jsonl(_codebuddy_jsonl_path(session_id, cwd))
+
+
+def _codex_public_text(payload, allow_agent_message=False):
+    """Return only Codex text that is intended for the user-facing transcript."""
+    if not isinstance(payload, dict):
+        return None
+
+    item_type = payload.get("type")
+    if allow_agent_message and item_type == "agent_message":
+        message = payload.get("message")
+        return message.strip() if isinstance(message, str) and message.strip() else None
+
+    blocks = None
+    accepted_types = set()
+    if item_type == "message" and payload.get("role") == "assistant":
+        blocks = payload.get("content")
+        accepted_types = {"output_text"}
+    if not isinstance(blocks, list):
+        return None
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") not in accepted_types:
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts) if parts else None
+
+
+def _scan_codex_jsonl(path):
+    """Read a bounded rollout tail and return the current turn's public output."""
+    if not isinstance(path, str) or not path.strip():
+        return {}
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return {}
+
+    event_user_indices = []
+    fallback_user_indices = []
+    public_messages = []
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - TRANSCRIPT_TAIL_BYTES)
+            handle.seek(start)
+            if start:
+                handle.readline()  # discard a partial JSONL record
+            lines = handle.read().decode("utf-8", errors="ignore").splitlines()
+
+        for index, line in enumerate(lines):
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            record_type = record.get("type")
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            payload_type = payload.get("type")
+            if record_type == "event_msg" and payload_type == "user_message":
+                event_user_indices.append(index)
+            elif (record_type == "response_item" and payload_type == "message"
+                  and payload.get("role") == "user"):
+                fallback_user_indices.append(index)
+
+            if record_type == "event_msg" and payload_type == "agent_message":
+                text = _codex_public_text(payload, allow_agent_message=True)
+            elif record_type == "response_item":
+                text = _codex_public_text(payload)
+            else:
+                text = None
+            if text:
+                public_messages.append((index, text))
+    except Exception:
+        return {}
+
+    if not public_messages:
+        return {}
+    last_user_index = max(event_user_indices + fallback_user_indices, default=-1)
+    output_index, output = public_messages[-1]
+    if output_index <= last_user_index:
+        return {}
+    return {"last_assistant_message": output[:4000]}
 
 
 def _read_stdin_json():
@@ -352,6 +500,11 @@ def main():
             prompt = extras.get("last_user_message")
             if prompt:
                 payload["prompt"] = prompt
+
+    if SOURCE == "codex" and normalized_event not in {"SessionStart", "UserPromptSubmit"}:
+        extras = _scan_codex_jsonl(payload.get("transcript_path"))
+        if extras.get("last_assistant_message") and not payload.get("last_assistant_message"):
+            payload["last_assistant_message"] = extras["last_assistant_message"]
 
     # Blocking events: permission prompts + question prompts
     expects_response = normalized_event == "PermissionRequest" or (

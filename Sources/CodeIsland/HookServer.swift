@@ -304,12 +304,12 @@ class HookServer {
 
     static func routeKind(for event: HookEvent) -> RouteKind {
         let normalizedEventName = EventNormalizer.normalize(event.eventName)
-        let source = event.rawJSON["_source"] as? String
-        let normalizedSource = SessionSnapshot.normalizedSupportedSource(source)
-        let isGeminiBasedSource = normalizedSource == "google-antigravity" || normalizedSource == "gemini"
-        // Gemini CLI and Google Antigravity send their blocking approval as PreToolUse.
-        // Route those source-tagged events through the same permission UI path.
-        if normalizedEventName == "PermissionRequest" || (isGeminiBasedSource && normalizedEventName == "PreToolUse") {
+        // Google Antigravity's PreToolUse stays a plain activity event. Its hook
+        // cannot approve a call (an `allow` is ignored and Antigravity prompts
+        // anyway), so an island card in front of it only doubled every approval
+        // and left a card behind when the user answered in Antigravity. The
+        // bridge has already told Antigravity to decide for itself (#339).
+        if normalizedEventName == "PermissionRequest" {
             return .permission
         }
         if normalizedEventName == "Notification", QuestionPayload.from(event: event) != nil {
@@ -767,7 +767,7 @@ class HookServer {
 
             // AskUserQuestion is a question, not a permission — route to QuestionBar
             if event.toolName == "AskUserQuestion" {
-                monitorPeerDisconnect(connection: connection, sessionId: sessionId)
+                monitorPeerDisconnect(connection: connection, sessionId: sessionId, agentId: event.agentId)
                 Task {
                     let responseBody = await withCheckedContinuation { continuation in
                         appState.handleAskUserQuestion(event, continuation: continuation)
@@ -782,7 +782,7 @@ class HookServer {
                 return
             }
 
-            monitorPeerDisconnect(connection: connection, sessionId: sessionId)
+            monitorPeerDisconnect(connection: connection, sessionId: sessionId, agentId: event.agentId)
             Task {
                 let responseBody = await withCheckedContinuation { continuation in
                     appState.handlePermissionRequest(event, continuation: continuation)
@@ -792,7 +792,7 @@ class HookServer {
 
         case .question:
             let questionSessionId = event.sessionId ?? "default"
-            monitorPeerDisconnect(connection: connection, sessionId: questionSessionId)
+            monitorPeerDisconnect(connection: connection, sessionId: questionSessionId, agentId: event.agentId)
             Task {
                 let responseBody = await withCheckedContinuation { continuation in
                     appState.handleQuestion(event, continuation: continuation)
@@ -830,7 +830,7 @@ class HookServer {
     /// That caused every PermissionRequest to be auto-drained as `deny` before the UI
     /// card was even visible. We now rely on `stateUpdateHandler` transitioning to
     /// `cancelled`/`failed` — which only happens on real socket teardown, not half-close.
-    private func monitorPeerDisconnect(connection: NWConnection, sessionId: String) {
+    private func monitorPeerDisconnect(connection: NWConnection, sessionId: String, agentId: String?) {
         let context = ConnectionContext()
         let connId = ObjectIdentifier(connection)
         connectionContexts[connId] = context
@@ -841,7 +841,7 @@ class HookServer {
                 switch state {
                 case .cancelled, .failed:
                     if !context.responded {
-                        self.appState.handlePeerDisconnect(sessionId: sessionId)
+                        self.appState.handlePeerDisconnect(sessionId: sessionId, agentId: agentId)
                     }
                     self.connectionContexts.removeValue(forKey: connId)
                 default:

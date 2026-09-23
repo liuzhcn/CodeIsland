@@ -5,9 +5,13 @@ import XCTest
 /// files, never replace whole event keys. Every SSH connect re-runs the script,
 /// so a replace would wipe user-authored hooks (e.g. a custom SessionStart) on
 /// each connection. These tests execute the real embedded Python script against
-/// a sandbox $HOME.
+/// a sandbox $HOME and a sandbox PATH; the same harness also covers where the
+/// script looks for config dirs (#342 custom CLIs).
 final class RemoteInstallerHookMergeTests: XCTestCase {
     private var sandboxHome: URL!
+    /// The only directory on the script's PATH. Empty unless a test drops a fake
+    /// executable in it, so `shutil.which` never sees the developer's own CLIs.
+    private var sandboxBin: URL!
 
     func testFailedUIDProbeDoesNotFallBackToSharedSocket() async {
         let host = RemoteHost(name: "unreachable", host: "127.0.0.1", port: 1)
@@ -19,23 +23,36 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
         sandboxHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("codeisland-remote-merge-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: sandboxHome, withIntermediateDirectories: true)
+        sandboxBin = sandboxHome.appendingPathComponent(".test-bin")
+        try FileManager.default.createDirectory(at: sandboxBin, withIntermediateDirectories: true)
     }
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: sandboxHome)
     }
 
-    private func runConfigureScript() throws {
+    /// Runs the real embedded install script against the sandbox $HOME and returns
+    /// its status line (the text Settings → Remote shows for the host).
+    @discardableResult
+    private func runConfigureScript(
+        customCLIs: [CLIConfig] = [],
+        environment overrides: [String: String] = [:]
+    ) throws -> String {
         let host = RemoteHost(name: "test-host", host: "example.invalid")
-        let script = RemoteInstaller.configureRemoteHooksScript(host: host, remoteSocketPath: "/tmp/ci-test.sock", customCLIs: [])
+        let script = RemoteInstaller.configureRemoteHooksScript(host: host, remoteSocketPath: "/tmp/ci-test.sock", customCLIs: customCLIs)
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", "-"]
+        // Absolute interpreter so PATH can be pinned to the sandbox bin dir.
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-"]
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = sandboxHome.path
-        // Keep the script away from any real Codex home configured in the caller env.
+        environment["PATH"] = sandboxBin.path
+        // Keep the script away from any real Codex / Claude config dir configured in
+        // the caller env — it would otherwise write hooks there.
         environment.removeValue(forKey: "CODEX_HOME")
+        environment.removeValue(forKey: "CLAUDE_CONFIG_DIR")
+        for (key, value) in overrides { environment[key] = value }
         process.environment = environment
 
         let stdin = Pipe()
@@ -49,8 +66,21 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
         stdin.fileHandleForWriting.closeFile()
         process.waitUntilExit()
 
+        let out = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         XCTAssertEqual(process.terminationStatus, 0, "configure script failed: \(err)")
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Puts a fake executable on the script's PATH, as if the CLI were installed.
+    private func installFakeBinary(_ name: String) throws {
+        let url = sandboxBin.appendingPathComponent(name)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    private func fileExists(_ relativePath: String) -> Bool {
+        FileManager.default.fileExists(atPath: sandboxHome.appendingPathComponent(relativePath).path)
     }
 
     private func writeJSON(_ object: [String: Any], to relativePath: String) throws {
@@ -185,11 +215,14 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
             "a permission prompt waits on a person; a 60s timeout would abandon it: \(timeouts)"
         )
 
-        // The tool events the local installer registers must be there too, or the
-        // card sits on "running" with no idea what the agent is doing.
-        for event in ["PreToolUse", "PostToolUse", "SessionEnd"] {
-            XCTAssertNotNil(hooks[event] as? [[String: Any]], "missing \(event)")
-        }
+        // Remote Codex must mirror every officially supported local lifecycle
+        // event or remote cards lose status detail that local cards retain.
+        let expectedEvents: Set<String> = [
+            "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact",
+            "PostCompact", "SessionStart", "SessionEnd", "SubagentStart",
+            "SubagentStop", "UserPromptSubmit", "Stop", "Interrupt",
+        ]
+        XCTAssertEqual(Set(hooks.keys), expectedEvents)
     }
 
     func testQoderInstallIsIdempotentAcrossReconnects() throws {
@@ -208,5 +241,237 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
         let cmds = commands(in: stop)
         XCTAssertEqual(cmds.filter { $0.contains("keep-qoder") }.count, 1, "user hook duplicated or lost: \(cmds)")
         XCTAssertEqual(cmds.filter { $0.contains("CODEISLAND_SOURCE=qoder") }.count, 1, "our hook not deduped: \(cmds)")
+    }
+
+    // MARK: - $CLAUDE_CONFIG_DIR on the remote host (#271)
+
+    private func assertOurClaudeHooks(in settingsPath: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        let settings = try readJSON(settingsPath)
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any], file: file, line: line)
+        let stop = try XCTUnwrap(hooks["Stop"] as? [[String: Any]], file: file, line: line)
+        XCTAssertTrue(
+            commands(in: stop).contains { $0.contains("CODEISLAND_SOURCE=claude") },
+            "our Claude hook missing from \(settingsPath)", file: file, line: line
+        )
+    }
+
+    /// Claude Code reads hooks from $CLAUDE_CONFIG_DIR/settings.json, so that is
+    /// where they must go — a write to ~/.claude would never fire.
+    func testClaudeInstallHonoursClaudeConfigDir() throws {
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent("claude-work"),
+            withIntermediateDirectories: true
+        )
+
+        let status = try runConfigureScript(environment: [
+            "CLAUDE_CONFIG_DIR": sandboxHome.appendingPathComponent("claude-work").path,
+        ])
+
+        try assertOurClaudeHooks(in: "claude-work/settings.json")
+        XCTAssertFalse(fileExists(".claude"), "hooks leaked into ~/.claude, which Claude Code does not read")
+        XCTAssertTrue(status.contains("Claude ok (~/claude-work)"), status)
+    }
+
+    func testClaudeConfigDirWithTildeExpandsAgainstRemoteHome() throws {
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent("claude-work"),
+            withIntermediateDirectories: true
+        )
+
+        try runConfigureScript(environment: ["CLAUDE_CONFIG_DIR": "~/claude-work/"])
+
+        try assertOurClaudeHooks(in: "claude-work/settings.json")
+        XCTAssertFalse(fileExists("~"))
+    }
+
+    /// Unset (or unusable) keeps today's behaviour exactly, status text included.
+    func testClaudeInstallWithoutClaudeConfigDirUsesDotClaude() throws {
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent(".claude"),
+            withIntermediateDirectories: true
+        )
+
+        let status = try runConfigureScript()
+
+        try assertOurClaudeHooks(in: ".claude/settings.json")
+        XCTAssertTrue(status.hasPrefix("Claude ok · "), status)
+    }
+
+    func testRelativeClaudeConfigDirFallsBackToDotClaude() throws {
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent(".claude"),
+            withIntermediateDirectories: true
+        )
+
+        let status = try runConfigureScript(environment: ["CLAUDE_CONFIG_DIR": "claude-work"])
+
+        try assertOurClaudeHooks(in: ".claude/settings.json")
+        XCTAssertFalse(fileExists("claude-work"))
+        XCTAssertTrue(status.hasPrefix("Claude ok · "), status)
+    }
+
+    /// The trap from the #270 attempt: Claude Code on PATH but never run with the
+    /// custom dir, so the dir does not exist yet. An early return on the missing
+    /// dir made the `which claude` check unreachable and installed nothing.
+    func testClaudeConfigDirAbsentButClaudeOnPathStillInstalls() throws {
+        try installFakeBinary("claude")
+
+        let status = try runConfigureScript(environment: [
+            "CLAUDE_CONFIG_DIR": sandboxHome.appendingPathComponent("claude-work").path,
+        ])
+
+        try assertOurClaudeHooks(in: "claude-work/settings.json")
+        XCTAssertFalse(fileExists(".claude"))
+        XCTAssertTrue(status.contains("Claude ok (~/claude-work)"), status)
+    }
+
+    /// Same direction without the variable: a fresh host with Claude Code on PATH
+    /// still gets ~/.claude hooks.
+    func testNoConfigDirButClaudeOnPathInstallsIntoDotClaude() throws {
+        try installFakeBinary("claude")
+
+        try runConfigureScript()
+
+        try assertOurClaudeHooks(in: ".claude/settings.json")
+    }
+
+    func testClaudeSkippedWhenNeitherConfigDirNorBinaryExists() throws {
+        let withVar = try runConfigureScript(environment: [
+            "CLAUDE_CONFIG_DIR": sandboxHome.appendingPathComponent("claude-work").path,
+        ])
+        XCTAssertTrue(withVar.hasPrefix("Claude skipped (config dir not found: ~/claude-work) · "), withVar)
+        XCTAssertFalse(fileExists("claude-work"))
+        XCTAssertFalse(fileExists(".claude"))
+
+        let withoutVar = try runConfigureScript()
+        XCTAssertTrue(withoutVar.hasPrefix("Claude skipped · "), withoutVar)
+        XCTAssertFalse(fileExists(".claude"))
+    }
+
+    /// ext4/xfs are byte-preserving: the path must be used exactly as given. A
+    /// decomposed name normalized to NFC (as the macOS-side resolver does) would be
+    /// a different, non-existent directory on Linux. APFS lookups can't observe the
+    /// difference, so compare the bytes the script reports.
+    func testClaudeConfigDirIsNotUnicodeNormalized() throws {
+        let decomposed = "cafe\u{0301}-claude"
+        XCTAssertNotEqual(Array(decomposed.utf8), Array(decomposed.precomposedStringWithCanonicalMapping.utf8))
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent(decomposed),
+            withIntermediateDirectories: true
+        )
+
+        let status = try runConfigureScript(environment: [
+            "CLAUDE_CONFIG_DIR": sandboxHome.path + "/" + decomposed,
+        ])
+
+        XCTAssertNotNil(
+            Data(status.utf8).range(of: Data("Claude ok (~/\(decomposed))".utf8)),
+            "config dir was not used byte-for-byte: \(status)"
+        )
+    }
+
+    // MARK: - Custom CLIs on the remote host (#342)
+
+    private func corpCodex(configPath: String) -> CLIConfig {
+        CLIConfig(
+            name: "corp_codex", source: "corp_codex",
+            configPath: configPath, configKey: "hooks",
+            format: .nested,
+            events: ConfigInstaller.defaultEvents(for: .nested)
+        )
+    }
+
+    /// #342 — a custom CLI whose config path was typed as `~/…` (how Settings
+    /// displays every path) was joined onto the remote $HOME verbatim, giving
+    /// `$HOME/~/…`. That dir never exists, so the CLI was always "skipped" even
+    /// though its real config dir was right there.
+    func testCustomCLITildeConfigPathResolvesAgainstRemoteHome() throws {
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent(".corp/engine/codex"),
+            withIntermediateDirectories: true
+        )
+
+        let status = try runConfigureScript(customCLIs: [corpCodex(configPath: "~/.corp/engine/codex/hooks.json")])
+
+        XCTAssertTrue(status.contains("corp_codex ok"), status)
+        let config = try readJSON(".corp/engine/codex/hooks.json")
+        let hooks = try XCTUnwrap(config["hooks"] as? [String: Any])
+        let sessionStart = try XCTUnwrap(hooks["SessionStart"] as? [[String: Any]])
+        XCTAssertTrue(commands(in: sessionStart).contains { $0.contains("CODEISLAND_SOURCE=corp_codex") })
+        XCTAssertFalse(fileExists("~"), "a literal ~ directory was created under the remote home")
+    }
+
+    /// The same path spelled with the Mac's own home prefix must land under the
+    /// remote home too — `/Users/<me>/…` does not exist on a Linux host.
+    func testCustomCLIMacHomeConfigPathResolvesAgainstRemoteHome() throws {
+        // Unique name: a regression must not be able to write into the real home.
+        let dir = ".corp-\(UUID().uuidString)/engine/codex"
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent(dir),
+            withIntermediateDirectories: true
+        )
+        let macPath = NSHomeDirectory() + "/\(dir)/hooks.json"
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath(macPath), "\(dir)/hooks.json")
+
+        let status = try runConfigureScript(customCLIs: [corpCodex(configPath: macPath)])
+
+        XCTAssertTrue(status.contains("corp_codex ok"), status)
+        XCTAssertTrue(fileExists("\(dir)/hooks.json"))
+    }
+
+    func testRemoteCustomConfigPathNormalization() {
+        let home = "/Users/me"
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath("~/.x/hooks.json", localHome: home), ".x/hooks.json")
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath("~//.x/hooks.json", localHome: home), ".x/hooks.json")
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath(".x/hooks.json", localHome: home), ".x/hooks.json")
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath("/Users/me/.x/hooks.json", localHome: home), ".x/hooks.json")
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath("  ~/.x/hooks.json ", localHome: home), ".x/hooks.json")
+        // Absolute paths outside the Mac home are meant literally.
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath("/opt/tool/hooks.json", localHome: home), "/opt/tool/hooks.json")
+        // Only a whole path component counts as the home prefix.
+        XCTAssertEqual(RemoteInstaller.remoteCustomConfigPath("/Users/meg/.x/hooks.json", localHome: home), "/Users/meg/.x/hooks.json")
+    }
+
+    /// "skipped" alone gave the user nothing to act on: the status line now names
+    /// the directory that was looked for on the remote host.
+    func testCustomCLISkipNamesTheMissingConfigDir() throws {
+        let status = try runConfigureScript(customCLIs: [corpCodex(configPath: "~/.corp/engine/codex/hooks.json")])
+
+        XCTAssertTrue(
+            status.contains("corp_codex skipped (config dir not found: ~/.corp/engine/codex)"),
+            status
+        )
+        XCTAssertFalse(fileExists(".corp"), "a skipped CLI must not get a config dir created")
+    }
+
+    /// The other half of the guard still holds: with the CLI's binary on PATH the
+    /// install goes ahead and creates the config dir.
+    func testCustomCLIWithBinaryOnPathInstallsWithoutConfigDir() throws {
+        try installFakeBinary("corp_codex")
+
+        let status = try runConfigureScript(customCLIs: [corpCodex(configPath: "~/.corp/engine/codex/hooks.json")])
+
+        XCTAssertTrue(status.contains("corp_codex ok"), status)
+        XCTAssertTrue(fileExists(".corp/engine/codex/hooks.json"))
+    }
+
+    /// Templates the remote hook cannot drive used to vanish from the status line
+    /// entirely; they are now reported, and still never installed.
+    func testUnsupportedCustomTemplateIsReportedNotInstalled() throws {
+        try FileManager.default.createDirectory(
+            at: sandboxHome.appendingPathComponent(".cl"),
+            withIntermediateDirectories: true
+        )
+        let flat = CLIConfig(
+            name: "CursorLike", source: "cursorlike",
+            configPath: ".cl/hooks.json", configKey: "hooks",
+            format: .flat,
+            events: [("beforeSubmitPrompt", 5, false)]
+        )
+
+        let status = try runConfigureScript(customCLIs: [flat])
+
+        XCTAssertTrue(status.contains("CursorLike skipped (template not supported remotely)"), status)
+        XCTAssertFalse(fileExists(".cl/hooks.json"))
     }
 }

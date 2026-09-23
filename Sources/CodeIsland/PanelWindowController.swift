@@ -677,6 +677,12 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         return false
     }
 
+    /// Whether the island currently holds keyboard focus. It only becomes key
+    /// when the user clicks into it (NotchHostingView.mouseDown).
+    var isPanelKeyWindow: Bool {
+        panel?.isKeyWindow == true
+    }
+
     /// Fast check: is the terminal running the active session the foreground app?
     /// Main-thread safe — no AppleScript or subprocess calls.
     func isActiveTerminalForeground() -> Bool {

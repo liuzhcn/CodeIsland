@@ -172,6 +172,160 @@ final class AppStateAnswerRoutingTests: XCTestCase {
         XCTAssertEqual(behavior, "deny")
     }
 
+    // MARK: - Answer state across cards (#333)
+
+    /// The #333 report, end to end: two sessions each ask one question. The
+    /// first card is answered, the second session's card replaces it in the
+    /// same slot, and the second session used to receive the first answer
+    /// ("是否立即触发构建？ → openURL 传裸路径"), because the card's answer
+    /// state survived the swap and answers are mapped by position.
+    func testEachSessionReceivesOnlyTheAnswerGivenOnItsOwnCard() async throws {
+        let appState = AppState()
+        let first = try makeAskUserQuestionEvent(
+            sessionId: "s-openurl",
+            text: "How should openURL receive the path?",
+            options: ["openURL 传裸路径", "file:// URL"]
+        )
+        let second = try makeAskUserQuestionEvent(
+            sessionId: "s-build",
+            text: "是否立即触发构建（含后续飞书通知）？",
+            options: ["立即触发", "稍后"]
+        )
+
+        let firstResponse = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(first, continuation: $0) }
+        }
+        await Task.yield()
+        let secondResponse = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(second, continuation: $0) }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.surface, .questionCard(sessionId: "s-openurl"))
+
+        // One wizard for both cards: the worst case, where the view keeps its
+        // @State across the swap.
+        var wizard = QuestionWizardState()
+        try chooseOnCardOnScreen("openURL 传裸路径", in: appState, wizard: &wizard)
+
+        guard assertQueue(
+            appState.questionQueue.map { $0.event.sessionId },
+            ["s-build"],
+            "answering the first card must resolve only the first session"
+        ) else { return }
+        let firstAnswers = try extractAnswers(from: await firstResponse.value)
+        XCTAssertEqual(
+            firstAnswers as? [String: String],
+            ["How should openURL receive the path?": "openURL 传裸路径"]
+        )
+
+        // The second session's card is promoted into the same slot.
+        XCTAssertEqual(appState.surface, .questionCard(sessionId: "s-build"))
+        try chooseOnCardOnScreen("立即触发", in: appState, wizard: &wizard)
+
+        guard assertQueue(
+            appState.questionQueue.map { $0.event.sessionId },
+            [],
+            "the second card's answer must resolve the second session"
+        ) else { return }
+        let secondAnswers = try extractAnswers(from: await secondResponse.value)
+        XCTAssertEqual(
+            secondAnswers as? [String: String],
+            ["是否立即触发构建（含后续飞书通知）？": "立即触发"],
+            "the second session must get the answer given on its own card, never the first session's"
+        )
+    }
+
+    /// Model-side guard for the same failure: whatever the view does, a set of
+    /// answers that is not one-per-question for this request is never mapped
+    /// onto its questions by position.
+    func testAnswerSetCollectedForAnotherRequestIsRefused() async throws {
+        let appState = AppState()
+        let first = try makeAskUserQuestionEvent(sessionId: "s-first", text: "First?")
+        let second = try makeAskUserQuestionEvent(sessionId: "s-second", text: "Second?")
+
+        _ = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(first, continuation: $0) }
+        }
+        await Task.yield()
+        let secondResponse = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(second, continuation: $0) }
+        }
+        await Task.yield()
+
+        // What the card sent before the fix: the first card's answer leading
+        // the second card's.
+        appState.answerQuestionMulti([
+            AskUserQuestionAnswer(question: "First?", answer: "No", selectedOptions: ["No"], customInput: nil),
+            AskUserQuestionAnswer(question: "Second?", answer: "Yes", selectedOptions: ["Yes"], customInput: nil),
+        ], expectedSessionId: "s-second")
+        // Right size, wrong question.
+        appState.answerQuestionMulti(
+            [AskUserQuestionAnswer(question: "First?", answer: "No", selectedOptions: ["No"], customInput: nil)],
+            expectedSessionId: "s-second"
+        )
+
+        guard assertQueue(
+            appState.questionQueue.map { $0.event.sessionId },
+            ["s-first", "s-second"],
+            "answers that do not belong to the request must not resolve it"
+        ) else { return }
+
+        appState.answerQuestionMulti(
+            [AskUserQuestionAnswer(question: "Second?", answer: "Yes", selectedOptions: ["Yes"], customInput: nil)],
+            expectedSessionId: "s-second"
+        )
+        guard assertQueue(
+            appState.questionQueue.map { $0.event.sessionId },
+            ["s-first"],
+            "the request's own answer still goes through"
+        ) else { return }
+        let answers = try extractAnswers(from: await secondResponse.value)
+        XCTAssertEqual(answers as? [String: String], ["Second?": "Yes"])
+    }
+
+    /// The card is keyed by request, not session: the next request of the
+    /// same session (or of another agent in it) must get a fresh card, and a
+    /// request keeps its card while it is updated in place.
+    func testQuestionCardIdentityIsPerRequest() async throws {
+        let appState = AppState()
+        let first = try makeAskUserQuestionEvent(sessionId: "s-a", text: "First?")
+        let second = try makeAskUserQuestionEvent(sessionId: "s-b", text: "Second?")
+
+        _ = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(first, continuation: $0) }
+        }
+        await Task.yield()
+        let firstId = try XCTUnwrap(appState.pendingQuestion(forSession: "s-a")?.id)
+
+        _ = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(second, continuation: $0) }
+        }
+        await Task.yield()
+        let secondId = try XCTUnwrap(appState.pendingQuestion(forSession: "s-b")?.id)
+        XCTAssertNotEqual(firstId, secondId)
+        XCTAssertEqual(
+            appState.pendingQuestion(forSession: "s-a")?.id,
+            firstId,
+            "queueing another request must not change a shown card's identity"
+        )
+
+        appState.questionQueue[0].askUserQuestionState?.answers["First?"] = "Yes"
+        XCTAssertEqual(
+            appState.pendingQuestion(forSession: "s-a")?.id,
+            firstId,
+            "a partial answer (iPhone) updates the request in place, same card"
+        )
+
+        // The same session asking again is a different request.
+        let again = try makeAskUserQuestionEvent(sessionId: "s-a", text: "First?")
+        _ = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(again, continuation: $0) }
+        }
+        await Task.yield()
+        let againId = try XCTUnwrap(appState.pendingQuestion(forSession: "s-a")?.id)
+        XCTAssertNotEqual(againId, firstId, "a re-asked question must not inherit the previous card's state")
+    }
+
     // MARK: - Permissions
 
     func testApproveGoesToTheCardsSessionWhenAnotherSessionIsQueuedFirst() async throws {
@@ -520,6 +674,39 @@ final class AppStateAnswerRoutingTests: XCTestCase {
         _ = await secondResponse.value
     }
 
+    /// Same as above for AskUserQuestion. The non-head branch handed the
+    /// answer to answerQuestion(), which ignores wizard requests, so an
+    /// iPhone answer for any session but the head was silently dropped.
+    func testCompanionAnswerReachesAnAskUserQuestionQueuedBehindAnotherSession() async throws {
+        let appState = AppState()
+        let first = try makeAskUserQuestionEvent(sessionId: "s-first", text: "First?")
+        let second = try makeAskUserQuestionEvent(sessionId: "s-second", text: "Second?")
+
+        _ = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(first, continuation: $0) }
+        }
+        await Task.yield()
+        let secondResponse = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(second, continuation: $0) }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.questionQueue.count, 2)
+
+        appState.answerCompanionQuestion("No", expectedSessionId: "s-second")
+
+        guard assertQueue(
+            appState.questionQueue.map { $0.event.sessionId },
+            ["s-first"],
+            "the phone's answer must resolve the AskUserQuestion it named"
+        ) else { return }
+        XCTAssertNil(
+            appState.questionQueue[0].askUserQuestionState?.answers["First?"],
+            "the head session's question must not be touched"
+        )
+        let answers = try extractAnswers(from: await secondResponse.value)
+        XCTAssertEqual(answers as? [String: String], ["Second?": "No"])
+    }
+
     // MARK: - Helpers
 
     /// Assert the post-action queue, and report whether it held. Every await in
@@ -537,7 +724,11 @@ final class AppStateAnswerRoutingTests: XCTestCase {
         return actual == expectedOptionals
     }
 
-    private func makeAskUserQuestionEvent(sessionId: String, text: String) throws -> HookEvent {
+    private func makeAskUserQuestionEvent(
+        sessionId: String,
+        text: String,
+        options: [String] = ["Yes", "No"]
+    ) throws -> HookEvent {
         let payload: [String: Any] = [
             "hook_event_name": "PermissionRequest",
             "session_id": sessionId,
@@ -546,11 +737,35 @@ final class AppStateAnswerRoutingTests: XCTestCase {
                 "questions": [[
                     "question": text,
                     "header": "Pick",
-                    "options": [["label": "Yes", "description": ""], ["label": "No", "description": ""]],
+                    "options": options.map { ["label": $0, "description": ""] },
                 ]]
             ],
         ]
         return try makeEvent(payload)
+    }
+
+    /// Pick `option` on the question card that is on screen, the way
+    /// QuestionBar does — through `wizard`, which (like the view's @State)
+    /// the caller keeps across cards — and submit it from that card.
+    private func chooseOnCardOnScreen(
+        _ option: String,
+        in appState: AppState,
+        wizard: inout QuestionWizardState
+    ) throws {
+        let sid = try XCTUnwrap(appState.surface.questionSessionId, "a question card must be on screen")
+        let card = try XCTUnwrap(appState.pendingQuestion(forSession: sid))
+        let items = try XCTUnwrap(card.askUserQuestionState?.items)
+        let chosen = AskUserQuestionAnswer(
+            question: items[0].payload.question,
+            answer: option,
+            selectedOptions: [option],
+            customInput: nil
+        )
+        let submission = try XCTUnwrap(
+            wizard.record(chosen, for: card.id, questionCount: items.count),
+            "a single-question card submits on its only answer"
+        )
+        appState.answerQuestionMulti(submission, expectedSessionId: sid)
     }
 
     private func makeNotificationQuestionEvent(sessionId: String, text: String) throws -> HookEvent {

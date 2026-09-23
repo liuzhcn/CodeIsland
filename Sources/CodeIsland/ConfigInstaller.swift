@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CodeIslandCore
 import Yams
 
@@ -23,8 +24,9 @@ enum HookFormat {
     case nested
     /// Cursor style: [{command: "..."}]
     case flat
-    /// Trae IDE / Trae CN style:
+    /// Trae IDE / Trae CN (TraeCode desktop) style:
     /// {version, hooks: {event: [{matcher, loop_limit, hooks: [{type, command, timeout}]}]}}
+    /// with Claude-style PascalCase event names.
     case traeIDE
     /// TraeCli style: YAML managed block in ~/.trae/traecli.yaml
     case traecli
@@ -300,7 +302,12 @@ struct ConfigInstaller {
                 // stays in "running" and the approval sound never plays —
                 // see issue #145 and developers.openai.com/codex/hooks.
                 ("PermissionRequest", 86400, false),
+                ("PreCompact", 5, false),
+                ("PostCompact", 5, false),
+                ("SubagentStart", 5, false),
+                ("SubagentStop", 5, false),
                 ("Stop", 5, false),
+                ("Interrupt", 5, false),
             ],
             rootOverride: { ConfigInstaller.codexHome() },
             displayPathOverride: { ConfigInstaller.displayCodexPath(filename: "hooks.json") }
@@ -663,7 +670,7 @@ struct ConfigInstaller {
                 ("PostToolUse", 5, false),
                 ("Stop", 5, false),
             ]
-        case .flat, .traeIDE:
+        case .flat:
             return [
                 ("beforeSubmitPrompt", 5, false),
                 ("beforeShellExecution", 5, false),
@@ -675,6 +682,22 @@ struct ConfigInstaller {
                 ("afterAgentThought", 5, false),
                 ("afterAgentResponse", 5, false),
                 ("stop", 5, false),
+            ]
+        case .traeIDE:
+            // TraeCode (Trae / Trae CN desktop) fires exactly these six
+            // Claude-style events; both editions document the same list
+            // (docs.trae.ai/ide/hook-configuration-reference,
+            // docs.trae.cn/ide_hook-configuration-reference). The Cursor-style
+            // camelCase names we used to share with `.flat` never fire there.
+            // Notification runs async and TRAE ignores its stdout, so it gets
+            // the same short timeout as the status events.
+            return [
+                ("SessionStart", 5, false),
+                ("UserPromptSubmit", 5, false),
+                ("PreToolUse", 5, false),
+                ("PostToolUse", 5, false),
+                ("Stop", 5, false),
+                ("Notification", 5, false),
             ]
         case .traecli:
             return [
@@ -751,11 +774,15 @@ struct ConfigInstaller {
             return []
         case .antigravityNamed:
             // Antigravity hooks.json uses Claude-style PascalCase event names.
-            // We install the three actionable events for status/permission.
+            // We install the three actionable events for status.
             // PreInvocation/PostInvocation are pass-through with no internal
             // meaning, so they're omitted. Timeout is in SECONDS (docs default 30).
+            // PreToolUse no longer waits on an island card — the bridge answers
+            // `ask` at once (#339) — and a hook Antigravity has to kill counts
+            // as a denial, so it keeps the documented default rather than a
+            // day-long ceiling nothing should ever reach.
             return [
-                ("PreToolUse", 86400, false),
+                ("PreToolUse", 30, false),
                 ("PostToolUse", 5, false),
                 ("Stop", 5, false),
             ]
@@ -1025,6 +1052,11 @@ struct ConfigInstaller {
 
     /// Check if a specific CLI's hooks are installed
     static func isInstalled(source: String) -> Bool {
+        if source == "aiwork" || source == "aiwork-cli" {
+            // No hooks to install — "activated" means monitoring is enabled and
+            // the matching AiWork surface is present on this machine.
+            return isEnabled(source: source) && cliExists(source: source)
+        }
         if source == "opencode" { return isOpencodePluginInstalled(fm: FileManager.default) }
         if source == "pi" { return isPiExtensionInstalled(fm: FileManager.default) }
         if source == "omp" { return isOmpExtensionInstalled(fm: FileManager.default) }
@@ -1043,6 +1075,8 @@ struct ConfigInstaller {
 
     /// Check if CLI directory exists (tool is installed on this machine)
     static func cliExists(source: String) -> Bool {
+        if source == "aiwork" { return aiworkGuiIsPresent() }
+        if source == "aiwork-cli" { return aiworkCliIsPresent() }
         if source == "opencode" { return FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.config/opencode") }
         if source == "pi" { return FileManager.default.fileExists(atPath: piAgentDir) }
         if source == "omp" { return FileManager.default.fileExists(atPath: ompAgentDir) }
@@ -1088,6 +1122,54 @@ struct ConfigInstaller {
         return FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.dsh")
     }
 
+    /// AiWork GUI (formerly DTCoder). Bundle id is still `com.alipay.dtcoder.ide`.
+    static func aiworkGuiIsPresent(fileManager fm: FileManager = .default) -> Bool {
+        if NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.alipay.dtcoder.ide") != nil {
+            return true
+        }
+        let names = ["AiWork.app", "DTCoder.app"]
+        let roots = [NSHomeDirectory() + "/Applications", "/Applications"]
+        return names.contains { name in
+            roots.contains { root in
+                fm.fileExists(atPath: (root as NSString).appendingPathComponent(name))
+            }
+        }
+    }
+
+    /// AiWork CLI (`aiwork` / legacy `dtcoder` on PATH, or Agentix state).
+    static func aiworkCliIsPresent(fileManager fm: FileManager = .default) -> Bool {
+        let pathDirs = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        let binaries = ["aiwork", "dtcoder"]
+        for dir in pathDirs {
+            for binary in binaries where fm.isExecutableFile(atPath: (dir as NSString).appendingPathComponent(binary)) {
+                return true
+            }
+        }
+        // TUI brings up the Agentix daemon under ~/.agentix even without the GUI app.
+        // A GUI-launched CodeIsland inherits launchd's minimal PATH, so this state
+        // directory — the same root the watcher discovers sockets under — is the
+        // check that actually decides in practice.
+        return fm.fileExists(atPath: AiWorkWatchClient.defaultStateDir() + "/run")
+    }
+
+    /// Either GUI or CLI/TUI is available.
+    static func aiworkIsPresent(fileManager fm: FileManager = .default) -> Bool {
+        aiworkGuiIsPresent(fileManager: fm) || aiworkCliIsPresent(fileManager: fm)
+    }
+
+    /// Monitoring is on for GUI and/or CLI.
+    static func isAnyAiWorkMonitoringEnabled() -> Bool {
+        isEnabled(source: "aiwork") || isEnabled(source: "aiwork-cli")
+    }
+
+    static var aiworkDisplayConfigPath: String { "~/.agentix/run/coder/agent.sock" }
+    static var aiworkCliDisplayConfigPath: String { "aiwork tui → agent.sock" }
+    static var aiworkFullConfigPath: String {
+        NSHomeDirectory() + "/.agentix/run/coder/agent.sock"
+    }
+
     // Keep backward compat
     static func isCodexInstalled() -> Bool { isInstalled(source: "codex") }
 
@@ -1106,6 +1188,10 @@ struct ConfigInstaller {
         if enabled {
             installHookScript(fm: fm)
             installBridgeBinary(fm: fm)
+            if source == "aiwork" || source == "aiwork-cli" {
+                // Daemon session watch — no hook files; AppState starts the watcher.
+                return true
+            }
             if source == "opencode" {
                 return installOpencodePlugin(fm: fm)
             }
@@ -1130,7 +1216,9 @@ struct ConfigInstaller {
                 return isHooksInstalled(for: cli, fm: fm)
             }
         } else {
-            if source == "opencode" {
+            if source == "aiwork" || source == "aiwork-cli" {
+                return true
+            } else if source == "opencode" {
                 uninstallOpencodePlugin(fm: fm)
             } else if source == "pi" {
                 uninstallPiExtension(fm: fm)
@@ -1525,9 +1613,12 @@ struct ConfigInstaller {
 
         let root = parseJSONFile(at: cli.fullPath, fm: fm) ?? [:]
         var hooks = root[cli.configKey] as? [String: Any] ?? [:]
-        if cli.source == "traecli-next" {
-            // Clean up CodeIsland-managed entries written with the old Trae IDE
-            // event names (for example beforeReadFile) at the new Trae CLI path.
+        if cli.source == "traecli-next" || cli.format == .traeIDE {
+            // Clean up CodeIsland-managed entries written with the old
+            // Cursor-style event names (beforeReadFile, stop, …): Trae CLI Next
+            // rejects them, and TraeCode never fires them. The loop below only
+            // replaces entries under the current event names, so without this
+            // an upgraded install would keep the dead keys forever.
             hooks = removeManagedHookEntries(from: hooks)
         }
         // Quote the path in case home directory contains spaces or special characters
@@ -2997,7 +3088,7 @@ struct ConfigInstaller {
     /// Kept independent of pi (OMP reuses the "CodeIsland pi extension" banner
     /// but ships its own resource file), so a pi-only bump does not false-flag
     /// healthy OMP installs as needing repair.
-    private static let ompExtensionVersion = "v7"
+    private static let ompExtensionVersion = "v8"
 
     private static func piExtensionSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-pi", withExtension: "ts", subdirectory: "Resources"),
@@ -3372,7 +3463,7 @@ struct ConfigInstaller {
     }
 
     /// Current OpenCode plugin version — bump when codeisland-opencode.js changes
-    private static let opencodePluginVersion = "v7"
+    private static let opencodePluginVersion = "v8"
 
     private static func isOpencodePluginInstalled(fm: FileManager) -> Bool {
         guard fm.fileExists(atPath: opencodePluginPath) else { return false }

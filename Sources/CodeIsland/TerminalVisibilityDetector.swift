@@ -27,6 +27,11 @@ struct TerminalVisibilityDetector {
     /// Fast check: is the session's terminal app the frontmost application?
     /// Safe to call from the main thread — no AppleScript or subprocess calls.
     static func isTerminalFrontmostForSession(_ session: SessionSnapshot) -> Bool {
+        // Harness-hosted (T3 Code): the harness is where the session lives,
+        // not the terminal its inherited env names (#321).
+        if let harness = session.hostHarness {
+            return HostHarnessSupport.isFrontmost(harness)
+        }
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return false }
         let frontBundleId = frontApp.bundleIdentifier?.lowercased() ?? ""
 
@@ -66,6 +71,14 @@ struct TerminalVisibilityDetector {
     static func isSessionTabVisible(_ session: SessionSnapshot) -> Bool {
         // Fast path: terminal not even frontmost
         guard isTerminalFrontmostForSession(session) else { return false }
+
+        // Harness desktop app in front: like a native agent app, the app IS
+        // the session surface. A browser in front says nothing about which
+        // tab is showing, so it never counts as the session being visible.
+        if let harness = session.hostHarness {
+            if case .desktopApp = harness.surface { return true }
+            return false
+        }
 
         // Native app bundles (Cursor APP, Codex APP): app IS the session, suppress when frontmost
         if session.isNativeAppMode {

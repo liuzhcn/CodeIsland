@@ -40,6 +40,7 @@ final class CodexDeepLinkTests: XCTestCase {
         XCTAssertEqual(local.codexDesktopURL?.absoluteString, "codex://threads/" + id)
         local.remoteHostId = "remote-ssh-server"
         XCTAssertTrue(local.canActivateSession)
+        XCTAssertTrue(local.canJumpFromNotch)
         XCTAssertEqual(local.codexDesktopURL?.absoluteString, "codex://threads/" + id)
         local.termBundleId = nil
         local.remoteHostId = "remote-ssh-codex-managed:test"
@@ -51,6 +52,7 @@ final class CodexDeepLinkTests: XCTestCase {
         local.providerSessionId = "../settings"
         XCTAssertNil(local.codexDesktopURL)
         XCTAssertFalse(local.canActivateSession)
+        XCTAssertFalse(local.canJumpFromNotch)
         local.source = "claude"
         XCTAssertNil(local.codexDesktopURL)
     }

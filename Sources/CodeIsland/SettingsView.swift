@@ -95,7 +95,7 @@ struct SettingsView: View {
                 case .sound: SoundPage()
                 case .shortcuts: ShortcutsPage()
                 case .remote: RemoteHostsPage()
-                case .hooks: HooksPage()
+                case .hooks: HooksPage(appState: appState)
                 case .buddy: BuddyPage()
                 case .about: AboutPage()
                 }
@@ -232,10 +232,15 @@ private struct RemoteHostRow: View {
                 .foregroundStyle(.secondary)
 
             if let message = remoteManager.lastMessage[host.id], !message.isEmpty {
+                // Per-CLI install results end with the custom CLIs, whose skip reason
+                // (e.g. the config dir that was not found) is the actionable part —
+                // two lines truncated it away (#342). Selectable so the path can be copied.
                 Text(message)
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
-                    .lineLimit(2)
+                    .lineLimit(5)
+                    .textSelection(.enabled)
+                    .help(message)
             }
 
             // Editable per-host session scope (#240) — saved on submit / focus loss.
@@ -611,6 +616,7 @@ private struct BehaviorPage: View {
 // MARK: - Hooks Page
 
 private struct HooksPage: View {
+    var appState: AppState?
     @ObservedObject private var l10n = L10n.shared
     @State private var cliStatuses: [String: Bool] = [:]
     @State private var statusMessage = ""
@@ -627,6 +633,24 @@ private struct HooksPage: View {
             cliStatuses[cli.source] = ConfigInstaller.isInstalled(source: cli.source)
         }
         cliStatuses["opencode"] = ConfigInstaller.isInstalled(source: "opencode")
+        cliStatuses["aiwork"] = ConfigInstaller.isInstalled(source: "aiwork")
+        cliStatuses["aiwork-cli"] = ConfigInstaller.isInstalled(source: "aiwork-cli")
+    }
+
+    private func applySourceToggle(source: String, enabled: Bool) {
+        if source == "aiwork" || source == "aiwork-cli" {
+            if enabled {
+                appState?.startAiWorkWatcher()
+            } else {
+                appState?.removeAiWorkSessions(source: source)
+                if !ConfigInstaller.isAnyAiWorkMonitoringEnabled() {
+                    appState?.stopAiWorkWatcher()
+                } else {
+                    appState?.pruneDisabledAiWorkSessions()
+                }
+            }
+        }
+        refreshCLIStatuses()
     }
 
     private func statusText(installed: Bool, exists: Bool) -> String {
@@ -646,7 +670,7 @@ private struct HooksPage: View {
                         fullPath: cli.fullPath,
                         installed: installed,
                         exists: exists
-                    ) { _ in refreshCLIStatuses() }
+                    ) { enabled in applySourceToggle(source: cli.source, enabled: enabled) }
                     .id("\(cli.source)-\(refreshKey)")
                 }
                 // OpenCode (plugin-based, not hooks)
@@ -659,8 +683,33 @@ private struct HooksPage: View {
                     fullPath: NSHomeDirectory() + "/.config/opencode/config.json",
                     installed: ocInstalled,
                     exists: ocExists
-                ) { _ in refreshCLIStatuses() }
+                ) { enabled in applySourceToggle(source: "opencode", enabled: enabled) }
                 .id("opencode-\(refreshKey)")
+
+                // AiWork GUI + CLI/TUI (Agentix daemon watch — no hooks)
+                let dtInstalled = cliStatuses["aiwork"] ?? false
+                let dtExists = ConfigInstaller.cliExists(source: "aiwork")
+                CLIStatusRow(
+                    name: "AiWork",
+                    source: "aiwork",
+                    configPath: ConfigInstaller.aiworkDisplayConfigPath,
+                    fullPath: ConfigInstaller.aiworkFullConfigPath,
+                    installed: dtInstalled,
+                    exists: dtExists
+                ) { enabled in applySourceToggle(source: "aiwork", enabled: enabled) }
+                .id("aiwork-\(refreshKey)")
+
+                let dtCliInstalled = cliStatuses["aiwork-cli"] ?? false
+                let dtCliExists = ConfigInstaller.cliExists(source: "aiwork-cli")
+                CLIStatusRow(
+                    name: "AiWork CLI",
+                    source: "aiwork-cli",
+                    configPath: ConfigInstaller.aiworkCliDisplayConfigPath,
+                    fullPath: ConfigInstaller.aiworkFullConfigPath,
+                    installed: dtCliInstalled,
+                    exists: dtCliExists
+                ) { enabled in applySourceToggle(source: "aiwork-cli", enabled: enabled) }
+                .id("aiwork-cli-\(refreshKey)")
             }
 
             Section("Custom CLIs") {
@@ -738,7 +787,19 @@ private struct HooksPage: View {
                         if ConfigInstaller.cliExists(source: "opencode") {
                             UserDefaults.standard.set(true, forKey: "cli_enabled_opencode")
                         }
+                        if ConfigInstaller.cliExists(source: "aiwork") {
+                            UserDefaults.standard.set(true, forKey: "cli_enabled_aiwork")
+                        }
+                        if ConfigInstaller.cliExists(source: "aiwork-cli") {
+                            UserDefaults.standard.set(true, forKey: "cli_enabled_aiwork-cli")
+                        }
                         if ConfigInstaller.install() {
+                            // Started only after install succeeds — otherwise a failed
+                            // install left the watcher running while the button
+                            // reported failure.
+                            if ConfigInstaller.isAnyAiWorkMonitoringEnabled() {
+                                appState?.startAiWorkWatcher()
+                            }
                             refreshCLIStatuses()
                             refreshKey += 1
                             statusMessage = l10n["hooks_installed"]
@@ -759,6 +820,9 @@ private struct HooksPage: View {
                             UserDefaults.standard.set(false, forKey: "cli_enabled_\(cli.source)")
                         }
                         UserDefaults.standard.set(false, forKey: "cli_enabled_opencode")
+                        UserDefaults.standard.set(false, forKey: "cli_enabled_aiwork")
+                        UserDefaults.standard.set(false, forKey: "cli_enabled_aiwork-cli")
+                        appState?.stopAiWorkWatcher()
                         ConfigInstaller.uninstall()
                         refreshCLIStatuses()
                         refreshKey += 1
@@ -866,14 +930,23 @@ private struct AppearancePage: View {
     @AppStorage(SettingsKey.showToolStatus) private var showToolStatus = SettingsDefaults.showToolStatus
     @AppStorage(SettingsKey.showGitBranch) private var showGitBranch = SettingsDefaults.showGitBranch
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
+    @AppStorage(SettingsKey.showClaudeQuota) private var showClaudeQuota = SettingsDefaults.showClaudeQuota
     @AppStorage(SettingsKey.collapsedWidthScale) private var collapsedWidthScale = SettingsDefaults.collapsedWidthScale
     @AppStorage(SettingsKey.notchHeightMode) private var notchHeightModeRaw = SettingsDefaults.notchHeightMode
     @AppStorage(SettingsKey.customNotchHeight) private var customNotchHeight = SettingsDefaults.customNotchHeight
+    @AppStorage(SettingsKey.notchAnimationSpeed) private var notchAnimationSpeed = SettingsDefaults.notchAnimationSpeed
 
     private var notchHeightMode: Binding<NotchHeightMode> {
         Binding(
             get: { NotchHeightMode(rawValue: notchHeightModeRaw) ?? .matchNotch },
             set: { notchHeightModeRaw = $0.rawValue }
+        )
+    }
+
+    private var notchAnimationSpeedBinding: Binding<Double> {
+        Binding(
+            get: { NotchAnimationSpeed.clamped(notchAnimationSpeed) },
+            set: { notchAnimationSpeed = NotchAnimationSpeed.clamped($0) }
         )
     }
 
@@ -888,6 +961,25 @@ private struct AppearancePage: View {
             }
 
             Section(l10n["panel"]) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(l10n["notch_animation_speed"])
+                        Spacer()
+                        Text("\(notchAnimationSpeedBinding.wrappedValue, specifier: "%.1f")×")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(
+                        value: notchAnimationSpeedBinding,
+                        in: NotchAnimationSpeed.minimum...NotchAnimationSpeed.maximum,
+                        step: NotchAnimationSpeed.step
+                    )
+                    .accessibilityLabel(Text(l10n["notch_animation_speed"]))
+                    .accessibilityValue(Text("\(notchAnimationSpeedBinding.wrappedValue, specifier: "%.1f")×"))
+                    Text(l10n["notch_animation_speed_desc"])
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Picker(selection: $maxVisibleSessions) {
                     Text("3").tag(3)
                     Text("5").tag(5)
@@ -962,6 +1054,12 @@ private struct AppearancePage: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Toggle(l10n["show_usage_stats"], isOn: $showUsageStats)
                     Text(l10n["show_usage_stats_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["show_claude_quota"], isOn: $showClaudeQuota)
+                    Text(l10n["show_claude_quota_desc"])
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
@@ -1095,6 +1193,8 @@ private struct MascotsPage: View {
         ("OpBot", "opencode", "OpenCode", Color(red: 0.55, green: 0.55, blue: 0.57)),
         ("ClineBot", "cline", "Cline", Color(red: 0.00, green: 0.70, blue: 0.49)),
         ("Gemini", "google-antigravity", "Google Antigravity", Color(red: 0.278, green: 0.588, blue: 0.894)),
+        ("AiWorkBot", "aiwork", "AiWork", Color(red: 0.12, green: 0.72, blue: 0.28)),
+        ("AiWorkBot", "aiwork-cli", "AiWork CLI", Color(red: 0.12, green: 0.55, blue: 0.90)),
     ]
 
     var body: some View {

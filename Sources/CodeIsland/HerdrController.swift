@@ -29,6 +29,7 @@ enum HerdrController {
 
     static func shouldRoute(_ session: SessionSnapshot) -> Bool {
         !session.isRemote
+            && session.hostHarness == nil
             && session.tmuxPane?.isEmpty != false
             && session.zellijPaneId?.isEmpty != false
             && identity(from: session) != nil

@@ -218,6 +218,19 @@ if let idx = args.firstIndex(of: "--event"), idx + 1 < args.count {
     eventTag = args[idx + 1]
 }
 
+// Google Antigravity refuses the tool call when its PreToolUse hook prints no
+// decision, so answer before any of the early exits below can leave stdout
+// empty (island not running, CODEISLAND_SKIP, a deadline). The island only
+// observes Antigravity tool calls; the decision stays with Antigravity (#339).
+var wroteAntigravityDecision = false
+func writeAntigravityDecisionIfNeeded(eventName: String?) {
+    guard !wroteAntigravityDecision,
+          let stdout = AntigravityHookContract.hookStdout(source: sourceTag, eventName: eventName) else { return }
+    wroteAntigravityDecision = true
+    FileHandle.standardOutput.write(Data(stdout.utf8))
+}
+writeAntigravityDecisionIfNeeded(eventName: eventTag)
+
 // Quick exit: skip if CODEISLAND_SKIP is set
 guard env["CODEISLAND_SKIP"] == nil else { exit(0) }
 
@@ -307,30 +320,33 @@ if json["transcript_path"] == nil, let tp = nonEmptyString(json["transcriptPath"
 
 // Grok's hook payload does not carry a transcript path. Its documented session
 // layout is deterministic, and chat_history.jsonl uses the user/assistant row
-// shapes already understood by CodeIsland's incremental tailer.
+// shapes already understood by CodeIsland's incremental tailer. The path is
+// only forwarded once the file exists (see GrokSessionPaths).
 if isGrokRuntime,
    json["transcript_path"] == nil,
    let sessionId = nonEmptyString(json["session_id"]),
    let cwd = nonEmptyString(json["cwd"]) {
-    var allowed = CharacterSet.alphanumerics
-    allowed.insert(charactersIn: "-._~")
-    if let encodedCwd = cwd.addingPercentEncoding(withAllowedCharacters: allowed) {
-        let rawHome = nonEmptyString(env["GROK_HOME"])
-        let grokHome: String
-        if let rawHome {
-            if rawHome == "~" {
-                grokHome = FileManager.default.homeDirectoryForCurrentUser.path
-            } else if rawHome.hasPrefix("~/") {
-                grokHome = FileManager.default.homeDirectoryForCurrentUser.path
-                    + "/" + rawHome.dropFirst(2)
-            } else {
-                grokHome = rawHome
-            }
+    let rawHome = nonEmptyString(env["GROK_HOME"])
+    let grokHome: String
+    if let rawHome {
+        if rawHome == "~" {
+            grokHome = FileManager.default.homeDirectoryForCurrentUser.path
+        } else if rawHome.hasPrefix("~/") {
+            grokHome = FileManager.default.homeDirectoryForCurrentUser.path
+                + "/" + rawHome.dropFirst(2)
         } else {
-            grokHome = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".grok").path
+            grokHome = rawHome
         }
-        json["transcript_path"] = "\(grokHome)/sessions/\(encodedCwd)/\(sessionId)/chat_history.jsonl"
+    } else {
+        grokHome = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".grok").path
+    }
+    if let path = GrokSessionPaths.existingChatHistoryPath(
+        grokHome: grokHome,
+        cwd: cwd,
+        sessionId: sessionId
+    ) {
+        json["transcript_path"] = path
     }
 }
 
@@ -427,6 +443,14 @@ if resolvedTrackedPID != immediateParentPID {
 if effectiveSource == "cline" {
     json["_ppid"] = 0
 }
+// Callers that know their process is not the agent's lifetime opt out. OpenCode 2
+// runs plugins in a shared background service that outlives the client that
+// spawned it: tracked as the CLI, it would be SIGTERMed as a "reparented orphan"
+// the moment that first client quits, taking every session with it (#332).
+if json["_untracked_process"] as? Bool == true {
+    json["_ppid"] = 0
+    json.removeValue(forKey: "_hook_ppid")
+}
 
 // Validate: must have non-empty session_id
 if json["session_id"] == nil,
@@ -453,12 +477,14 @@ guard let sessionId = json["session_id"] as? String, !sessionId.isEmpty else {
 // Event type detection
 let eventName = json["hook_event_name"] as? String ?? ""
 let normalizedEventName = EventNormalizer.normalize(eventName)
-// Gemini CLI (--source gemini) and Google Antigravity (--source google-antigravity) both
-// send PreToolUse in the JSON payload; treat it as a blocking permission event for both.
+// agy wired through Gemini-style hooks names the event on stdin, not in --event.
+writeAntigravityDecisionIfNeeded(eventName: eventName)
 let isGeminiBasedSource = sourceTag == "google-antigravity" || sourceTag == "gemini"
     || effectiveSource == "google-antigravity" || effectiveSource == "gemini"
+// Antigravity's PreToolUse is NOT a blocking approval: it was already answered
+// above, and holding it for an island card only stacked a second prompt in
+// front of Antigravity's own (#339).
 let isPermission = normalizedEventName == "PermissionRequest"
-    || (isGeminiBasedSource && normalizedEventName == "PreToolUse")
 let isQuestion = (normalizedEventName == "Notification" || eventName == "afterAgentThought")
     && json["question"] as? String != nil
 let isBlocking = isPermission || isQuestion

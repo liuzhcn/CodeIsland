@@ -139,6 +139,41 @@ final class AppStateQuestionFlowTests: XCTestCase {
         XCTAssertEqual(answerDetails["customInput"] as? String, "自由输入")
     }
 
+    /// #332: OpenCode answers multi-select questions with label arrays (v1
+    /// `string[]`, v2 multiselect form field). The plugin can only rebuild
+    /// them from the structured picks — the display string is ", "-joined.
+    func testOpenCodeQuestionsCarryStructuredAnswerDetails() async throws {
+        let appState = AppState()
+        var multiQuestion = question(header: "Targets", text: "Which targets?", options: ["macOS, arm64", "iOS"])
+        multiQuestion["multiSelect"] = true
+        let event = try makeAskUserQuestionEvent(
+            sessionId: "opencode-ses_multi",
+            questions: [multiQuestion],
+            source: "opencode"
+        )
+
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handleAskUserQuestion(event, continuation: continuation)
+            }
+        }
+
+        await Task.yield()
+        appState.answerQuestionMulti([
+            AskUserQuestionAnswer(
+                question: "Which targets?",
+                answer: "macOS, arm64, iOS",
+                selectedOptions: ["macOS, arm64", "iOS"],
+                customInput: nil
+            ),
+        ])
+
+        let updatedInput = try extractUpdatedInput(from: await responseTask.value)
+        let details = try XCTUnwrap(updatedInput["_codeislandAnswerDetails"] as? [String: Any])
+        let picks = try XCTUnwrap(details["Which targets?"] as? [String: Any])
+        XCTAssertEqual(picks["selectedOptions"] as? [String], ["macOS, arm64", "iOS"])
+    }
+
     func testQuestionBarFreeTextAnswerPreservesCustomInput() throws {
         let answer = try XCTUnwrap(
             makeQuestionBarFreeTextAnswer(question: "请填写补充内容", text: "自由输入")

@@ -1,101 +1,303 @@
 <h1 align="center">
-  <img src="logo.png" width="48" height="48" alt="CodeIsland Logo" valign="middle">&nbsp;
+  <img src="logo.png" width="56" height="56" alt="CodeIsland logo" valign="middle">&nbsp;
   CodeIsland
 </h1>
+
 <p align="center">
-  <b>Real-time AI coding agent status panel for macOS Dynamic Island (Notch)</b><br>
+  <b>Your AI coding agents, live in the MacBook notch.</b><br>
+  See what every agent is doing, approve tool calls and answer its questions — without leaving the window you're in.
+</p>
+
+<p align="center">
+  <a href="https://github.com/wxtsky/CodeIsland/releases/latest"><img src="https://img.shields.io/github/v/release/wxtsky/CodeIsland?style=flat-square&color=4c8bf5&label=release" alt="Latest release"></a>
+  <a href="https://github.com/wxtsky/CodeIsland/releases"><img src="https://img.shields.io/github/downloads/wxtsky/CodeIsland/total?style=flat-square&color=2ea44f" alt="Downloads"></a>
+  <img src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+">
+  <a href="https://apps.apple.com/us/app/code-island-buddy/id6773881129"><img src="https://img.shields.io/badge/iPhone%20%26%20Watch-Buddy-0d96f6?style=flat-square&logo=appstore&logoColor=white" alt="Code Island Buddy on the App Store"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/wxtsky/CodeIsland?style=flat-square&color=8250df" alt="MIT license"></a>
+  <a href="https://github.com/wxtsky/CodeIsland/stargazers"><img src="https://img.shields.io/github/stars/wxtsky/CodeIsland?style=flat-square&color=e3b341" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
   <a href="#installation">Install</a> •
-  <a href="#features">Features</a> •
-  <a href="#supported-tools">Supported Tools</a> •
-  <a href="#build-from-source">Build</a><br>
-  English | <a href="README.zh-CN.md">简体中文</a>
+  <a href="#highlights">Highlights</a> •
+  <a href="#supported-tools">Supported tools</a> •
+  <a href="#how-it-works">How it works</a> •
+  <a href="#build-from-source">Build</a>
+  <br>
+  <b>English</b> | <a href="README.zh-CN.md">简体中文</a>
 </p>
-
----
 
 <p align="center">
-  <img src="docs/images/notch-panel.png" width="700" alt="CodeIsland Panel Preview">
+  <img src="docs/images/readme-hero.png" width="760" alt="CodeIsland expanded from the MacBook notch, showing Claude Code, Codex, Cursor and Gemini CLI sessions">
 </p>
 
-## What is CodeIsland?
+## Why CodeIsland?
 
-CodeIsland lives in your MacBook's notch area and shows you what your AI coding agents are doing — in real time. No more switching windows to check if Claude is waiting for approval or if Codex finished its task.
+Coding agents spend a lot of time either working or waiting on you — and you only find out by switching to their window. CodeIsland turns the notch into a live status bar for all of them: which session is thinking, which one needs an approval, which one just finished. Approve the tool call or answer the question right there, or click once to jump to the exact terminal tab.
 
-It connects to **14 AI coding tools** via Unix socket IPC, displaying session status, tool calls, permission requests, and more — all in a compact, pixel-art styled panel.
+It works with **30+ AI coding tools**, installs its hooks for you, and keeps everything on your Mac.
 
-## Features
+## Highlights
 
-- **Notch-native UI** — Expands from the MacBook notch, collapses when idle
-- **15 AI tools supported** — Claude Code, Codex, Grok CLI, Gemini CLI, Cursor, Copilot, Trae/Traecli, Qoder, Factory, CodeBuddy, OpenCode, Kimi Code CLI, Cline, Pi / Oh My Pi, DeepSeek Harness
-- **Live status tracking** — See active sessions, tool calls, and AI responses in real time
-- **Permission management** — Approve/deny tool permissions directly from the panel
-- **Question answering** — Respond to agent questions without leaving your current app
-- **Pixel-art mascots** — Each AI tool has its own animated character
-- **One-click jump** — Click a session to jump to its terminal tab, IDE window, or exact Herdr agent pane
-- **Smart suppress** — Tab-level terminal and Herdr pane detection: only suppresses notifications when you're looking at the specific session, not just the terminal app
-- **Sound effects** — Optional 8-bit sound notifications for session events
-- **Auto hook install** — Automatically configures hooks for all detected CLI tools, with auto-repair and version tracking
-- **iPhone & Apple Watch Buddy** — Mirror session status to Dynamic Island, Lock Screen, StandBy, and Apple Watch
-- **Bilingual UI** — English and Chinese, auto-detects system language
-- **Multi-display** — Works with external monitors, auto-detects notch displays
+<table>
+<tr>
+<td width="50%" valign="top">
 
-## Supported Tools
+**👀 See everything at a glance**
 
-| | Tool | Events | Jump | Status |
-|:---:|------|--------|------|--------|
-| <img src="docs/images/mascots/claude.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/claude.png" width="16"> Claude Code | 13 | Terminal tab | Full |
-| <img src="docs/images/mascots/codex.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/codex.png" width="16"> Codex | 3 | Terminal | Basic |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/grok.png" width="16"> Grok CLI | 14 | Terminal | Basic |
-| <img src="docs/images/mascots/gemini.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/gemini.png" width="16"> Gemini CLI | 6 | Terminal | Full |
-| <img src="docs/images/mascots/cursor.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cursor.png" width="16"> Cursor | 10 | IDE | Full |
-| <img src="docs/images/mascots/trae.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/traecli.png" width="16"> TraeCli | 10 | Terminal | Full |
-| <img src="docs/images/mascots/qoder.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/qoder.png" width="16"> Qoder | 10 | IDE | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/copilot.png" width="16"> Copilot | 6 | Terminal | Full |
-| <img src="docs/images/mascots/factory.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/factory.png" width="16"> Factory | 10 | IDE | Full |
-| <img src="docs/images/mascots/codebuddy.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/codebuddy.png" width="16"> CodeBuddy | 10 | APP/Terminal | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/kimi.png" width="16"> Kimi Code CLI | 10 | Terminal | Full |
-| <img src="docs/images/mascots/opencode.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/opencode.png" width="16"> OpenCode | All | APP/Terminal | Full |
-| <img src="docs/images/mascots/cline.gif" width="28"> | <img src="Sources/CodeIsland/Resources/cli-icons/cline.png" width="16"> Cline | 5 | VSCode | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/pi.png" width="16"> Pi / Oh My Pi | 8 | Terminal | Full |
-| | <img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="16"> DeepSeek Harness | 9 | Terminal | Full |
+- Live status, current tool and latest reply for every session
+- Git branch and worktree on each card; group sessions by project or tool
+- Claude usage stats, plus opt-in plan limits (5-hour and weekly)
+- A pixel-art mascot per tool, animated by what the agent is doing
+
+</td>
+<td width="50%" valign="top">
+
+**✋ Act without switching windows**
+
+- Approve, deny or always-allow tool calls; answer multi-question prompts
+- One click to the exact terminal tab, IDE window, or tmux / zellij / Herdr pane
+- Global shortcuts for approve, deny, skip and jump
+- Auto-proceed for agents you already run in YOLO / Turbo mode
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+**🧘 Stays out of your way**
+
+- Smart suppress: no ping while you're already looking at that session's tab
+- Quiet hours, per-event 8-bit sounds, a "glance dot" completion mode
+- Hides in full screen, steps around menu-bar icons, adjustable open/close speed
+- Silence rules for directories you never want to hear about
+
+</td>
+<td width="50%" valign="top">
+
+**🌐 Beyond this Mac**
+
+- SSH remote hosts — server sessions show up next to local ones
+- iPhone & Apple Watch Buddy: Dynamic Island, Lock Screen, StandBy
+- An ESP32 desk buddy over Bluetooth
+- Webhook forwarding to DingTalk / Lark / Slack
+- 7 UI languages; signed, notarized, auto-updating
+
+</td>
+</tr>
+</table>
+
+<p align="center">
+  <img src="docs/images/readme-approval.png" width="640" alt="Approval card: allow or deny a Bash command from the notch"><br>
+  <sub>Approve a tool call without leaving your editor…</sub>
+</p>
+<p align="center">
+  <img src="docs/images/readme-question.png" width="640" alt="Question card: pick an answer to the agent's question from the notch"><br>
+  <sub>…or answer the agent's question right in the notch.</sub>
+</p>
+
+## Supported tools
+
+<table>
+<tr>
+<td align="center" width="16%"><img src="docs/images/mascots/claude.gif" width="48" alt=""><br><sub><b>Claude Code</b></sub></td>
+<td align="center" width="16%"><img src="docs/images/mascots/codex.gif" width="48" alt=""><br><sub><b>Codex</b></sub></td>
+<td align="center" width="16%"><img src="docs/images/mascots/gemini.gif" width="48" alt=""><br><sub><b>Gemini CLI</b></sub></td>
+<td align="center" width="16%"><img src="docs/images/mascots/cursor.gif" width="48" alt=""><br><sub><b>Cursor</b></sub></td>
+<td align="center" width="16%"><img src="docs/images/mascots/grok.gif" width="48" alt=""><br><sub><b>Grok CLI</b></sub></td>
+<td align="center" width="16%"><img src="docs/images/mascots/opencode.gif" width="48" alt=""><br><sub><b>OpenCode</b></sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/mascots/qoder.gif" width="48" alt=""><br><sub><b>Qoder</b></sub></td>
+<td align="center"><img src="docs/images/mascots/trae.gif" width="48" alt=""><br><sub><b>Trae</b></sub></td>
+<td align="center"><img src="docs/images/mascots/copilot.gif" width="48" alt=""><br><sub><b>Copilot CLI</b></sub></td>
+<td align="center"><img src="docs/images/mascots/factory.gif" width="48" alt=""><br><sub><b>Factory Droid</b></sub></td>
+<td align="center"><img src="docs/images/mascots/codebuddy.gif" width="48" alt=""><br><sub><b>CodeBuddy</b></sub></td>
+<td align="center"><img src="docs/images/mascots/qwen.gif" width="48" alt=""><br><sub><b>Qwen Code</b></sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/mascots/kimi.gif" width="48" alt=""><br><sub><b>Kimi Code CLI</b></sub></td>
+<td align="center"><img src="docs/images/mascots/cline.gif" width="48" alt=""><br><sub><b>Cline</b></sub></td>
+<td align="center"><img src="docs/images/mascots/pi.gif" width="48" alt=""><br><sub><b>Pi / Oh My Pi</b></sub></td>
+<td align="center"><img src="docs/images/mascots/hermes.gif" width="48" alt=""><br><sub><b>Hermes</b></sub></td>
+<td align="center"><img src="docs/images/mascots/openclaw.gif" width="48" alt=""><br><sub><b>OpenClaw</b></sub></td>
+<td align="center"><img src="Sources/CodeIsland/Resources/cli-icons/antigravity.png" width="40" alt=""><br><sub><b>Google Antigravity</b></sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/mascots/kiro.gif" width="48" alt=""><br><sub><b>Kiro CLI</b></sub></td>
+<td align="center"><img src="docs/images/mascots/stepfun.gif" width="48" alt=""><br><sub><b>StepFun</b></sub></td>
+<td align="center"><img src="docs/images/mascots/workbuddy.gif" width="48" alt=""><br><sub><b>WorkBuddy</b></sub></td>
+<td align="center"><img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="40" alt=""><br><sub><b>DeepSeek Harness</b></sub></td>
+<td align="center"><img src="docs/images/mascots/aiwork.gif" width="48" alt=""><br><sub><b>AiWork</b></sub></td>
+<td align="center"><sub><b>+ more</b><br>see below ↓</sub></td>
+</tr>
+</table>
+
+**Also covered:** Trae CN, Trae CLI / Trae CLI Next, Qoder CN, QoderWork and Qoder CLI, Cursor CLI, CodeBuddy CN, Claude Desktop (Code tab), ZCode — plus any tool with Claude-style hooks, added as a **custom CLI** in Settings → Hooks.
+
+**Knows where it runs:** sessions inside **tmux**, **zellij**, **Herdr** or **T3 Code** get a chip next to the terminal badge, and click-to-jump goes to the right pane or thread.
+
+**Approvals & questions** can be answered from the island for tools whose hooks wait for a decision — Claude Code, Codex, Gemini CLI, Qoder, Qwen Code, Trae CLI Next, ZCode, OpenCode, Pi / Oh My Pi, DeepSeek Harness and others. Tools whose hooks can't carry a decision (Google Antigravity, AiWork) are shown read-only, and approvals stay in their own UI.
+
+<details>
+<summary><b>Where each integration is installed</b></summary>
+
+<br>
+
+CodeIsland writes these for you on launch (and repairs them if they drift); each can be switched off in **Settings → Hooks**.
+
+| Tool | Installed into |
+|------|----------------|
+| Claude Code | `~/.claude/settings.json` (honours `$CLAUDE_CONFIG_DIR`) |
+| Codex | `~/.codex/hooks.json` — [needs a one-time review](#codex) |
+| Gemini CLI | `~/.gemini/settings.json` |
+| Google Antigravity | `~/.gemini/config/hooks.json` |
+| Cursor / Cursor CLI | `~/.cursor/hooks.json` |
+| Grok CLI | `~/.grok/hooks/codeisland.json` |
+| Qoder / Qoder CN / QoderWork | `~/.qoder/`, `~/.qoder-cn/`, `~/.qoderwork/` `settings.json` |
+| Trae / Trae CN | `~/.trae/hooks.json`, `~/.trae-cn/hooks.json` (turn on global hooks in Trae) |
+| Trae CLI / Trae CLI Next | `~/.trae/traecli.yaml`, `~/.trae/cli/hooks.json` |
+| Factory, CodeBuddy, StepFun, WorkBuddy, Qwen Code | `~/.<tool>/settings.json` |
+| Copilot CLI | `~/.copilot/hooks/codeisland.json` |
+| Kimi Code CLI | `~/.kimi-code/config.toml` (or legacy `~/.kimi/`) |
+| Kiro CLI | `~/.kiro/agents/codeisland.json` — launch with `kiro --agent codeisland` |
+| Hermes | `~/.hermes/config.yaml` |
+| ZCode | `~/.zcode/cli/config.json` |
+| Cline | `~/Documents/Cline/Hooks` |
+| OpenCode | plugin at `~/.config/opencode/plugins/codeisland.js` |
+| Pi / Oh My Pi | extension at `~/.pi/agent/extensions/codeisland.ts` / `~/.omp/agent/extensions/codeisland.ts` |
+| OpenClaw | plugin at `~/.openclaw/codeisland-plugin/` |
+| DeepSeek Harness | [dsh-island](https://github.com/cdxiaodong/dsh-island) plugin — see [below](#deepseek-harness) |
+| AiWork | nothing to install — read from AiWork's local daemon |
+
+</details>
 
 ## Installation
 
-### Homebrew (Recommended)
+### Homebrew (recommended)
 
 ```bash
 brew tap wxtsky/tap
 brew install --cask codeisland
 ```
 
-### Manual Download
+### Manual download
 
-1. Go to [Releases](https://github.com/wxtsky/CodeIsland/releases)
-2. Download `CodeIsland.dmg`
-3. Open the DMG and drag `CodeIsland.app` to your Applications folder
-4. Launch CodeIsland — it will automatically install hooks for all detected AI tools
+1. Download `CodeIsland.dmg` from the [latest release](https://github.com/wxtsky/CodeIsland/releases/latest)
+2. Drag `CodeIsland.app` into Applications
+3. Launch it — hooks are installed automatically for every AI tool it detects
 
-> **Note:** On first launch, macOS may show a security warning. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
+The app is signed and notarized, and keeps itself up to date through Sparkle.
 
 ### iPhone & Apple Watch Buddy
 
-Code Island Buddy is available on the App Store:
+<a href="https://apps.apple.com/us/app/code-island-buddy/id6773881129">Code Island Buddy</a> — free on the App Store, no account, no server — mirrors your Mac sessions to the Dynamic Island, Lock Screen, StandBy and Apple Watch, and lets you approve or answer from the phone.
 
-[Download Code Island Buddy](https://apps.apple.com/us/app/code-island-buddy/id6773881129)
+1. On the Mac, open **Settings → Buddy → iPhone Buddy** and turn on *Allow iPhone Buddy to discover this Mac*.
+2. Open the app on the same Wi-Fi to pair; connected devices are listed under the toggle.
+3. When macOS asks, allow **both** Local Network and Bluetooth. Local Network carries full snapshots while the app is open; Bluetooth carries the compact summaries that keep the Live Activity and the Watch fresh once it's in the background.
 
-The iPhone app mirrors your Mac sessions to Dynamic Island, Lock Screen, StandBy, and Apple Watch. The Mac app publishes lightweight session snapshots over your local network while the iPhone app is open, and sends compact Bluetooth summaries for background refreshes such as Live Activities and Watch updates.
-
-Code Island Buddy is completely free and open source. It does not require an account or an external server; the companion source code lives in this repository under `ios/CodeIslandCompanion` and `apple-companion`.
-
-**Getting started:** on the Mac, open **Settings → Buddy → iPhone Buddy** and turn on *Allow iPhone Buddy to discover this Mac*. Open the iPhone app on the same Wi-Fi to pair; connected devices are listed right below the toggle. macOS asks for Local Network and Bluetooth permission on first connect — grant both: Local Network carries the full snapshots while the app is in front, Bluetooth carries the summaries that refresh the Live Activity and the Watch once it is backgrounded. *Sync interval* in the same section controls how often those go out.
+The companion source lives in this repository under `ios/CodeIslandCompanion` and `apple-companion`.
 
 ### Hardware Buddy (ESP32)
 
-Beyond the phone, CodeIsland drives a small ESP32 screen on your desk over BLE, playing the pixel mascot animation for the current agent state — asleep when idle, typing while it works, calling you when it needs an approval or an answer.
+A small ESP32 screen on your desk, driven over Bluetooth: it sleeps when your agents are idle, types while they work, and waves at you when one needs an approval or an answer. Board, parts list, firmware and pairing are in **[hardware/README.md](hardware/README.md)** (in Chinese). The Mac-side switch is in **Settings → Buddy**.
 
-Parts list, firmware flashing, and pairing steps are in **[hardware/README.md](hardware/README.md)** (written in Chinese, including the exact dev board and where to buy it). The Mac-side switch is in the hardware Buddy section of **Settings → Buddy**.
+## Setup notes
 
-### Build from Source
+<a name="codex"></a>
+<details>
+<summary><b>Codex — trust the hooks once</b></summary>
+
+<br>
+
+Codex won't run a hook it hasn't been shown. After installing, Codex prints `1 hook needs review before it can run.` — run `/hooks`, review the CodeIsland entries and trust them. Until you do, Codex silently ignores them, which looks exactly like CodeIsland not supporting Codex. Codex stores a hash per trusted hook in `~/.codex/config.toml` under `[hooks.state]`, so if a CodeIsland update rewrites `~/.codex/hooks.json`, review them once more.
+
+While a Codex turn runs, the collapsed bar shows the agent's latest public output when no tool is active. Hidden reasoning, encrypted content, tool results and internal subagent messages are never displayed.
+
+</details>
+
+<details>
+<summary><b>OpenCode 1.x and 2</b></summary>
+
+<br>
+
+A single JS plugin talks to the socket directly — no bridge binary. The same file serves OpenCode 1.x (`server()`) and OpenCode 2 (`setup()`); OpenCode 2 auto-loads it from `~/.config/opencode/plugins/`. Under OpenCode 2's shared background service, click-to-jump reaches the terminal app but not the exact tab, and questions are answered through the service's local HTTP API.
+
+</details>
+
+<a name="deepseek-harness"></a>
+<details>
+<summary><b>DeepSeek Harness</b></summary>
+
+<br>
+
+DSH is plugin-native, so CodeIsland installs nothing. The [dsh-island](https://github.com/cdxiaodong/dsh-island) plugin listens to DSH's built-in events and writes them to CodeIsland's socket:
+
+```bash
+dsh plugin --profile <profile> add github:cdxiaodong/dsh-island
+```
+
+</details>
+
+<details>
+<summary><b>Google Antigravity</b></summary>
+
+<br>
+
+Antigravity's `PreToolUse` hook can refuse a tool call but can't approve one, so the island *observes* Antigravity: it shows the running tool and hands every decision straight back to Antigravity's own permission prompt, so your grants and "Always Allow" keep working.
+
+</details>
+
+<details>
+<summary><b>SSH remote hosts</b></summary>
+
+<br>
+
+Add a host in **Settings → Remote**. CodeIsland installs a small helper and the hooks on the server (merged into your existing config, never replacing it), and forwards events back over SSH. An optional working-directory filter keeps other people's sessions off your island on shared machines. If a tool shows `skipped`, the status line says why — usually its config directory doesn't exist on that host yet.
+
+</details>
+
+## How it works
+
+```
+AI tool (Claude Code / Codex / Gemini / Cursor / …)
+  └─ hook fires ─→ codeisland-bridge (native Swift binary)
+                     └─ Unix socket /tmp/codeisland-<uid>.sock
+                          └─ CodeIsland updates the notch in real time
+                               └─ optional: iPhone / Watch / ESP32 Buddy, webhook
+```
+
+CodeIsland installs lightweight hooks into each tool's own config. When the tool fires an event — session start, tool call, permission request, question, stop — the bridge forwards it as JSON over a local Unix socket, and the island updates instantly. For events that wait on you, the answer travels back the same way.
+
+**Privacy:** events never leave your Mac unless you opt in. The only network requests CodeIsland makes are Sparkle update checks, plus — only if you turn them on — Claude plan-limit lookups (sent to `api.anthropic.com` with your own Claude Code login) and webhook forwarding to the URL you configure.
+
+## Settings
+
+| Page | What's there |
+|------|--------------|
+| **General** | Language, launch at login, display selection |
+| **Behavior** | Auto-expand, smart suppress, completion style, session cleanup, silence rules, auto-approve, webhook |
+| **Appearance** | Panel size, notch width, font size, reply lines, open/close speed, git branch, usage stats, plan limits |
+| **Mascots** | Preview every character and its animations |
+| **Sound** | 8-bit sounds per event, volume, quiet hours |
+| **Shortcuts** | Global hotkeys for toggle, approve, deny, always-allow, skip, jump |
+| **Remote** | SSH hosts and per-host directory filters |
+| **Hooks** | Install status per tool, reinstall / uninstall, custom CLIs |
+| **Buddy** | iPhone / Apple Watch pairing, ESP32 hardware buddy |
+| **About** | Version, updates, diagnostics export |
+
+### Keyboard shortcuts
+
+| Shortcut | Action | Default |
+|----------|--------|---------|
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>I</kbd> | Toggle the island open / closed | On |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>A</kbd> | Approve the request on screen | Off |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>D</kbd> | Deny the request on screen | Off |
+
+Every shortcut can be rebound in **Settings → Shortcuts**, where you can also bind *always allow*, *skip question* and *jump to terminal*. Enabled approve/deny bindings appear as badges on the approval card.
+
+## Build from source
 
 Requires **macOS 14+** and **Swift 5.9+**.
 
@@ -103,81 +305,36 @@ Requires **macOS 14+** and **Swift 5.9+**.
 git clone https://github.com/wxtsky/CodeIsland.git
 cd CodeIsland
 
-# Development (debug build + launch; Buddy Bluetooth needs the .app below)
+# Development: debug build + launch (Buddy Bluetooth needs the .app below)
 swift build && ./.build/debug/CodeIsland
 
-# Release (universal binary: Apple Silicon + Intel)
+# Release: universal binary (Apple Silicon + Intel)
 ./build.sh
 open .build/release/CodeIsland.app
+
+# Tests
+swift test
 ```
-
-## How It Works
-
-```
-AI Tool (Claude/Codex/Gemini/Cursor/...)
-  → Hook event triggered
-    → codeisland-bridge (native Swift binary, ~86KB)
-      → Unix socket → /tmp/codeisland-<uid>.sock
-        → CodeIsland app receives event
-          → Updates UI in real time
-          → Optional local Buddy sync to iPhone / Apple Watch
-```
-
-CodeIsland installs lightweight hooks into each AI tool's config. When the tool triggers an event (session start, tool call, permission request, etc.), the hook sends a JSON message through a Unix socket. CodeIsland listens on this socket and updates the notch panel instantly.
-
-For **OpenCode**, a JS plugin connects directly to the socket — no bridge binary needed.
-
-For **Codex**, one extra step is yours and not something CodeIsland can do for you: Codex will not run a hook it has not been shown. After installing, start Codex and it reports `1 hook needs review before it can run.` — run `/hooks`, review the CodeIsland entries and trust them. Until then Codex simply does nothing with them, with no error, which looks exactly like CodeIsland not supporting Codex. Codex records a content hash per trusted hook in `~/.codex/config.toml` under `[hooks.state]`, so if a CodeIsland update rewrites `~/.codex/hooks.json`, the review is needed once more.
-
-For **DeepSeek Harness (DSH)**, the [dsh-island](https://github.com/cdxiaodong/dsh-island) cordis plugin listens to DSH's built-in events (`session/created`, `tools/pre-execute`, `approval/request`, …) and writes the same JSON over the Unix socket. Install it inside DSH:
-
-```bash
-dsh plugin --profile <profile> add github:cdxiaodong/dsh-island
-```
-
-DSH is plugin-native, so no hook configuration is installed — CodeIsland only needs to know the `dsh` source name to render its session card.
-
-## Settings
-
-CodeIsland provides a 7-tab settings panel:
-
-- **General** — Language, launch at login, display selection
-- **Behavior** — Auto-hide, smart suppress, session cleanup
-- **Appearance** — Panel height, font size, AI reply lines
-- **Mascots** — Preview all pixel-art characters and their animations
-- **Sound** — 8-bit sound effects for session events
-- **Hooks** — View CLI installation status, reinstall or uninstall hooks
-- **About** — Version info and links
-
-## Keyboard Shortcuts
-
-| Shortcut | Action | Default |
-|----------|--------|---------|
-| ⌘⇧I | Toggle the island panel open/closed | On |
-| ⌘⇧A | Approve the current permission request | Off |
-| ⌘⇧D | Deny the current permission request | Off |
-
-All shortcuts are configurable — and more actions (always-allow, skip question, jump to terminal) can be bound — under **Settings → Shortcuts**. When an approve/deny shortcut is enabled, its binding shows as a badge right on the approval card.
 
 ## Requirements
 
-- macOS 14.0 (Sonoma) or later
-- Works best on MacBooks with a notch, but also works on external displays
+- macOS 14 Sonoma or later
+- Best on a MacBook with a notch; external and notch-less displays work too
 
 ## Acknowledgments
 
-This project was inspired by [claude-island](https://github.com/farouqaldori/claude-island) by [@farouqaldori](https://github.com/farouqaldori). Thanks for the original idea of bringing AI agent status into the macOS notch.
+Inspired by [claude-island](https://github.com/farouqaldori/claude-island) by [@farouqaldori](https://github.com/farouqaldori) — thanks for the original idea of putting AI agent status in the macOS notch. And thanks to everyone who has contributed integrations, fixes and bug reports.
 
-## Star History
+## Star history
 
 <a href="https://star-history.dera.page/#wxtsky/CodeIsland&type=date&legend=bottom-right">
-   <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
-   </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&theme=dark&legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
+    <img alt="Star history chart" src="https://star-history.dera.page/svg?repos=wxtsky/CodeIsland&type=date&legend=top-left" />
+  </picture>
 </a>
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).

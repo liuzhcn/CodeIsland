@@ -52,7 +52,9 @@ struct TerminalActivator {
         "codex": "com.openai.codex",
         "cursor": "com.todesktop.230313mzl4w4u92",
         "trae": "com.trae.app",
-        "traecn": "com.trae.app",
+        // Trae CN is its own install with its own bundle id (Homebrew trae-cn
+        // cask; TraeCode CN 3.3.104 Info.plist), not the international Trae.app.
+        "traecn": "cn.trae.app",
         "qoder": "com.qoder.ide",
         "droid": "com.factory.app",
         "codebuddy": "com.tencent.codebuddy",
@@ -60,6 +62,10 @@ struct TerminalActivator {
         "stepfun": "com.stepfun.app",
         "opencode": "ai.opencode.desktop",
         "workbuddy": "com.workbuddy.workbuddy",
+        // AiWork GUI only. `aiwork-cli` is deliberately absent: a TUI session runs
+        // in a terminal, so it must fall through to terminal tab-matching instead
+        // of raising — or launching — the IDE.
+        "aiwork": "com.alipay.dtcoder.ide",
     ]
 
     /// Bundle IDs of apps that have both APP and CLI modes.
@@ -69,6 +75,7 @@ struct TerminalActivator {
         "com.openai.codex": "Codex",
         "com.todesktop.230313mzl4w4u92": "Cursor",
         "com.trae.app": "Trae",
+        "cn.trae.app": "Trae CN",
         "com.qoder.ide": "Qoder",
         "com.factory.app": "Factory",
         "com.tencent.codebuddy": "CodeBuddy",
@@ -76,6 +83,7 @@ struct TerminalActivator {
         "com.stepfun.app": "StepFun",
         "ai.opencode.desktop": "OpenCode",
         "com.workbuddy.workbuddy": "WorkBuddy",
+        "com.alipay.dtcoder.ide": "AiWork",
         // Claude Code Desktop (#211). Deliberately NOT in sourceToNativeAppBundleId:
         // most "claude" sessions are terminal CLI runs, and that fallback would
         // steal their click-to-jump whenever the desktop app happens to be open.
@@ -89,6 +97,14 @@ struct TerminalActivator {
     ) {
         if let url = session.codexDesktopURL, NSWorkspace.shared.open(url) { return }
         guard !session.isRemote else { return }
+        // A UI harness (T3 Code) owns the conversation: the terminal/multiplexer
+        // env the CLI inherited belongs to wherever the harness server was
+        // started, so jump to the harness instead — before Herdr/tmux routing,
+        // which would otherwise aim at that unrelated pane (#321).
+        if let harness = session.hostHarness {
+            HostHarnessSupport.activate(harness: harness, session: session, sessionId: sessionId)
+            return
+        }
         if allowHerdr && activateHerdrIfAvailable(session: session, sessionId: sessionId) {
             return
         }

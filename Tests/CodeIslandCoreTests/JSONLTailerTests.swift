@@ -141,6 +141,91 @@ final class JSONLTailerTests: XCTestCase {
         XCTAssertFalse(result.delta.isEmpty)
     }
 
+    func testScanLinesExtractsCodexPublicAgentMessage() {
+        let line = #"{"type":"event_msg","payload":{"type":"agent_message","message":"Checking the affected call sites now."}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertEqual(result.delta.lastAssistantMessage, "Checking the affected call sites now.")
+        XCTAssertTrue(result.delta.hasActivity)
+    }
+
+    func testScanLinesExtractsCodexAssistantOutputText() {
+        let line = #"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The focused tests now pass."}]}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertEqual(result.delta.lastAssistantMessage, "The focused tests now pass.")
+        XCTAssertTrue(result.delta.hasActivity)
+    }
+
+    /// Shape copied from a real Codex 0.155 rollout: model output carries a
+    /// Responses API `id` between the payload `type` and `role`, plus trailing
+    /// `phase` / metadata keys. Paginated rollouts (the TUI/exec default) no
+    /// longer persist `event_msg` `agent_message`, so this record is the only
+    /// place public assistant text appears.
+    func testScanLinesExtractsCodexAssistantOutputTextWithResponseId() {
+        let line = #"{"timestamp":"2026-09-22T10:30:08.122Z","ordinal":12,"type":"response_item","payload":{"type":"message","id":"msg_06d3529cdc545225016ab258ae4a9487d0b31be86b7c8d5a90","role":"assistant","content":[{"type":"output_text","text":"Checking the parser first."}],"phase":"commentary","internal_chat_message_metadata_passthrough":{"turn_id":"t1"}}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertEqual(result.delta.lastAssistantMessage, "Checking the parser first.")
+        XCTAssertTrue(result.delta.hasActivity)
+    }
+
+    func testScanLinesIgnoresCodexUserAndDeveloperMessagesWithResponseId() {
+        let lines = [
+            #"{"type":"response_item","payload":{"type":"message","id":"msg_1","role":"developer","content":[{"type":"input_text","text":"<app-context>"}]}}"#,
+            #"{"type":"response_item","payload":{"type":"message","id":"msg_2","role":"user","content":[{"type":"input_text","text":"say \"role\":\"assistant\" and \"type\":\"output_text\""}]}}"#,
+        ].joined(separator: "\n")
+        let result = JSONLTailer.scanLines(Data((lines + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+    }
+
+    func testScanLinesIgnoresPaginatedCodexReasoningItems() {
+        let line = #"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"t","turn_id":"u","item":{"type":"Reasoning","id":"rs_1","summary_text":["private summary"],"raw_content":["private reasoning"]}}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+    }
+
+    func testScanLinesIgnoresCodexReasoningEvenWhenItHasASummary() {
+        let line = #"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Reviewing transcript parsing"}],"content":[{"type":"text","text":"hidden chain of thought"}],"encrypted_content":"secret"}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+    }
+
+    func testScanLinesIgnoresCodexResponseItemAgentMessageWithMessageField() {
+        let line = #"{"type":"response_item","payload":{"type":"agent_message","message":"private delegation","author":"/root","recipient":"/root/worker"}}"#
+        let result = JSONLTailer.scanLines(Data((line + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+        XCTAssertFalse(result.delta.hasActivity)
+    }
+
+    func testScanLinesIgnoresCodexPrivateReasoningAndInterAgentMessages() {
+        let lines = [
+            #"{"type":"response_item","payload":{"type":"reasoning","summary":[],"content":[{"type":"text","text":"hidden chain of thought"}],"encrypted_content":"secret"}}"#,
+            #"{"type":"response_item","payload":{"type":"agent_message","author":"/root","recipient":"/root/worker","content":[{"type":"input_text","text":"private delegation"}]}}"#
+        ].joined(separator: "\n")
+        let result = JSONLTailer.scanLines(Data((lines + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+        XCTAssertFalse(result.delta.hasActivity)
+    }
+
+    func testScanLinesClearsPreviousCodexOutputAtNewTurnBoundary() {
+        let lines = [
+            #"{"type":"event_msg","payload":{"type":"agent_message","message":"Old answer"}}"#,
+            #"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"type":"event_msg","payload":{"type":"user_message","message":"New task"}}"#,
+        ].joined(separator: "\n")
+        let result = JSONLTailer.scanLines(Data((lines + "\n").utf8))
+
+        XCTAssertNil(result.delta.lastAssistantMessage)
+        XCTAssertEqual(result.delta.lastUserPrompt, "New task")
+        XCTAssertEqual(result.delta.turnStatus, .processing)
+    }
+
     func testScanLinesExtractsGrokChatHistoryRows() {
         let lines = [
             #"{"type":"user","content":[{"type":"text","text":"build it"}]}"#,

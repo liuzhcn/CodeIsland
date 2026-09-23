@@ -50,6 +50,9 @@ extension AppState {
                 session.status = .processing
                 session.interrupted = false
                 session.taskRoundEnded = false
+                if session.source == "codex" {
+                    session.liveCodexOutput = nil
+                }
             case .idle:
                 session.status = .idle
                 session.currentTool = nil
@@ -201,6 +204,9 @@ extension AppState {
                 session.status = .processing
                 session.interrupted = false
                 session.taskRoundEnded = false
+                if session.source == "codex" {
+                    session.liveCodexOutput = nil
+                }
             case .idle:
                 session.status = .idle
                 session.currentTool = nil
@@ -243,6 +249,10 @@ extension AppState {
                 if lastNormalized != normalizedIncoming {
                     session.addRecentMessage(ChatMessage(isUser: false, text: normalizedIncoming))
                 }
+                mutated = true
+            }
+            if session.source == "codex", session.liveCodexOutput != normalizedIncoming {
+                session.liveCodexOutput = normalizedIncoming
                 mutated = true
             }
         }

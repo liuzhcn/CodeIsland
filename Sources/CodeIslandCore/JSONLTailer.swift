@@ -436,21 +436,38 @@ public final class JSONLTailer: @unchecked Sendable {
                 }
             }
         case "response_item":
-            guard let payload = json["payload"] as? [String: Any],
-                  payload["type"] as? String == "message",
-                  payload["role"] as? String == "user",
-                  let content = payload["content"] as? [[String: Any]] else { return }
-            let text = content.filter { $0["type"] as? String == "input_text" }
-                .compactMap { $0["text"] as? String }.joined(separator: "\n")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { delta.lastUserPrompt = text }
+            if let payload = json["payload"] as? [String: Any],
+               payload["type"] as? String == "message",
+               payload["role"] as? String == "user",
+               let content = payload["content"] as? [[String: Any]] {
+                let text = content.filter { $0["type"] as? String == "input_text" }
+                    .compactMap { $0["text"] as? String }.joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty {
+                    delta.lastUserPrompt = text
+                    delta.hasActivity = true
+                }
+            }
+            if let text = codexPublicAssistantText(from: json) {
+                delta.lastAssistantMessage = text
+                delta.hasActivity = true
+            }
         case "event_msg":
             delta.hasActivity = true
             guard let payload = json["payload"] as? [String: Any],
                   let eventType = payload["type"] as? String else { return }
+            if let text = codexPublicAssistantText(from: json) {
+                delta.lastAssistantMessage = text
+            }
             switch eventType {
             case "task_started":
+                delta.lastAssistantMessage = nil
                 delta.turnStatus = .processing
+            case "user_message":
+                delta.lastAssistantMessage = nil
+                if let message = normalizedText(payload["message"]) {
+                    delta.lastUserPrompt = message
+                }
             // "turn_failed" is not in today's codex EventMsg enum — kept as a
             // forward-compatible guess at the obvious name for a failed turn.
             case "task_complete", "turn_aborted", "turn_failed":
@@ -467,6 +484,42 @@ public final class JSONLTailer: @unchecked Sendable {
                 applyCursorRoleLine(role: role, message: message, into: &delta)
             }
         }
+    }
+
+    /// Extract assistant text that Codex deliberately persists for display.
+    ///
+    /// Raw/encrypted reasoning content and every response-item `agent_message`
+    /// are intentionally excluded because the latter may be inter-agent traffic.
+    public static func codexPublicAssistantText(from json: [String: Any]) -> String? {
+        guard let type = json["type"] as? String,
+              let payload = json["payload"] as? [String: Any],
+              let payloadType = payload["type"] as? String else { return nil }
+
+        if type == "event_msg", payloadType == "agent_message" {
+            return normalizedText(payload["message"])
+        }
+
+        guard type == "response_item" else { return nil }
+        if payloadType == "message", payload["role"] as? String == "assistant" {
+            return codexTextBlocks(payload["content"], acceptedTypes: ["output_text"])
+        }
+        return nil
+    }
+
+    private static func codexTextBlocks(_ value: Any?, acceptedTypes: Set<String>) -> String? {
+        guard let blocks = value as? [[String: Any]] else { return nil }
+        let parts = blocks.compactMap { block -> String? in
+            guard let type = block["type"] as? String,
+                  acceptedTypes.contains(type) else { return nil }
+            return normalizedText(block["text"])
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n")
+    }
+
+    private static func normalizedText(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Handle one Cursor `role`-keyed transcript entry.
@@ -593,6 +646,7 @@ public final class JSONLTailer: @unchecked Sendable {
         case user
         case assistant
         case codexEvent
+        case codexResponseItem
         case cursorRole
         case irrelevant
     }
@@ -650,6 +704,11 @@ public final class JSONLTailer: @unchecked Sendable {
                             if hasExactValue(ptr, at: valueStart, total: total, expect: eventMsgBytes) {
                                 return .codexEvent
                             }
+                        case 0x72:  // 'r'
+                            if hasExactValue(ptr, at: valueStart, total: total, expect: responseItemBytes) {
+                                return isCodexPublicResponseCandidate(ptr, total: total)
+                                    ? .codexResponseItem : .irrelevant
+                            }
                         default:
                             break
                         }
@@ -699,6 +758,50 @@ public final class JSONLTailer: @unchecked Sendable {
     private static let plannerResponseBytes: [UInt8] = Array(#"PLANNER_RESPONSE""#.utf8)
 
     private static let eventMsgBytes: [UInt8] = Array(#"event_msg""#.utf8)
+    private static let responseItemBytes: [UInt8] = Array(#"response_item""#.utf8)
+    private static let codexMessagePayloadMarker: [UInt8] = Array(
+        #""payload":{"type":"message","#.utf8
+    )
+    private static let codexAssistantRoleMarker: [UInt8] = Array(#""role":"assistant""#.utf8)
+    private static let codexOutputTextMarker: [UInt8] = Array(#""type":"output_text""#.utf8)
+
+    /// Keep large tool results on the no-parse path. Only response items with
+    /// the compact public-message shapes emitted by Codex reach JSONSerialization.
+    private static func isCodexPublicResponseCandidate(
+        _ ptr: UnsafePointer<UInt8>,
+        total: Int
+    ) -> Bool {
+        // Codex writes the payload type and content block at the front of a
+        // response item. Bound the probe so a multi-megabyte tool result stays
+        // O(1) here instead of being scanned once before the fast rejection.
+        //
+        // Model output carries a Responses API id between `type` and `role`
+        // (`{"type":"message","id":"msg_…","role":"assistant",…}`), so match
+        // the three markers independently instead of as one contiguous run.
+        // Quotes inside string values are escaped, so a user message quoting
+        // `"role":"assistant"` cannot match; `apply` re-checks the parsed role.
+        let prefixLength = min(total, 4096)
+        return containsMarker(ptr, total: prefixLength, marker: codexMessagePayloadMarker)
+            && containsMarker(ptr, total: prefixLength, marker: codexAssistantRoleMarker)
+            && containsMarker(ptr, total: prefixLength, marker: codexOutputTextMarker)
+    }
+
+    private static func containsMarker(
+        _ ptr: UnsafePointer<UInt8>,
+        total: Int,
+        marker: [UInt8]
+    ) -> Bool {
+        guard !marker.isEmpty, total >= marker.count else { return false }
+        for start in 0...(total - marker.count) {
+            var matched = true
+            for offset in marker.indices where ptr[start + offset] != marker[offset] {
+                matched = false
+                break
+            }
+            if matched { return true }
+        }
+        return false
+    }
 
     private static func hasExactValue(
         _ ptr: UnsafePointer<UInt8>,

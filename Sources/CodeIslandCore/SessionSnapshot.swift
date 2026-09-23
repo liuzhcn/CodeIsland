@@ -40,6 +40,18 @@ public struct SessionSnapshot: Sendable {
         "cline",
         "dsh",
         "zcode",
+        "aiwork",
+        "aiwork-cli",
+    ]
+
+    /// Sources whose tool/description text arrives as a rapid delta stream
+    /// (AiWork/Agentix `stream.text_delta`). MorphText swaps text immediately for
+    /// these instead of restarting its blur morph on every update, which would
+    /// otherwise leave the label permanently unreadable. Scoped deliberately:
+    /// every other source keeps the original morph behaviour.
+    public static let rapidStreamingSources: Set<String> = [
+        "aiwork",
+        "aiwork-cli",
     ]
 
     public static let ideCompletionSources: Set<String> = [
@@ -101,6 +113,9 @@ public struct SessionSnapshot: Sendable {
     public var startTime: Date = Date()
     public var lastUserPrompt: String?
     public var lastAssistantMessage: String?
+    /// Public assistant text emitted during the active Codex turn. This is
+    /// transient UI state: a new turn clears it while chat history remains.
+    public var liveCodexOutput: String?
     /// Absolute path to the JSONL transcript currently backing this session. Populated
     /// by hooks (`transcript_path` field) and by filesystem discovery, consumed by the
     /// JSONLTailer for incremental streaming of the latest assistant reply.
@@ -143,6 +158,10 @@ public struct SessionSnapshot: Sendable {
     public var orcaWorktreeId: String?
     public var cliPid: pid_t?            // CLI process PID (from bridge _ppid)
     public var cliStartTime: Date?       // Start time of the tracked CLI PID (guards PID reuse)
+    /// UI harness (T3 Code, …) that spawned the CLI, found by walking the
+    /// ancestry of `cliPid`. Resolved off the main actor and re-read rather
+    /// than persisted: the harness may have restarted between runs. (#321)
+    public var hostHarness: HostHarness?
     public var source: String = "claude" // "claude" or "codex"
     public var interrupted: Bool = false
     /// Cline-specific: true after TaskComplete/TaskCancel until the next TaskStart/TaskResume.
@@ -152,6 +171,9 @@ public struct SessionSnapshot: Sendable {
     public var sessionTitle: String?
     public var sessionTitleSource: SessionTitleSource?
     public var providerSessionId: String?
+    /// AiWork/Agentix `client_type` from `sessions.get` (e.g. `DTCoderGUI`, `AiWorkGUI`).
+    /// Prefer this over the `acp:`/`cli:` session-id prefix — modern TUI also uses `acp:`.
+    public var aiworkClientType: String?
     public var remoteHostId: String?
     public var remoteHostName: String?
     /// nil = unchecked, false = not YOLO, true = YOLO
@@ -272,6 +294,12 @@ public struct SessionSnapshot: Sendable {
             "qoderclicn": "qoder-cli",
             "qodercli-cn": "qoder-cli",
             "qoder-cn": "qoder-cli",
+            // AiWork (formerly DTCoder) — the pre-rename spelling and the
+            // no-separator CLI variants normalise onto the `aiwork*` keys.
+            "dtcoder": "aiwork",
+            "dtcoder-cli": "aiwork-cli",
+            "dtcodercli": "aiwork-cli",
+            "aiworkcli": "aiwork-cli",
             "qodercn": "qoder-cli",
             // QoderWork — Qoder's standalone desktop assistant app (not the
             // IDE); own hooks file at ~/.qoderwork/settings.json (#249).
@@ -631,6 +659,8 @@ public struct SessionSnapshot: Sendable {
         case "kiro": return "Kiro"
         case "cline": return "Cline"
         case "zcode": return "ZCode"
+        case "aiwork": return "AiWork"
+        case "aiwork-cli": return "AiWork CLI"
         default:
             if let customName = Self.loadCustomSourceNames()[source] {
                 return customName
@@ -688,6 +718,7 @@ public struct SessionSnapshot: Sendable {
     private static let appBundleNames: [String: String] = [
         "com.todesktop.230313mzl4w4u92": "Cursor",
         "com.trae.app": "Trae",
+        "cn.trae.app": "Trae CN",
         "com.qoder.ide": "Qoder",
         "com.factory.app": "Factory",
         "com.tencent.codebuddy": "CodeBuddy",
@@ -699,6 +730,7 @@ public struct SessionSnapshot: Sendable {
         // Claude Code Desktop (#211): local Code-tab sessions run the same engine
         // and fire the same ~/.claude/settings.json hooks as the CLI.
         "com.anthropic.claudefordesktop": "Claude",
+        "com.alipay.dtcoder.ide": "AiWork",
     ]
 
     /// Maps native app bundle IDs to their expected source identifier.
@@ -706,6 +738,8 @@ public struct SessionSnapshot: Sendable {
     private static let appBundleSources: [String: String] = [
         "com.todesktop.230313mzl4w4u92": "cursor",
         "com.trae.app": "trae",
+        // Trae CN ships as its own app (`Trae CN.app`), not inside Trae.app.
+        "cn.trae.app": "traecn",
         "com.qoder.ide": "qoder",
         "com.factory.app": "droid",
         "com.tencent.codebuddy": "codebuddy",
@@ -719,6 +753,7 @@ public struct SessionSnapshot: Sendable {
         // Claude Code Desktop (#211) — hook subprocesses inherit the app's
         // __CFBundleIdentifier, so desktop Code sessions arrive tagged with it.
         "com.anthropic.claudefordesktop": "claude",
+        "com.alipay.dtcoder.ide": "aiwork",
     ]
 
     /// Source id for the native app that owns `bundleId`, if any.
@@ -771,6 +806,10 @@ public struct SessionSnapshot: Sendable {
     /// innermost layer — the one the CLI actually sits in — wins, which is the
     /// same order `HerdrController.shouldRoute` uses to decide where a jump goes.
     public var multiplexerLabel: String? {
+        // Under a harness the multiplexer vars were inherited from wherever the
+        // harness server was started; the conversation is not in that pane, so
+        // naming it would point the user at the wrong place (#321).
+        if hostHarness != nil { return nil }
         if zellijPaneId != nil || zellijSessionName != nil { return "zellij" }
         if tmuxEnv != nil || tmuxPane != nil { return "tmux" }
         if hasHerdrRoute { return "herdr" }
@@ -793,6 +832,9 @@ public struct SessionSnapshot: Sendable {
         if isRemote {
             return remoteDisplayName ?? "Remote"
         }
+        // AiWork (formerly DTCoder): badge names match Hooks settings.
+        if source == "aiwork" { return "AiWork" }
+        if source == "aiwork-cli" { return "AiWork CLI" }
         // If termBundleId is a known app, show app name (APP mode)
         if let bid = termBundleId, let name = Self.appBundleNames[bid] {
             return name
@@ -810,6 +852,7 @@ public struct SessionSnapshot: Sendable {
             // IDE integrated terminals
             if lower.contains("vscode") || lower.contains("vscodium") { return "VS Code" }
             if lower == "com.trae.app" { return "Trae" }
+            if lower == "cn.trae.app" { return "Trae CN" }
             if lower.contains("windsurf") { return "Windsurf" }
             if lower.contains("jetbrains") {
                 if lower.contains("intellij") { return "IDEA" }
@@ -988,6 +1031,24 @@ public func reduceEvent(
         return effects
     }
 
+    // Codex may flush already queued tool hooks after an Interrupt. Keep the
+    // terminal state latched until a new prompt/session starts so stale work
+    // cannot revive the card as processing.
+    //
+    // SubagentStop still passes: interrupting the root turn does not stop
+    // spawned agents, and dropping their stop would leave them in `subagents`
+    // so the next root Stop sees "active subagents" and pins the card to
+    // running/Agent. Removing a subagent never revives an idle parent.
+    if sessions[sessionId]?.source == "codex",
+       sessions[sessionId]?.interrupted == true,
+       eventName != "SessionStart",
+       eventName != "UserPromptSubmit",
+       eventName != "SessionEnd",
+       eventName != "SubagentStop",
+       eventName != "Interrupt" {
+        return effects
+    }
+
     // Route subagent-specific events
     if let agentId = event.agentId {
         let handled = handleSubagentEvent(
@@ -1010,6 +1071,20 @@ public func reduceEvent(
         return effects
     }
 
+    // Remote Codex hooks can enrich ordinary lifecycle events with the latest
+    // public assistant text because their transcript path is not readable on
+    // this Mac. Apply it only after stale/interrupted and subagent events have
+    // been filtered, and keep it separate from persisted chat history.
+    if sessions[sessionId]?.source == "codex",
+       eventName != "UserPromptSubmit",
+       eventName != "SessionStart",
+       let output = event.rawJSON["last_assistant_message"] as? String {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            sessions[sessionId]?.liveCodexOutput = trimmed
+        }
+    }
+
     // Preserve actionable states: don't let activity updates overwrite waiting states
     let isWaiting = sessions[sessionId]?.status == .waitingApproval
         || sessions[sessionId]?.status == .waitingQuestion
@@ -1019,6 +1094,9 @@ public func reduceEvent(
     case "UserPromptSubmit":
         sessions[sessionId]?.interrupted = false
         sessions[sessionId]?.taskRoundEnded = false
+        if sessions[sessionId]?.source == "codex" {
+            sessions[sessionId]?.liveCodexOutput = nil
+        }
         sessions[sessionId]?.status = .processing
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil
@@ -1048,7 +1126,7 @@ public func reduceEvent(
     case "PreToolUse":
         if !isWaiting {
             sessions[sessionId]?.status = .running
-            sessions[sessionId]?.currentTool = event.toolName
+            sessions[sessionId]?.currentTool = event.activityLabel
             sessions[sessionId]?.toolDescription = event.toolDescription
         }
     case "PostToolUse":
@@ -1351,7 +1429,22 @@ public func reduceEvent(
         }
     case "PreCompact":
         sessions[sessionId]?.status = .processing
+        if sessions[sessionId]?.source == "codex" {
+            sessions[sessionId]?.currentTool = "Compacting"
+        }
         sessions[sessionId]?.toolDescription = "Compacting context\u{2026}"
+    case "PostCompact":
+        if !isWaiting {
+            sessions[sessionId]?.status = .processing
+            sessions[sessionId]?.currentTool = nil
+            sessions[sessionId]?.toolDescription = nil
+        }
+    case "Interrupt":
+        sessions[sessionId]?.interrupted = true
+        sessions[sessionId]?.status = .idle
+        sessions[sessionId]?.currentTool = nil
+        sessions[sessionId]?.toolDescription = nil
+        effects.append(.enqueueCompletion(sessionId: sessionId))
     default:
         break
     }
@@ -1522,6 +1615,13 @@ private func shouldReopenCursorSubagentOnPrompt(event: HookEvent, session: Sessi
         ?? SessionSnapshot.normalizedSupportedSource(event.rawJSON["source"] as? String)
         ?? session?.source
     return source == "cursor" || source == "cursor-cli"
+}
+
+/// Whether a subagent-routed event comes from Codex (native child threads).
+private func isCodexSubagentEvent(_ event: HookEvent, session: SessionSnapshot?) -> Bool {
+    let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
+        ?? session?.source
+    return source == "codex"
 }
 
 /// Whether folded-child prompt/response text should appear on the parent card.
@@ -1864,7 +1964,17 @@ private func handleSubagentEvent(
 
     case "SubagentStop", "Stop", "SessionEnd":
         sessions[sessionId]?.subagents.removeValue(forKey: agentId)
-        sessions[sessionId]?.recordClosedSubagentId(agentId)
+        // Codex fires SubagentStop at the end of every child *turn*, and its
+        // agent_id is the child's thread id, reused for follow-up turns sent
+        // via send_message / followup_task without a new SubagentStart. A
+        // tombstone here would drop those turns' hooks (ensureSubagent) and
+        // auto-deny their PermissionRequests (shouldSuppressClosedSubagentUI).
+        // Removing the entry is enough: Codex awaits each hook in order, so no
+        // stale tool hook can trail the stop, and the next turn's hooks
+        // recreate the entry.
+        if !(eventName == "SubagentStop" && isCodexSubagentEvent(event, session: sessions[sessionId])) {
+            sessions[sessionId]?.recordClosedSubagentId(agentId)
+        }
         // If no more subagents, revert parent to processing (waiting for main thread to continue)
         if sessions[sessionId]?.subagents.isEmpty == true {
             if sessions[sessionId]?.status == .running && sessions[sessionId]?.currentTool == "Agent" {
@@ -1881,7 +1991,7 @@ private func handleSubagentEvent(
             return true
         }
         sessions[sessionId]?.subagents[agentId]?.status = .running
-        sessions[sessionId]?.subagents[agentId]?.currentTool = event.toolName
+        sessions[sessionId]?.subagents[agentId]?.currentTool = event.activityLabel
         sessions[sessionId]?.subagents[agentId]?.toolDescription = event.toolDescription
         sessions[sessionId]?.subagents[agentId]?.lastActivity = Date()
         // Keep parent session showing as active while subagents work

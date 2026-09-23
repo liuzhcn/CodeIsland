@@ -189,6 +189,36 @@ final class AppState {
     /// app-server delivered `thread/closed`.
     @ObservationIgnored
     var closedCodexAppThreads: [String: Date] = [:]
+    /// Grok sessions retired because their pager process started another
+    /// session (#318), mapped to that process. While it lives, discovery and
+    /// trailing passive hooks must not resurrect the card; a new prompt or
+    /// SessionStart for the session means the user switched back to it.
+    @ObservationIgnored
+    var supersededGrokSessions: [String: ProcessIdentity] = [:]
+
+    /// Per-agent AiWork/Agentix daemon watch clients (`sessions.watch`).
+    /// Keyed by agent id (e.g. `"coder"`). See AppState+AiWorkWatch.
+    @ObservationIgnored
+    var aiworkWatchClients: [String: AiWorkWatchClient] = [:]
+    /// Periodic reconnect / rediscovery timer for Agentix daemons.
+    @ObservationIgnored
+    var aiworkWatchReconnectTimer: Timer?
+    /// Daemon session ids that already received a `sessions.get` title/cwd hydrate.
+    @ObservationIgnored
+    var aiworkHydratedSessionIds: Set<String> = []
+    /// When a `sessions.get` hydrate last failed, per daemon session id. The id
+    /// stays in `aiworkHydratedSessionIds` until the cooldown elapses, so a
+    /// failing daemon is not re-dialled on every streamed token.
+    @ObservationIgnored
+    var aiworkHydrateFailedAt: [String: Date] = [:]
+    /// Agentix state dir to discover daemons under; nil = `$AGENTIX_STATE_DIR`
+    /// or `~/.agentix`. Tests point this at a temp dir so they never reach a
+    /// real daemon on the developer's machine.
+    @ObservationIgnored
+    var aiworkStateDirOverride: String?
+    /// Guards overlapping `agent.stats` reconciles from the 3s rediscovery timer.
+    @ObservationIgnored
+    var aiworkReconcileInFlight = false
 
     /// Computed: first item in permission queue (backward compat for UI reads)
     var pendingPermission: PermissionRequest? { permissionQueue.first }
@@ -226,6 +256,9 @@ final class AppState {
             }
             if surface.isExpanded {
                 refreshClaudeUsageIfStale()
+                claudeQuota.noteExpanded()
+            } else {
+                claudeQuota.noteCollapsed()
             }
         }
     }
@@ -233,7 +266,15 @@ final class AppState {
     /// Local-transcript token usage shown in the session-list footer.
     /// Refreshed lazily on panel expansion (no resident timer, no API calls).
     var claudeUsage: ClaudeUsageScanner.Snapshot?
-    private var usageScanInFlight = false
+    /// Subscription rate limits (5h / weekly) from Anthropic — opt-in, network.
+    let claudeQuota = ClaudeQuotaMonitor()
+    /// Process-wide, not per-instance: the scan reads one shared history
+    /// (`~/.claude`), so two concurrent runs are always duplicate work. Production
+    /// has a single AppState and never noticed, but anything constructing several —
+    /// the test bundle does — otherwise starts N cold scans at once on the shared
+    /// `.utility` cooperative pool and starves every other detached probe on it
+    /// (git-branch resolution among them).
+    private static var usageScanInFlight = false
     /// Incremental parse state — round-trips through each detached scan so
     /// growing transcripts are only read past their last consumed offset.
     private var usageFileCache = ClaudeUsageScanner.FileCache()
@@ -516,6 +557,27 @@ final class AppState {
             }
         }
 
+        // 4b. AiWork sessions come from the Agentix daemon's persistent session
+        //     store, which keeps every conversation as status:"active" forever and
+        //     never emits a close/delete event. A finished turn or an exited TUI/GUI
+        //     conversation just goes idle, so without this it would sit here for the
+        //     full 10-min no-monitor timeout (Section 4) — completed eval bursts pile
+        //     up in the notch. Backfill already treats idle AiWork entries as
+        //     historical and skips them, so mirror that: drop an idle AiWork session
+        //     shortly after its last activity. Live turns bump lastActivity on every
+        //     stream event, so an in-use conversation is never swept mid-thought and
+        //     re-appears the moment the next turn starts.
+        let aiworkIdleGrace: TimeInterval = 60
+        for (key, session) in sessions
+            where key.hasPrefix(AppState.aiworkSessionPrefix)
+            && session.status == .idle {
+            guard -session.lastActivity.timeIntervalSinceNow > aiworkIdleGrace else { continue }
+            if let daemonId = session.providerSessionId {
+                forgetAiWorkHydrateState(daemonId)
+            }
+            removeSession(key)
+        }
+
         // 5. Reclaim memory for abandoned tool_use_id cache entries.
         prunePendingToolUses()
 
@@ -647,13 +709,22 @@ final class AppState {
         return qoderIDEBundlePrefixes.contains { path.contains($0) }
     }
 
+    /// Is `executablePath` inside the Trae CN IDE bundle, under any name it
+    /// ships as? It never matches the international `Trae.app`: the two
+    /// editions are separate installs and must not keep each other's
+    /// sessions alive. The markers live in CodeIslandCore so the bridge's
+    /// `_ppid` resolution uses the same list.
+    nonisolated static func isTraeCNIDEBundlePath(_ executablePath: String) -> Bool {
+        CLIProcessResolver.isTraeCNBundlePath(executablePath)
+    }
+
     private nonisolated static func isNativeAppProcess(_ pid: pid_t, source: String) -> Bool {
         guard let executable = executablePath(for: pid) else { return false }
         let path = executable.lowercased()
         switch source {
         case "cursor":     return path.contains("/cursor.app/contents/")
         case "trae":       return path.contains("/trae.app/contents/")
-        case "traecn":     return path.contains("/trae.app/contents/") || path.contains("/traecn.app/contents/")
+        case "traecn":     return isTraeCNIDEBundlePath(path)
         case "qoder":      return isQoderIDEBundlePath(path)
         // QoderWork desktop app (#249) — bundle id undocumented; the standard
         // /Applications/QoderWork.app layout is assumed, pending real-install
@@ -815,6 +886,8 @@ final class AppState {
         detachTranscriptTailer(sessionId: sessionId)
         exitingSessions.removeValue(forKey: sessionId)
         modelReadRetryAt.removeValue(forKey: sessionId)
+        hostHarnessProbes.removeValue(forKey: sessionId)
+        hostHarnessProbeRetryAt.removeValue(forKey: sessionId)
         completionQueue.removeAll { $0 == sessionId }
         if activeSessionId == sessionId {
             activeSessionId = mostActiveSessionId()
@@ -1033,7 +1106,7 @@ final class AppState {
         return .expand
     }
 
-    private func enqueueCompletion(_ sessionId: String) {
+    func enqueueCompletion(_ sessionId: String) {
         switch Self.completionStyle() {
         case .off:
             // Panel stays compact — status indicators still update, but no
@@ -1062,17 +1135,20 @@ final class AppState {
     /// on the first expansion.
     func refreshClaudeUsageIfStale() {
         guard UserDefaults.standard.bool(forKey: SettingsKey.showUsageStats) else { return }
-        guard !usageScanInFlight else { return }
+        guard !Self.usageScanInFlight else { return }
         if let scannedAt = claudeUsage?.scannedAt, Date().timeIntervalSince(scannedAt) < 120 { return }
-        usageScanInFlight = true
+        Self.usageScanInFlight = true
         let cacheCopy = usageFileCache
         Task.detached(priority: .utility) {
             var cache = cacheCopy
             let snapshot = ClaudeUsageScanner.scan(cache: &cache)
+            // Bound to a `let` before the hop: capturing the `var` in the
+            // concurrently-executing closure is an error under Swift 6.
+            let scannedCache = cache
             await MainActor.run { [weak self] in
                 self?.claudeUsage = snapshot
-                self?.usageFileCache = cache
-                self?.usageScanInFlight = false
+                self?.usageFileCache = scannedCache
+                AppState.usageScanInFlight = false
             }
         }
     }
@@ -1099,6 +1175,49 @@ final class AppState {
                 s.gitBranch = info?.branch
                 s.gitIsWorktree = info?.isWorktree ?? false
                 self.sessions[sessionId] = s
+            }
+        }
+    }
+
+    /// Last conclusive host-harness probe per session, keyed to the CLI pid it
+    /// walked. A SessionStart rebuilds the snapshot; the cache lets the result
+    /// be re-applied without walking the ancestry again. (#321)
+    private var hostHarnessProbes: [String: (pid: pid_t, harness: HostHarness?)] = [:]
+    private var hostHarnessProbesInFlight: Set<String> = []
+    /// Throttle for probes that could not read the process (it had already
+    /// exited, or the pid is a short-lived hook shell) — retried, not cached.
+    private var hostHarnessProbeRetryAt: [String: Date] = [:]
+
+    /// Detect a UI harness (T3 Code) in the CLI's ancestry, off the main actor.
+    /// Runs once per CLI pid; remote sessions never probe the local process table.
+    private func maybeResolveHostHarness(for sessionId: String) {
+        guard let session = sessions[sessionId],
+              !session.isRemote,
+              let pid = session.cliPid, pid > 1 else { return }
+        if let cached = hostHarnessProbes[sessionId], cached.pid == pid {
+            if session.hostHarness != cached.harness {
+                sessions[sessionId]?.hostHarness = cached.harness
+            }
+            return
+        }
+        guard !hostHarnessProbesInFlight.contains(sessionId),
+              Date() >= hostHarnessProbeRetryAt[sessionId] ?? .distantPast else { return }
+        hostHarnessProbesInFlight.insert(sessionId)
+        Task.detached(priority: .utility) {
+            let result = HostHarnessSupport.probe(cliPid: pid)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.hostHarnessProbesInFlight.remove(sessionId)
+                guard self.sessions[sessionId]?.cliPid == pid else { return }
+                if result.conclusive {
+                    self.hostHarnessProbes[sessionId] = (pid, result.harness)
+                    self.hostHarnessProbeRetryAt.removeValue(forKey: sessionId)
+                } else {
+                    self.hostHarnessProbeRetryAt[sessionId] = Date().addingTimeInterval(10)
+                }
+                if self.sessions[sessionId]?.hostHarness != result.harness {
+                    self.sessions[sessionId]?.hostHarness = result.harness
+                }
             }
         }
     }
@@ -1350,6 +1469,13 @@ final class AppState {
             return
         }
 
+        if shouldDropEventForSupersededGrokSession(
+            sessionId: sessionId,
+            normalizedEventName: normalizedEventName
+        ) {
+            return
+        }
+
         if source?.lowercased() == "codex",
            event.rawJSON["_term_bundle"] as? String == Self.codexAppBundleId,
            let rawProviderSessionId = event.rawJSON["session_id"] as? String {
@@ -1409,6 +1535,14 @@ final class AppState {
         // After reduce: remoteHostId is authoritative (extractMetadata just ran),
         // so a remote session can never probe the local filesystem here.
         maybeRefreshGitBranch(for: sessionId, cwdBefore: cwdBeforeReduce, normalizedEventName: normalizedEventName)
+        maybeResolveHostHarness(for: sessionId)
+
+        // A finished local Claude turn is booked against the plan limits now —
+        // the quota monitor coalesces these into at most one fetch a minute.
+        if normalizedEventName == "Stop",
+           let s = sessions[sessionId], s.isClaude, s.isRemote != true {
+            claudeQuota.noteStop()
+        }
 
         // Backfill model after metadata extraction. Hooks are inconsistent across providers,
         // so retry with a cooldown instead of giving up permanently on the first miss.
@@ -1428,10 +1562,19 @@ final class AppState {
         // the question-queue drain (questions don't carry tool_use_id reliably
         // and are rare enough that a blanket sweep is acceptable) and refresh
         // session status, but never drain unrelated permission requests.
+        //
+        // The sweep only covers questions asked by the same agent as the event.
+        // Background subagents share the parent's session_id, so their tool
+        // calls and SubagentStop kept arriving while the main thread's question
+        // was on screen and denied it ("Permission denied by hook").
         if wasWaiting {
             let keepWaiting: Set<String> = ["Notification", "SessionStart", "SessionEnd", "PreCompact"]
             if !keepWaiting.contains(normalizedEventName) {
-                drainQuestions(forSession: sessionId, reason: "wasWaiting-blanket-drain-event=\(normalizedEventName)")
+                drainQuestions(
+                    forSession: sessionId,
+                    reason: "wasWaiting-blanket-drain-event=\(normalizedEventName)",
+                    where: { $0.agentId == event.agentId }
+                )
                 let stillHasPermission = permissionQueue.contains { $0.event.sessionId == sessionId }
                 let stillHasQuestion = questionQueue.contains { $0.event.sessionId == sessionId }
                 if !stillHasPermission && !stillHasQuestion,
@@ -1454,6 +1597,10 @@ final class AppState {
 
         for effect in effects {
             executeEffect(effect, sessionId: sessionId)
+        }
+
+        if normalizedEventName == "SessionStart" {
+            retireGrokSessionsSuperseded(bySessionStartOf: sessionId)
         }
 
         if let provider = sessions[sessionId]?.source,
@@ -1479,6 +1626,86 @@ final class AppState {
         scheduleSave()
         startRotationIfNeeded()
         refreshDerivedState()
+    }
+
+    /// Grok's TUI switches the session it hosts in place (`/resume`, `/new`, a
+    /// welcome-screen pick) without any hook for the session it leaves, so
+    /// that card stayed alive for as long as the process did (#318). One pager
+    /// process can also run several top-level sessions at once (Agent
+    /// Dashboard dispatch, `/fork`), so only an idle card — no turn, no
+    /// working subagent — counts as superseded. Every other provider keeps its
+    /// many-sessions-per-PID model (Codex app-server, IDEs, opencode server).
+    nonisolated static func isGrokSessionSupersededBySessionStart(
+        candidate: SessionSnapshot,
+        candidateId: String,
+        started: SessionSnapshot,
+        startedId: String
+    ) -> Bool {
+        guard candidateId != startedId,
+              started.source == "grok",
+              candidate.source == "grok",
+              !started.isRemote,
+              !candidate.isRemote,
+              let pid = started.cliPid,
+              pid > 0,
+              candidate.cliPid == pid,
+              candidate.status == .idle else {
+            return false
+        }
+        return !candidate.subagents.values.contains { $0.status != .idle }
+    }
+
+    private func retireGrokSessionsSuperseded(bySessionStartOf sessionId: String) {
+        guard let started = sessions[sessionId],
+              started.source == "grok",
+              let pid = started.cliPid else { return }
+        supersededGrokSessions = supersededGrokSessions.filter { Self.isLiveProcess($0.value) }
+
+        let superseded = sessions.compactMap { key, candidate -> String? in
+            guard Self.isGrokSessionSupersededBySessionStart(
+                candidate: candidate,
+                candidateId: key,
+                started: started,
+                startedId: sessionId
+            ),
+            !permissionQueue.contains(where: { ($0.event.sessionId ?? "default") == key }),
+            !questionQueue.contains(where: { ($0.event.sessionId ?? "default") == key }) else {
+                return nil
+            }
+            return key
+        }
+        guard !superseded.isEmpty else { return }
+
+        let process = Self.liveProcessIdentity(for: pid) ?? ProcessIdentity(pid: pid, startTime: nil)
+        for key in superseded {
+            log.info("retiring superseded grok session=\(key, privacy: .public) pid=\(pid, privacy: .public) new=\(sessionId, privacy: .public)")
+            supersededGrokSessions[key] = process
+            removeSession(key)
+        }
+    }
+
+    /// A retired Grok session can still emit passive hooks (the `idle_prompt`
+    /// Notification about a minute after it settles, the session-end Stop and
+    /// SessionEnd when Grok quits). Only generation-start activity revives it.
+    private func shouldDropEventForSupersededGrokSession(
+        sessionId: String,
+        normalizedEventName: String
+    ) -> Bool {
+        guard let process = supersededGrokSessions[sessionId] else { return false }
+        if normalizedEventName == "SessionStart"
+            || normalizedEventName == "UserPromptSubmit"
+            || !Self.isLiveProcess(process) {
+            supersededGrokSessions.removeValue(forKey: sessionId)
+            return false
+        }
+        return true
+    }
+
+    private func isSupersededGrokDiscovery(_ info: DiscoveredSession) -> Bool {
+        guard let process = supersededGrokSessions[info.sessionId] else { return false }
+        if Self.isLiveProcess(process) { return true }
+        supersededGrokSessions.removeValue(forKey: info.sessionId)
+        return false
     }
 
     func removeRemoteSessions(hostId: String) {
@@ -1595,11 +1822,12 @@ final class AppState {
             return
         }
 
-        // Clear any pending questions for THIS session (mutually exclusive within a session)
-        drainQuestions(forSession: sessionId, reason: "newPermissionRequest")
+        // Clear any pending questions from THIS agent (mutually exclusive within an agent;
+        // a background subagent's request must not deny the main thread's question)
+        drainQuestions(forSession: sessionId, reason: "newPermissionRequest", where: { $0.agentId == event.agentId })
 
         sessions[sessionId]?.status = .waitingApproval
-        sessions[sessionId]?.currentTool = event.toolName
+        sessions[sessionId]?.currentTool = event.activityLabel
         sessions[sessionId]?.toolDescription = event.toolDescription
         sessions[sessionId]?.lastActivity = Date()
         markMergedSubagentWaiting(sessionId: sessionId, agentId: event.agentId, status: .waitingApproval)
@@ -1845,38 +2073,41 @@ final class AppState {
             log.info("Ignored companion question answer because question queue is empty")
             return
         }
-        if let expectedSessionId,
-           questionQueue.first?.event.sessionId ?? "default" != expectedSessionId {
-            // The card the phone was showing is no longer at the head. Route by
-            // identity rather than answering a question the user never read.
+        // Route by the card the phone was showing, which need not be the head:
+        // never answer a question the user never read. Gone entirely (answered
+        // in the terminal) → answerQuestion discards it and resyncs.
+        guard let index = questionIndex(expecting: expectedSessionId) else {
             answerQuestion(answer, expectedSessionId: expectedSessionId)
             return
         }
 
-        if questionQueue[0].isFromPermission,
-           var askState = questionQueue[0].askUserQuestionState {
-            guard let index = askState.items.firstIndex(where: { askState.answers[$0.answerKey] == nil }) else {
+        // AskUserQuestion is answered one question at a time from the phone.
+        // This must run at the addressed index too: answerQuestion() ignores
+        // wizard requests, so handing a non-head one to it dropped the answer.
+        if questionQueue[index].isFromPermission,
+           var askState = questionQueue[index].askUserQuestionState {
+            guard let itemIndex = askState.items.firstIndex(where: { askState.answers[$0.answerKey] == nil }) else {
                 answerQuestionMulti(askState.items.map {
                     (question: $0.payload.question, answer: askState.answers[$0.answerKey] ?? "")
-                })
+                }, expectedSessionId: expectedSessionId)
                 return
             }
 
-            let item = askState.items[index]
+            let item = askState.items[itemIndex]
             askState.answers[item.answerKey] = answer
-            questionQueue[0].askUserQuestionState = askState
+            questionQueue[index].askUserQuestionState = askState
 
             if askState.canConfirm {
                 answerQuestionMulti(askState.items.map {
                     (question: $0.payload.question, answer: askState.answers[$0.answerKey] ?? "")
-                })
+                }, expectedSessionId: expectedSessionId)
             } else {
                 refreshDerivedState()
             }
             return
         }
 
-        answerQuestion(answer)
+        answerQuestion(answer, expectedSessionId: expectedSessionId)
     }
 
     /// Find an existing session whose source matches and whose CLI PID equals
@@ -2025,7 +2256,7 @@ final class AppState {
             continuation.resume(returning: Data("{}".utf8))
             return
         }
-        drainPermissions(forSession: sessionId, reason: "handleQuestion(Notification)")
+        drainPermissions(forSession: sessionId, reason: "handleQuestion(Notification)", where: { $0.agentId == event.agentId })
 
         sessions[sessionId]?.status = .waitingQuestion
         sessions[sessionId]?.lastActivity = Date()
@@ -2142,8 +2373,8 @@ final class AppState {
             return
         }
 
-        drainPermissions(forSession: sessionId, reason: "handleAskUserQuestion")
-        drainQuestions(forSession: sessionId, reason: "handleAskUserQuestion")
+        drainPermissions(forSession: sessionId, reason: "handleAskUserQuestion", where: { $0.agentId == event.agentId })
+        drainQuestions(forSession: sessionId, reason: "handleAskUserQuestion", where: { $0.agentId == event.agentId })
 
         sessions[sessionId]?.status = .waitingQuestion
         sessions[sessionId]?.lastActivity = Date()
@@ -2266,6 +2497,18 @@ final class AppState {
             }
             return
         }
+        // Wizard answers are mapped onto items by position below. A set that
+        // is not exactly one answer per this request's questions was collected
+        // for some other request — delivering it would answer this CLI's
+        // question with another session's answer — so it is refused and the
+        // request stays waiting. (#333)
+        if let askState = questionQueue[index].askUserQuestionState,
+           !askState.accepts(answers) {
+            let sessionId = questionQueue[index].event.sessionId ?? "default"
+            log.notice("⚠️ refused answers for session=\(sessionId, privacy: .public) — \(answers.count, privacy: .public) answer(s) do not match its \(askState.items.count, privacy: .public) question(s)")
+            refreshDerivedState()
+            return
+        }
         // Codex app-server questions reply over the JSON-RPC client, not a hook.
         if questionQueue[index].isCodexAppServer {
             let pending = questionQueue.remove(at: index)
@@ -2375,9 +2618,13 @@ final class AppState {
         if let answer, !Self.isQoderEvent(event) {
             updatedInput["answer"] = answer
         }
+        // Structured picks for plugins that answer with label arrays: OMP/Pi,
+        // and OpenCode, whose multi-select answers are `string[]` (v1) or a
+        // multiselect form field (v2) — a ", "-joined display string can't be
+        // split back when a label itself contains ", " (#332).
+        let detailsSource = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
         if !answerDetails.isEmpty,
-           SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) == "pi",
-           event.toolUseId != nil {
+           (detailsSource == "pi" && event.toolUseId != nil) || detailsSource == "opencode" {
             updatedInput["_codeislandAnswerDetails"] = answerDetails
         }
         return updatedInput
@@ -2417,28 +2664,42 @@ final class AppState {
         refreshDerivedState()
     }
 
-    /// Drain all queued permissions for a specific session, resuming their continuations with deny
-    private func drainPermissions(forSession sessionId: String, reason: String = "unknown") {
+    /// Drain queued permissions for a specific session, resuming their continuations with deny.
+    /// `matches` narrows the drain by the request's event — background subagents share the
+    /// parent's session_id, so callers reacting to one agent pass an agent_id filter.
+    private func drainPermissions(
+        forSession sessionId: String,
+        reason: String = "unknown",
+        where matches: (HookEvent) -> Bool = { _ in true }
+    ) {
         dismissedPermissionSessionIds.remove(sessionId)
         let denyResponse = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
         permissionQueue.removeAll { item in
-            guard item.event.sessionId == sessionId else { return false }
+            guard item.event.sessionId == sessionId, matches(item.event) else { return false }
             log.notice("⚠️ permission deny reason=drainPermissions(\(reason, privacy: .public)) session=\(sessionId, privacy: .public) toolUseId=\(item.toolUseId ?? "nil", privacy: .public) tool=\(item.event.toolName ?? "nil", privacy: .public)")
             item.continuation.resume(returning: denyResponse)
             return true
         }
     }
 
-    /// Called when the bridge socket disconnects — the question/permission was answered externally (e.g. user replied in terminal)
-    func handlePeerDisconnect(sessionId: String) {
-        let hadPending = questionQueue.contains(where: { $0.event.sessionId == sessionId })
-            || permissionQueue.contains(where: { $0.event.sessionId == sessionId })
+    /// Called when the bridge socket disconnects — the question/permission was answered externally (e.g. user replied in terminal).
+    /// Only the disconnecting agent's requests are drained: the socket belonged to one agent,
+    /// and another agent's request in the same session is still waiting on the user.
+    func handlePeerDisconnect(sessionId: String, agentId: String? = nil) {
+        let sameAgent: (HookEvent) -> Bool = { $0.sessionId == sessionId && $0.agentId == agentId }
+        let hadPending = questionQueue.contains(where: { sameAgent($0.event) })
+            || permissionQueue.contains(where: { sameAgent($0.event) })
         guard hadPending else { return }
 
-        drainQuestions(forSession: sessionId, reason: "peer-disconnect")
-        drainPermissions(forSession: sessionId, reason: "peer-disconnect")
+        drainQuestions(forSession: sessionId, reason: "peer-disconnect", where: sameAgent)
+        drainPermissions(forSession: sessionId, reason: "peer-disconnect", where: sameAgent)
         let currentStatus = sessions[sessionId]?.status
-        if currentStatus == .waitingApproval || currentStatus == .waitingQuestion {
+        let wasWaiting = currentStatus == .waitingApproval || currentStatus == .waitingQuestion
+        if wasWaiting, permissionQueue.contains(where: { $0.event.sessionId == sessionId }) {
+            sessions[sessionId]?.status = .waitingApproval
+        } else if wasWaiting, questionQueue.contains(where: { $0.event.sessionId == sessionId }) {
+            sessions[sessionId]?.status = .waitingQuestion
+        } else if wasWaiting {
             sessions[sessionId]?.status = .processing
             sessions[sessionId]?.currentTool = nil
             sessions[sessionId]?.toolDescription = nil
@@ -2449,9 +2710,13 @@ final class AppState {
 
     /// Drain all queued questions for a specific session.
     /// AskUserQuestion-derived requests are denied; notification questions return empty.
-    private func drainQuestions(forSession sessionId: String, reason: String = "unknown") {
+    private func drainQuestions(
+        forSession sessionId: String,
+        reason: String = "unknown",
+        where matches: (HookEvent) -> Bool = { _ in true }
+    ) {
         questionQueue.removeAll { item in
-            guard item.event.sessionId == sessionId else { return false }
+            guard item.event.sessionId == sessionId, matches(item.event) else { return false }
             if item.isCodexAppServer {
                 // Abandon the Codex app-server request so the server stops waiting.
                 item.resolveCodexAppServer(nil)
@@ -2942,6 +3207,8 @@ final class AppState {
             )
             // Reattach exit monitoring without changing the restored idle/running snapshot.
             tryMonitorSession(restoredSessionId)
+            // Harness is re-probed, not persisted — it may have restarted between runs.
+            maybeResolveHostHarness(for: restoredSessionId)
         }
         SessionPersistence.clear()
         _ = applyCodexSubsessionModeToKnownSessions()
@@ -3236,6 +3503,9 @@ final class AppState {
         var didMutate = false
         for info in discovered {
             if shouldSuppressClosedCodexDesktopDiscovery(info) {
+                continue
+            }
+            if isSupersededGrokDiscovery(info) {
                 continue
             }
             if routeDiscoveredSubsessionIfNeeded(info) {
@@ -4638,8 +4908,7 @@ final class AppState {
 
     private nonisolated static func findTraeCNPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
         findPids(
-            matchingPathSubstrings: [
-                "/traecn.app/contents/macos/trae",
+            matchingPathSubstrings: CLIProcessResolver.traeCNBundlePathMarkers + [
                 "/trae-cn.app/contents/macos/trae",
                 "/.traecn/",
                 "/.trae-cn/",
@@ -5106,17 +5375,73 @@ final class AppState {
     /// Grok percent-encodes the full cwd into a single directory component,
     /// including `/` as `%2F` (for example `/Users/me` -> `%2FUsers%2Fme`).
     nonisolated static func grokEncodedCwd(_ cwd: String) -> String? {
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-._~")
-        return cwd.addingPercentEncoding(withAllowedCharacters: allowed)
+        GrokSessionPaths.encodedCwd(cwd)
     }
 
-    private struct GrokSessionCandidate {
+    struct GrokSessionCandidate {
         let sessionId: String
-        let directory: String
+        /// `sessions/<encoded-cwd>/<id>`; nil when only Grok's search index
+        /// knows the session, so there is no transcript to read or tail.
+        let directory: String?
         let model: String?
         let createdAt: Date?
         let activityAt: Date
+    }
+
+    /// Grok mints UUIDv7 session ids (a client may pass its own with `-s`),
+    /// whose leading 48 bits are the creation time in Unix milliseconds. That
+    /// stands in for `summary.json`'s `created_at` when it is missing, and is
+    /// the only creation time for a session known only to the search index.
+    nonisolated static func grokSessionCreationDate(fromSessionId sessionId: String) -> Date? {
+        guard let uuid = UUID(uuidString: sessionId)?.uuid,
+              uuid.6 >> 4 == 7,
+              uuid.8 & 0xC0 == 0x80 else { return nil }
+        let milliseconds = [uuid.0, uuid.1, uuid.2, uuid.3, uuid.4, uuid.5]
+            .reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        return Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1000)
+    }
+
+    /// Sessions that Grok's search index (`sessions/session_search.sqlite`,
+    /// table `session_docs`) records for `cwd`, most recently updated first.
+    /// Grok writes the index live in WAL mode, so it is opened read-only
+    /// through SQLite (never `immutable`, which would skip the WAL), and an
+    /// unexpected schema yields no rows rather than a guess.
+    nonisolated static func grokIndexedSessions(
+        databasePath: String,
+        cwd: String,
+        limit: Int = 50
+    ) -> [(sessionId: String, updatedAt: Date)] {
+        withSQLiteDatabase(at: databasePath) { db -> [(sessionId: String, updatedAt: Date)]? in
+            let columns = sqliteTableColumns(db: db, tableName: "session_docs")
+            guard columns.isSuperset(of: ["session_id", "cwd", "updated_at"]),
+                  let statement = prepareSQLiteStatement(
+                    db: db,
+                    sql: """
+                        SELECT session_id, updated_at
+                        FROM session_docs
+                        WHERE cwd = ?
+                        ORDER BY updated_at DESC
+                        LIMIT ?;
+                        """
+                  ) else {
+                return nil
+            }
+            defer { sqlite3_finalize(statement) }
+            bindSQLiteText(cwd, to: statement, index: 1)
+            sqlite3_bind_int(statement, 2, Int32(clamping: limit))
+
+            var rows: [(sessionId: String, updatedAt: Date)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let sessionId = sqliteColumnString(statement, index: 0),
+                      !sessionId.isEmpty else { continue }
+                let raw = sqlite3_column_int64(statement, 1)
+                guard raw > 0 else { continue }
+                // Schema v4 stores Unix seconds; tolerate milliseconds.
+                let seconds = raw > 100_000_000_000 ? Double(raw) / 1000 : Double(raw)
+                rows.append((sessionId, Date(timeIntervalSince1970: seconds)))
+            }
+            return rows
+        } ?? []
     }
 
     /// Score a metadata session against a live Grok process. Grok's native
@@ -5233,12 +5558,43 @@ final class AppState {
         return Dictionary(uniqueKeysWithValues: sessionByPid.map { ($0.value, $0.key) })
     }
 
-    private nonisolated static func grokSessionCandidates(
+    /// Grok sessions recorded for `cwd`. The per-session directories are
+    /// Grok's session store and carry the transcript; `session_search.sqlite`
+    /// is Grok's search index over sessions and only adds ones without a
+    /// readable directory here (a cwd too long for one path component is
+    /// stored under a slug+hash name, and a machine can hold sessions whose
+    /// directories are gone). Both layouts can coexist on one machine.
+    nonisolated static func grokSessionCandidates(
         cwd: String,
+        sessionsRoot: String = "\(ConfigInstaller.grokHome())/sessions",
+        includeIndex: Bool = true,
         fm: FileManager = .default
     ) -> [GrokSessionCandidate] {
+        var candidates = grokDirectorySessionCandidates(cwd: cwd, sessionsRoot: sessionsRoot, fm: fm)
+        let indexPath = "\(sessionsRoot)/session_search.sqlite"
+        guard includeIndex, fm.fileExists(atPath: indexPath) else { return candidates }
+
+        let known = Set(candidates.map(\.sessionId))
+        for row in grokIndexedSessions(databasePath: indexPath, cwd: cwd)
+        where !known.contains(row.sessionId) {
+            candidates.append(GrokSessionCandidate(
+                sessionId: row.sessionId,
+                directory: nil,
+                model: nil,
+                createdAt: grokSessionCreationDate(fromSessionId: row.sessionId),
+                activityAt: row.updatedAt
+            ))
+        }
+        return candidates
+    }
+
+    private nonisolated static func grokDirectorySessionCandidates(
+        cwd: String,
+        sessionsRoot: String,
+        fm: FileManager
+    ) -> [GrokSessionCandidate] {
         guard let encodedCwd = grokEncodedCwd(cwd) else { return [] }
-        let cwdDirectory = "\(ConfigInstaller.grokHome())/sessions/\(encodedCwd)"
+        let cwdDirectory = "\(sessionsRoot)/\(encodedCwd)"
         guard let sessionDirectories = try? fm.contentsOfDirectory(atPath: cwdDirectory) else { return [] }
 
         var candidates: [GrokSessionCandidate] = []
@@ -5253,6 +5609,7 @@ final class AppState {
 
             let sessionId = (info["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? directoryName
             let createdAt = (summary["created_at"] as? String).flatMap(parseISO8601Timestamp)
+                ?? grokSessionCreationDate(fromSessionId: sessionId)
             let timestamps = ["last_active_at", "updated_at", "created_at"]
                 .compactMap { summary[$0] as? String }
                 .compactMap(parseISO8601Timestamp)
@@ -5285,7 +5642,8 @@ final class AppState {
         after processStart: Date?,
         fm: FileManager = .default
     ) -> GrokSessionCandidate? {
-        grokSessionCandidates(cwd: cwd, fm: fm)
+        // Model backfill runs on the main actor, and the index has no model.
+        grokSessionCandidates(cwd: cwd, includeIndex: false, fm: fm)
             .filter {
                 grokSessionProcessMatchScore(
                     createdAt: $0.createdAt,
@@ -5317,23 +5675,52 @@ final class AppState {
 
             for candidate in candidates {
                 guard let pid = assignments[candidate.sessionId] else { continue }
-                let chatPath = "\(candidate.directory)/chat_history.jsonl"
-                let hasChat = fm.fileExists(atPath: chatPath)
-                let messages = hasChat ? readRecentFromTranscript(path: chatPath).1 : []
-                results.append(DiscoveredSession(
+                // Index-only sessions have no transcript; never point the
+                // tailer at a file that is not there.
+                let chatPath = candidate.directory
+                    .map { "\($0)/chat_history.jsonl" }
+                    .flatMap { fm.fileExists(atPath: $0) ? $0 : nil }
+                let messages = chatPath.map { readRecentFromTranscript(path: $0).1 } ?? []
+                results.append(grokDiscoveredSession(
                     sessionId: candidate.sessionId,
                     cwd: cwd,
-                    tty: nil,
                     model: candidate.model,
                     pid: pid,
                     modifiedAt: candidate.activityAt,
                     recentMessages: messages,
-                    source: "grok",
-                    transcriptPath: hasChat ? chatPath : nil
+                    transcriptPath: chatPath
                 ))
             }
         }
         return results
+    }
+
+    /// Grok hooks and Grok discovery both key a card by Grok's own session id,
+    /// so the discovered id doubles as the provider id. Carrying it stops the
+    /// same-PID dedup in `integrateDiscovered` from folding a different Grok
+    /// session — such as the one `/resume` just loaded — into an existing card
+    /// and rewriting that card's identity, transcript and messages (#318).
+    nonisolated static func grokDiscoveredSession(
+        sessionId: String,
+        cwd: String,
+        model: String?,
+        pid: pid_t,
+        modifiedAt: Date,
+        recentMessages: [ChatMessage],
+        transcriptPath: String?
+    ) -> DiscoveredSession {
+        DiscoveredSession(
+            sessionId: sessionId,
+            cwd: cwd,
+            tty: nil,
+            model: model,
+            pid: pid,
+            modifiedAt: modifiedAt,
+            recentMessages: recentMessages,
+            source: "grok",
+            transcriptPath: transcriptPath,
+            providerSessionId: sessionId
+        )
     }
 
     private nonisolated static func findCopilotPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
@@ -5362,7 +5749,20 @@ final class AppState {
                 "/.opencode/bin/opencode",
             ],
             candidatePids: candidatePids
-        )
+        ).filter { pid in
+            // OpenCode 2's shared background service is the same executable as
+            // the TUI and inherits the first client's cwd, so a cwd match can
+            // land on it. It is not a session's process: it outlives the client
+            // that spawned it, and once reparented to launchd the orphan sweep
+            // would SIGTERM it — every session with it (#332).
+            guard let args = getProcessArgs(pid) else { return true }
+            return !isOpenCodeSharedService(arguments: args)
+        }
+    }
+
+    /// `opencode serve --service` — OpenCode 2's per-user shared server.
+    nonisolated static func isOpenCodeSharedService(arguments: [String]) -> Bool {
+        arguments.contains("serve") && arguments.contains("--service")
     }
 
     /// Get the current working directory of a process using proc_pidinfo
@@ -7190,6 +7590,7 @@ final class AppState {
 
         var model: String?
         var userMessages: [(Int, String)] = []
+        var fallbackUserMessage: (Int, String)?
         var assistantMessages: [(Int, String)] = []
         var index = 0
 
@@ -7207,43 +7608,36 @@ final class AppState {
                     ?? payload["model_provider"] as? String
             }
 
-            // Prefer event_msg (cleaner user/agent messages from Codex)
+            // Prefer event_msg (cleaner user messages from Codex).
             if type == "event_msg",
                let payload = json["payload"] as? [String: Any],
                let msgType = payload["type"] as? String,
                let msg = payload["message"] as? String, !msg.isEmpty {
                 if msgType == "user_message" {
                     userMessages.append((index, msg))
-                } else if msgType == "agent_message" {
-                    assistantMessages.append((index, msg))
                 }
             }
 
-            // Fallback: extract from response_item only if event_msg didn't provide the same content
-            // (user messages come from event_msg which is cleaner — response_item user entries
-            //  often contain injected system/tool context, not actual user input)
+            if let assistantText = JSONLTailer.codexPublicAssistantText(from: json),
+               assistantMessages.last?.1 != assistantText {
+                assistantMessages.append((index, assistantText))
+            }
+
+            // response_item user entries can include injected context. Keep
+            // only the latest as a fallback if no cleaner event_msg is found.
             if type == "response_item",
                let payload = json["payload"] as? [String: Any],
-               let role = payload["role"] as? String {
-
-                if let content = payload["content"] as? [[String: Any]] {
-                    for item in content {
-                        let itemType = item["type"] as? String ?? ""
-                        if let t = item["text"] as? String, !t.isEmpty {
-                            if role == "user" && itemType == "input_text" && userMessages.last?.1 != t {
-                                // Keep the latest distinct user message from response items too.
-                                userMessages.append((index, t))
-                            } else if role == "assistant" && itemType == "output_text" && assistantMessages.last?.1 != t {
-                                // Only add if not a duplicate of the last event_msg entry
-                                assistantMessages.append((index, t))
-                            }
-                            break
-                        }
-                    }
-                }
+               payload["type"] as? String == "message",
+               payload["role"] as? String == "user",
+               let content = payload["content"] as? [[String: Any]],
+               let text = content.first(where: { $0["type"] as? String == "input_text" })?["text"] as? String,
+               !text.isEmpty {
+                fallbackUserMessage = (index, text)
             }
             index += 1
         }
+
+        if userMessages.isEmpty, let fallbackUserMessage { userMessages = [fallbackUserMessage] }
 
         var combined: [(Int, ChatMessage)] = []
         for (i, text) in userMessages.suffix(1) {

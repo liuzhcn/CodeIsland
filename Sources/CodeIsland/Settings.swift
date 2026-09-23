@@ -33,6 +33,7 @@ enum SettingsKey {
     static let hideWhenNoSession = "hideWhenNoSession"
     static let smartSuppress = "smartSuppress"
     static let collapseOnMouseLeave = "collapseOnMouseLeave"
+    static let notchAnimationSpeed = "notchAnimationSpeed"
     static let autoCollapseAfterSessionJump = "autoCollapseAfterSessionJump"
     static let autoExpandOnPermission = "autoExpandOnPermission"
     static let autoExpandOnCompletion = "autoExpandOnCompletion"
@@ -69,6 +70,9 @@ enum SettingsKey {
 
     // Token-usage footer (local Claude transcript aggregation)
     static let showUsageStats = "showUsageStats"
+
+    // Claude plan limits (Anthropic usage endpoint via the Claude Code login)
+    static let showClaudeQuota = "showClaudeQuota"
 
     // Completion notification: "expand" | "glance" | "off". Successor of the
     // boolean autoExpandOnCompletion — see AppState.completionStyle migration.
@@ -145,6 +149,7 @@ struct SettingsDefaults {
     static let hideWhenNoSession = false
     static let smartSuppress = true
     static let collapseOnMouseLeave = true
+    static let notchAnimationSpeed = NotchAnimationSpeed.normal
     static let autoCollapseAfterSessionJump = false
     static let autoExpandOnPermission = true
     static let autoExpandOnCompletion = true
@@ -174,6 +179,7 @@ struct SettingsDefaults {
     static let quietHoursEnd = 8 * 60
     static let showGitBranch = true
     static let showUsageStats = true
+    static let showClaudeQuota = false
 
     static let rotationInterval = 5
 
@@ -232,6 +238,7 @@ class SettingsManager {
             SettingsKey.hideWhenNoSession: SettingsDefaults.hideWhenNoSession,
             SettingsKey.smartSuppress: SettingsDefaults.smartSuppress,
             SettingsKey.collapseOnMouseLeave: SettingsDefaults.collapseOnMouseLeave,
+            SettingsKey.notchAnimationSpeed: SettingsDefaults.notchAnimationSpeed,
             SettingsKey.autoCollapseAfterSessionJump: SettingsDefaults.autoCollapseAfterSessionJump,
             SettingsKey.autoExpandOnPermission: SettingsDefaults.autoExpandOnPermission,
             SettingsKey.autoExpandOnCompletion: SettingsDefaults.autoExpandOnCompletion,
@@ -259,6 +266,7 @@ class SettingsManager {
             SettingsKey.quietHoursEnd: SettingsDefaults.quietHoursEnd,
             SettingsKey.showGitBranch: SettingsDefaults.showGitBranch,
             SettingsKey.showUsageStats: SettingsDefaults.showUsageStats,
+            SettingsKey.showClaudeQuota: SettingsDefaults.showClaudeQuota,
             SettingsKey.rotationInterval: SettingsDefaults.rotationInterval,
             SettingsKey.maxToolHistory: SettingsDefaults.maxToolHistory,
             SettingsKey.mascotSpeed: SettingsDefaults.mascotSpeed,
@@ -334,6 +342,11 @@ class SettingsManager {
     var collapseOnMouseLeave: Bool {
         get { defaults.bool(forKey: SettingsKey.collapseOnMouseLeave) }
         set { defaults.set(newValue, forKey: SettingsKey.collapseOnMouseLeave) }
+    }
+
+    var notchAnimationSpeed: Double {
+        get { NotchAnimationSpeed.clamped(defaults.double(forKey: SettingsKey.notchAnimationSpeed)) }
+        set { defaults.set(NotchAnimationSpeed.clamped(newValue), forKey: SettingsKey.notchAnimationSpeed) }
     }
 
     var hapticOnHover: Bool {

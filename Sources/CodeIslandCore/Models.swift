@@ -1,11 +1,35 @@
 import Foundation
 
 public enum CLIProcessResolver {
+    /// Lowercased bundle markers of the Trae CN desktop IDE (bundle id
+    /// `cn.trae.app`). It has shipped as `Trae CN.app` since its first macOS
+    /// build (Homebrew `trae-cn` cask; TraeCode CN 3.3.104 still is), with
+    /// `Electron` as the main binary and `Trae CN Helper …` helpers — so the
+    /// generic `/traecn` substring rule never matched it. `TraeCode CN.app`
+    /// covers the product's new `nameAlias`, and `TraeCN.app` the name this
+    /// code first assumed. None of them matches the international `Trae.app`.
+    public static let traeCNBundlePathMarkers = [
+        "/trae cn.app/contents/",
+        "/traecode cn.app/contents/",
+        "/traecn.app/contents/",
+    ]
+
+    public static func isTraeCNBundlePath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        return traeCNBundlePathMarkers.contains { lowercasedPath.contains($0) }
+    }
+
     public static func sourceMatchesExecutablePath(_ path: String, source: String?) -> Bool {
         guard let normalizedSource = SessionSnapshot.normalizedSupportedSource(source) else { return false }
         let lowercasedPath = path.lowercased()
 
         switch normalizedSource {
+        case "traecn":
+            // Trae CN runs hooks through `bash -c`, so the bridge's own parent
+            // is a throwaway shell. Matching the bundle lets `_ppid` resolve to
+            // the long-lived Trae CN process instead; tracking the shell would
+            // idle or drop the card as soon as each hook returns.
+            return isTraeCNBundlePath(lowercasedPath)
         case "traecli":
             return lowercasedPath.hasSuffix("/coco")
                 || lowercasedPath.hasSuffix("/traecli")
@@ -159,12 +183,26 @@ public enum CLIProcessResolver {
     }
 }
 
-public enum AgentStatus: Sendable {
+public enum AgentStatus: Sendable, Equatable {
     case idle
     case processing
     case running
     case waitingApproval
     case waitingQuestion
+}
+
+/// Stable activity groups used for compact status text. The raw tool name stays
+/// on ``HookEvent`` for permission routing and provider-specific behavior.
+public enum ToolActivityCategory: String, Sendable {
+    case reading
+    case searching
+    case editing
+    case shell
+    case browser
+    case mcp
+    case delegation
+    case question
+    case other
 }
 
 public struct HookEvent {
@@ -215,11 +253,36 @@ public struct HookEvent {
         self.toolInput = HookEvent.firstDictionary(in: json, keys: ["tool_input", "toolInput", "input", "arguments", "args", "params"])
             ?? HookEvent.firstDictionary(inNestedDictionary: json, containerKeys: ["tool", "payload", "data"], keys: ["input", "tool_input", "toolInput", "arguments", "args", "params"])
             ?? HookEvent.firstDictionary(inNestedDictionary: json, containerKeys: ["toolCall"], keys: ["args"])
-        self.agentId = json["agent_id"] as? String
+        self.agentId = HookEvent.agentIdMarksSubagent(source: json["_source"] as? String)
+            ? json["agent_id"] as? String
+            : nil
         self.rawJSON = json
     }
 
+    /// Whether a payload's `agent_id` identifies a subagent working under the
+    /// session (Claude Code's contract, which the reducer's subagent routing
+    /// is built on).
+    ///
+    /// TRAE's desktop IDE (Trae / Trae CN) stamps EVERY hook with the id of
+    /// the agent running it — the main conversation included — as a common
+    /// field next to `agent_type` (docs.trae.cn/enterprise_hook-configuration-reference,
+    /// 请求体通用字段). The main agent's id is a stable built-in name such as
+    /// `solo_agent` or `builder_v3`, or a custom agent's id, and TraeCode has
+    /// no SubagentStart/SubagentStop events. Treated as a subagent, the whole
+    /// conversation was parked in `subagents` (SessionStart and prompts never
+    /// reached the card) and its first Stop tombstoned the id, so every later
+    /// turn was dropped. The raw id stays in `rawJSON`.
+    static func agentIdMarksSubagent(source: String?) -> Bool {
+        switch SessionSnapshot.normalizedSupportedSource(source) {
+        case "trae", "traecn": return false
+        default: return true
+        }
+    }
+
     public var toolDescription: String? {
+        if isCodexEvent {
+            return codexToolDescription
+        }
         if let input = toolInput {
             switch toolName {
             case "Bash", "execute_command", "run_command":
@@ -290,6 +353,195 @@ public struct HookEvent {
         if let agentType = rawJSON["agent_type"] as? String { return agentType }
         if let prompt = rawJSON["prompt"] as? String { return String(prompt.prefix(40)) }
         return nil
+    }
+
+    /// A concise, provider-neutral label for the current Codex action. Other
+    /// providers retain their original tool names to avoid changing established
+    /// display, color, permission, or history behavior.
+    public var activityLabel: String? {
+        guard let toolName else { return nil }
+        guard isCodexEvent else { return toolName }
+
+        switch activityCategory {
+        case .reading: return "Reading"
+        case .searching: return "Searching"
+        case .editing: return "Editing"
+        case .shell: return "Running command"
+        case .browser: return "Using browser"
+        case .mcp: return "Calling MCP"
+        case .delegation: return "Delegating"
+        case .question: return "Asking user"
+        case .other: return HookEvent.sanitizedSummary(toolName, limit: 48)
+        }
+    }
+
+    public var activityCategory: ToolActivityCategory {
+        guard isCodexEvent, let rawName = toolName?.lowercased() else { return .other }
+        let name = rawName.replacingOccurrences(of: "-", with: "_")
+
+        if name.hasPrefix("mcp__")
+            || name.contains("mcp_resource")
+            || name == "list_mcp_resources"
+            || name == "list_mcp_resource_templates" {
+            return .mcp
+        }
+        if name.contains("spawn_agent")
+            || name.contains("send_message")
+            || name.contains("followup_task")
+            || name.contains("wait_agent")
+            || name.contains("subagent")
+            || name == "task"
+            || name == "agent" {
+            return .delegation
+        }
+        if name.contains("request_user_input") || name.contains("ask_user") {
+            return .question
+        }
+        if name.contains("browser")
+            || name.contains("playwright")
+            || name.contains("navigate")
+            || name == "web_search"
+            || name == "web_fetch" {
+            return .browser
+        }
+        if name.contains("apply_patch")
+            || name.contains("edit_file")
+            || name.contains("write_file")
+            || name.contains("delete_file")
+            || name.contains("move_file")
+            || name.contains("replace_file") {
+            return .editing
+        }
+        if name.contains("grep")
+            || name.contains("glob")
+            || name.contains("search")
+            || name == "find"
+            || name.hasPrefix("rg_") {
+            return .searching
+        }
+        if name.contains("read_file")
+            || name.contains("view_file")
+            || name.contains("view_image")
+            || name.contains("list_dir") {
+            return .reading
+        }
+        if name.contains("exec_command")
+            || name.contains("write_stdin")
+            || name.contains("shell")
+            || name == "bash"
+            || name == "command"
+            || name == "run_command" {
+            return .shell
+        }
+        return .other
+    }
+
+    private var isCodexEvent: Bool {
+        (rawJSON["_source"] as? String)?.lowercased() == "codex"
+    }
+
+    private var codexToolDescription: String? {
+        let input = toolInput ?? [:]
+        switch activityCategory {
+        case .reading, .editing:
+            if let path = HookEvent.firstString(
+                in: input,
+                keys: ["file_path", "path", "filename", "AbsolutePath", "TargetFile"]
+            ) {
+                return HookEvent.sanitizedFilename(path)
+            }
+            return activityCategory == .editing ? "Applying changes" : nil
+        case .searching:
+            guard let query = HookEvent.firstString(in: input, keys: ["query", "pattern", "Query"]) else {
+                return nil
+            }
+            return HookEvent.sanitizedSummary(query, limit: 80)
+        case .shell:
+            guard let command = HookEvent.firstString(
+                in: input,
+                keys: ["command", "cmd", "CommandLine"]
+            ) else { return nil }
+            return HookEvent.sanitizedSummary(command, limit: 120)
+        case .browser:
+            if let rawURL = HookEvent.firstString(in: input, keys: ["url", "uri"]),
+               let host = URL(string: rawURL)?.host,
+               !host.isEmpty {
+                return host
+            }
+            if let query = HookEvent.firstString(in: input, keys: ["query", "search_query"]) {
+                return HookEvent.sanitizedSummary(query, limit: 72)
+            }
+            return nil
+        case .mcp:
+            guard let toolName else { return nil }
+            let pieces = toolName.components(separatedBy: "__").filter { !$0.isEmpty }
+            if pieces.count >= 3 {
+                return HookEvent.sanitizedSummary(pieces.dropFirst().joined(separator: " / "), limit: 72)
+            }
+            return nil
+        case .delegation:
+            if let detail = HookEvent.firstString(in: input, keys: ["task_name", "description", "agent_type"]) {
+                return HookEvent.sanitizedSummary(detail, limit: 72)
+            }
+            return nil
+        case .question:
+            return "Waiting for input"
+        case .other:
+            if let path = HookEvent.firstString(in: input, keys: ["file_path", "path"]) {
+                return HookEvent.sanitizedFilename(path)
+            }
+            if let detail = HookEvent.firstString(in: input, keys: ["description", "summary"]) {
+                return HookEvent.sanitizedSummary(detail, limit: 80)
+            }
+            return nil
+        }
+    }
+
+    private static func sanitizedFilename(_ path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return sanitizedSummary((trimmed as NSString).lastPathComponent, limit: 80)
+    }
+
+    /// Credential / home-path redactions applied by ``sanitizedSummary(_:limit:)``,
+    /// compiled once — the summary runs on every Codex PreToolUse and approval.
+    private static let summaryRedactions: [(regex: NSRegularExpression, template: String)] = [
+        (#"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)([\"']?)[^\"'\s]+"#, "$1[REDACTED]"),
+        (#"(?i)((?:aws[-_]?secret[-_]?access[-_]?key|aws[-_]?(?:session|security)[-_]?token|x[-_]amz[-_]security[-_]token)\s*[:=]\s*)([\"']?)[^\"'\s]+"#, "$1[REDACTED]"),
+        (#"(?i)((?:x[-_])?(?:api[-_]?key|auth[-_]?token|access[-_]?token|secret|password)\s*:\s*)([\"']?)[^\"'\s]+"#, "$1[REDACTED]"),
+        (#"(?i)((?:--)?(?:api[-_]?key|token|secret|password|passwd|auth)(?:\s+|=))([^\s]+)"#, "$1[REDACTED]"),
+        (#"(?i)([?&](?:api[-_]?key|token|secret|signature|sig|password)=)[^&\s\"']+"#, "$1[REDACTED]"),
+        (#"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b"#, "[REDACTED]"),
+        (#"/(?:Users|home)/[^/\s]+"#, "~"),
+        (#"\b[A-Za-z0-9_\-+/=]{48,}\b"#, "[REDACTED]"),
+    ].compactMap { pattern, template in
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            assertionFailure("invalid redaction pattern: \(pattern)")
+            return nil
+        }
+        return (regex, template)
+    }
+
+    /// Removes common credential shapes and home-directory usernames before a
+    /// bounded detail string reaches the notch, companion payloads, or history.
+    private static func sanitizedSummary(_ value: String, limit: Int) -> String? {
+        var result = value
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !result.isEmpty else { return nil }
+
+        for (regex, template) in summaryRedactions {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: range,
+                withTemplate: template
+            )
+        }
+
+        guard result.count > limit, limit > 3 else { return result }
+        return String(result.prefix(limit - 3)) + "..."
     }
 
     private static func normalizedMultilineString(_ value: Any?) -> String? {
