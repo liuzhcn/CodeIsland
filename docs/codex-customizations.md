@@ -39,3 +39,16 @@ configured through the normal installation workflow.
 Installing an official CodeIsland release replaces these customizations. Keep using
 builds from the customization branch until the relevant changes are incorporated
 upstream. Merging upstream source updates does not by itself rebuild the installed app.
+
+## Upstream v1.0.35 integration (2026-09-25)
+
+Merged upstream tag `v1.0.35` (`b444ae2`) while preserving the custom
+Codex titles/deep links, compact selection, external-display layout,
+remote reconciliation/deduplication, and protection for silent desktop turns.
+The cleanup loop keeps both that protection and upstream's independent Cowork
+settlement. Title-first cards honor the new Show project name switch; Codex
+jumps also stop the new follow-up reminders.
+
+Validation: full Swift suite (1,914 tests, 4 skipped, no failures), 52 focused
+reminder/deep-link tests after the jump integration, and RemoteHook Python checks.
+The previous source state is retained as `backup/before-v1.0.35-20260925`.

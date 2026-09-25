@@ -110,6 +110,16 @@ struct PanelScreenHopMotion {
     let fadeInDuration: TimeInterval
 }
 
+enum PanelHeightMetrics {
+    /// Window height the panel asks for before clamping to the screen: room
+    /// for `maxVisibleSessions` cards plus the notch bar. Shared with the
+    /// completion card, whose reply area has to fit inside the same window.
+    static func desiredHeight(maxVisibleSessions: Int) -> CGFloat {
+        let sessions = CGFloat(max(2, maxVisibleSessions))
+        return max(300, sessions * 90 + 60)
+    }
+}
+
 @MainActor
 class PanelWindowController: NSObject, NSWindowDelegate {
     private enum ScreenHopMetrics {
@@ -146,8 +156,9 @@ class PanelWindowController: NSObject, NSWindowDelegate {
     }
 
     private func panelSize(for screen: NSScreen) -> NSSize {
-        let maxSessions = CGFloat(max(2, UserDefaults.standard.integer(forKey: SettingsKey.maxVisibleSessions)))
-        let desiredH = max(300, maxSessions * 90 + 60)
+        let desiredH = PanelHeightMetrics.desiredHeight(
+            maxVisibleSessions: UserDefaults.standard.integer(forKey: SettingsKey.maxVisibleSessions)
+        )
         // Clamp to the screen's usable height. A borderless, non-opaque panel with a
         // very tall backing store (e.g. maxVisibleSessions=99 → 8970pt, ~18k px tall on
         // a Retina display) has its compositing dropped by the macOS 26 WindowServer
@@ -242,6 +253,15 @@ class PanelWindowController: NSObject, NSWindowDelegate {
 
         self.panel = panel
         self.lastChosenScreenSignature = ScreenDetector.signature(for: screen)
+        // A follow-up for the card under the pointer would remind someone who
+        // is already reading it. The island's own hover says whether the
+        // pointer is on the card (`pointerOverIsland`); the window frame —
+        // mostly transparent, and as large as the card ever gets — only
+        // backs that up against a hover flag a rebuilt view left behind.
+        appState.followUps.isPointerOverPanel = { [weak self] in
+            guard let panel = self?.panel, panel.isVisible else { return false }
+            return panel.frame.contains(NSEvent.mouseLocation)
+        }
 
         setupHorizontalDragMonitor()
         updatePosition()

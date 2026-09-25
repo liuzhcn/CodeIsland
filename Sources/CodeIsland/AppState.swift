@@ -119,8 +119,26 @@ final class AppState {
     @ObservationIgnored
     private var remoteDiscoveredCodexIds: [String: Set<String>] = [:]
     var activeSessionId: String?
-    var permissionQueue: [PermissionRequest] = []
-    var questionQueue: [QuestionRequest] = []
+    var permissionQueue: [PermissionRequest] = [] {
+        didSet {
+            followUps.waitingChanged()
+            PushNotifier.shared.requestsChanged()
+        }
+    }
+    var questionQueue: [QuestionRequest] = [] {
+        didSet {
+            followUps.waitingChanged()
+            PushNotifier.shared.requestsChanged()
+        }
+    }
+    /// Follow-up reminders for waiting approvals / questions and unseen
+    /// completions. Holds no entries and arms no timer while the setting is off.
+    @ObservationIgnored
+    private(set) lazy var followUps = FollowUpReminderController(appState: self)
+    /// What each display-only wait asks, recorded by the source that opened
+    /// it, for its pushes. See AppState+DisplayOnlyWaits.
+    @ObservationIgnored
+    var displayOnlyWaitAsks: [String: PushContent] = [:]
 
     @ObservationIgnored
     private(set) var recentHookEvents: [DiagnosticHookEvent] = []
@@ -166,6 +184,10 @@ final class AppState {
     /// that was closed and subsequently re-created.
     @ObservationIgnored
     var attachedTranscriptTokens: [String: UUID] = [:]
+    /// Attach-time checklist scans still running off the main actor, keyed by
+    /// session. See AppState+AgentTasks.
+    @ObservationIgnored
+    var pendingAgentTaskBackfills: [String: PendingAgentTaskBackfill] = [:]
     /// Watches active session transcripts for appended assistant lines. Lazily
     /// constructed so the delta handler can safely capture `self`.
     @ObservationIgnored
@@ -220,6 +242,19 @@ final class AppState {
     @ObservationIgnored
     var aiworkReconcileInFlight = false
 
+    /// Claude Desktop Cowork/Chat session-store watcher; nil while the setting
+    /// is off. See AppState+CoworkWatch.
+    @ObservationIgnored
+    var coworkWatcher: CoworkSessionWatcher?
+    /// The Claude Desktop process each in-flight Cowork turn runs in, and
+    /// how to find the running one (a seam for tests).
+    @ObservationIgnored
+    var coworkTurnHosts: [String: ProcessIdentity] = [:]
+    @ObservationIgnored
+    var claudeDesktopProcessProvider: () -> ProcessIdentity? = { AppState.runningClaudeDesktopProcess() }
+    @ObservationIgnored
+    var claudeDesktopTerminationObserver: NSObjectProtocol?
+
     /// Computed: first item in permission queue (backward compat for UI reads)
     var pendingPermission: PermissionRequest? { permissionQueue.first }
     /// Computed: first item in question queue
@@ -260,7 +295,40 @@ final class AppState {
             } else {
                 claudeQuota.noteCollapsed()
             }
+            if surface != oldValue {
+                followUps.surfaceChanged(surface)
+            }
+            switch surface {
+            case .approvalCard(let sid): cardRequestId = pendingPermission(forSession: sid)?.id
+            case .questionCard(let sid): cardRequestId = pendingQuestion(forSession: sid)?.id
+            case .collapsed, .sessionList, .completionCard: cardRequestId = nil
+            }
         }
+    }
+
+    /// The request the approval / question card on screen was opened for.
+    /// While that very request still waits, re-evaluating the queue leaves
+    /// the card alone — it may be one the user picked that is not the head.
+    /// Once it is answered, the session's next request filling the same card
+    /// is weighed like any other.
+    @ObservationIgnored
+    private var cardRequestId: UUID?
+
+    /// Index of the approval the card on screen still shows, when it is
+    /// still waiting and visible.
+    private var shownApprovalIndex: Int? {
+        guard let cardRequestId, case .approvalCard(let sid) = surface,
+              !dismissedPermissionSessionIds.contains(sid),
+              pendingPermission(forSession: sid)?.id == cardRequestId else { return nil }
+        return permissionQueue.firstIndex { $0.id == cardRequestId }
+    }
+
+    /// The session of the question card on screen, when the question it was
+    /// opened for still waits.
+    private var shownQuestionSessionId: String? {
+        guard let cardRequestId, case .questionCard(let sid) = surface,
+              pendingQuestion(forSession: sid)?.id == cardRequestId else { return nil }
+        return sid
     }
 
     /// Local-transcript token usage shown in the session-list footer.
@@ -296,9 +364,19 @@ final class AppState {
     @ObservationIgnored
     nonisolated(unsafe) private var cleanupTimer: Timer?
     private var autoCollapseTask: Task<Void, Never>?
+    /// How long a completion card stays up on its own. Tests shorten it.
+    @ObservationIgnored
+    var completionAutoCollapseDelay: TimeInterval = 5
     private var completionQueue: [String] = []
     /// Mouse must enter the panel before auto-collapse is allowed (prevents instant dismiss)
-    var completionHasBeenEntered = false
+    var completionHasBeenEntered = false {
+        // The pointer on the completion card is the one proof the turn was seen.
+        didSet {
+            if completionHasBeenEntered, let sid = justCompletedSessionId {
+                followUps.completionSeen(sessionId: sid)
+            }
+        }
+    }
     /// Auto-collapse timer fired but mouse is inside panel — defer collapse until mouse leaves
     var deferCollapseOnMouseLeave = false
     /// `attachParentPid` is the monitored process's ppid captured when the monitor was
@@ -334,13 +412,51 @@ final class AppState {
         }
     }
     private var modelReadRetryAt: [String: Date] = [:]
+    /// Per parent session → subagent id: the subagent's own model/effort once
+    /// read from its transcript, and the reads still trying to find it.
+    @ObservationIgnored
+    var subagentModelObservations: [String: [String: ModelObservation]] = [:]
+    @ObservationIgnored
+    var subagentModelReads: [String: [String: SubagentModelRead]] = [:]
 
-    private var dismissedPermissionSessionIds: Set<String> = []
+    private var dismissedPermissionSessionIds: Set<String> = [] {
+        didSet { followUps.waitingChanged() }
+    }
     private func nextVisiblePermissionIndex() -> Int? {
         permissionQueue.firstIndex { request in
             let sid = request.event.sessionId ?? "default"
             return !dismissedPermissionSessionIds.contains(sid)
         }
+    }
+
+    /// Sessions whose approval is still waiting on the user: queued and not
+    /// dismissed. Dismissing hides a request without dequeuing it (#309), so
+    /// the queue alone would keep reminding about a prompt the user hid.
+    var visiblePermissionSessionIds: Set<String> {
+        Set(permissionQueue.map { $0.event.sessionId ?? "default" })
+            .subtracting(dismissedPermissionSessionIds)
+    }
+
+    /// The request each of those sessions' approval card shows — its first
+    /// queued one — by session. Follow-up reminders belong to that request.
+    var visiblePermissionRequestIds: [String: String] {
+        var ids: [String: String] = [:]
+        for request in permissionQueue {
+            let sid = request.event.sessionId ?? "default"
+            guard ids[sid] == nil, !dismissedPermissionSessionIds.contains(sid) else { continue }
+            ids[sid] = request.id.uuidString
+        }
+        return ids
+    }
+
+    /// Question counterpart of `visiblePermissionRequestIds`.
+    var pendingQuestionRequestIds: [String: String] {
+        var ids: [String: String] = [:]
+        for request in questionQueue {
+            let sid = request.event.sessionId ?? "default"
+            if ids[sid] == nil { ids[sid] = request.id.uuidString }
+        }
+        return ids
     }
 
     var rotatingSessionId: String?
@@ -441,13 +557,18 @@ final class AppState {
         //    events for >180s shouldn't be force-flipped to idle here — it'll then be
         //    swept by Section 4. Remote session lifecycle is driven by remote-end hooks
         //    and SSH connection state in RemoteManager, not by local timeouts. (#121)
-        for (key, session) in sessions where processMonitors[key] == nil {
+        //    Claude Desktop Cowork cards are skipped too and settled on their own
+        //    clock right after: their session store stays silent through a long
+        //    tool run and for as long as a permission card is left open.
+        for (key, session) in sessions where processMonitors[key] == nil
+            && !key.hasPrefix(Self.coworkSessionPrefix) {
             if Self.shouldExpireUnmonitoredSession(session) {
                 sessions[key]?.status = .idle
                 sessions[key]?.currentTool = nil
                 sessions[key]?.toolDescription = nil
             }
         }
+        settleCoworkCards()
 
         // 2b. Some CLIs keep their parent process alive across requests, so a missed Stop hook
         // can leave the UI stuck in bare "thinking" forever after an interrupt. If we've had no
@@ -643,12 +764,12 @@ final class AppState {
         return true
     }
 
-    private nonisolated static func liveProcessIdentity(for pid: pid_t) -> ProcessIdentity? {
+    nonisolated static func liveProcessIdentity(for pid: pid_t) -> ProcessIdentity? {
         guard pid > 0, kill(pid, 0) == 0 else { return nil }
         return ProcessIdentity(pid: pid, startTime: getProcessStartTime(pid))
     }
 
-    private nonisolated static func isLiveProcess(_ process: ProcessIdentity) -> Bool {
+    nonisolated static func isLiveProcess(_ process: ProcessIdentity) -> Bool {
         guard process.pid > 0, kill(process.pid, 0) == 0 else { return false }
         guard let expectedStart = process.startTime else { return true }
         return getProcessStartTime(process.pid) == expectedStart
@@ -870,28 +991,34 @@ final class AppState {
     /// Every removal path (cleanup timer, process exit, reducer effect) goes through here
     /// so leaked continuations / connections are impossible.
     func removeSession(_ sessionId: String) {
+        let displayOnlyWaitBefore = displayOnlyWaitKind(forSession: sessionId)
         // Resume ALL pending continuations for this session
         drainPermissions(forSession: sessionId, reason: "removeSession")
         drainQuestions(forSession: sessionId, reason: "removeSession")
 
+        completionQueue.removeAll { $0 == sessionId }
         if surface.sessionId == sessionId {
             autoCollapseTask?.cancel()
             if case .completionCard = surface {
-                if !showNextPending() {
-                    showNextCompletionOrCollapse()
-                }
+                // The turn on this card belongs to a session that is going
+                // away: nothing is left on it to read, pointer on it or not.
+                completionHasBeenEntered = false
+                deferCollapseOnMouseLeave = false
+                showNextCompletionOrCollapse()
             } else {
                 _ = showNextPending()
             }
         }
         sessions.removeValue(forKey: sessionId)
+        noteDisplayOnlyWait(sessionId: sessionId, was: displayOnlyWaitBefore)
         stopMonitor(sessionId)
         detachTranscriptTailer(sessionId: sessionId)
         exitingSessions.removeValue(forKey: sessionId)
         modelReadRetryAt.removeValue(forKey: sessionId)
+        subagentModelObservations.removeValue(forKey: sessionId)
+        subagentModelReads.removeValue(forKey: sessionId)
         hostHarnessProbes.removeValue(forKey: sessionId)
         hostHarnessProbeRetryAt.removeValue(forKey: sessionId)
-        completionQueue.removeAll { $0 == sessionId }
         if activeSessionId == sessionId {
             activeSessionId = mostActiveSessionId()
         }
@@ -1109,8 +1236,15 @@ final class AppState {
         return .expand
     }
 
-    func enqueueCompletion(_ sessionId: String) {
-        switch Self.completionStyle() {
+    /// `turnFailed`: the turn ended on an error (StopFailure, a failed AiWork
+    /// stream or Cowork turn) — its follow-up says so.
+    func enqueueCompletion(_ sessionId: String, turnFailed: Bool = false) {
+        let style = Self.completionStyle()
+        // Follow-ups only chase completions the user asked to hear about.
+        if style != .off {
+            followUps.trackCompletion(sessionId: sessionId, turnFailed: turnFailed)
+        }
+        switch style {
         case .off:
             // Panel stays compact — status indicators still update, but no
             // completion card pops down (#146).
@@ -1144,7 +1278,7 @@ final class AppState {
         let cacheCopy = usageFileCache
         Task.detached(priority: .utility) {
             var cache = cacheCopy
-            let snapshot = ClaudeUsageScanner.scan(cache: &cache)
+            let snapshot = ClaudeUsageScanner.scan(claudeHomes: ClaudeConfigPaths.allConfigDirs(), cache: &cache)
             // Bound to a `let` before the hop: capturing the `var` in the
             // concurrently-executing closure is an error under Swift 6.
             let scannedCache = cache
@@ -1263,6 +1397,38 @@ final class AppState {
         return defaults.bool(forKey: SettingsKey.autoExpandOnPermission)
     }
 
+    /// The question counterpart of `autoExpandOnPermission`. Questions never
+    /// honoured that switch — an AskUserQuestion card opened even when the
+    /// user had asked the island not to steal focus. With this off the sound
+    /// still plays, the collapsed bar shows a question badge, and one click
+    /// (on the bar, or "Answer" in the session list) opens the card.
+    static func autoExpandOnQuestion(_ defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: SettingsKey.autoExpandOnQuestion) != nil else {
+            return SettingsDefaults.autoExpandOnQuestion
+        }
+        return defaults.bool(forKey: SettingsKey.autoExpandOnQuestion)
+    }
+
+    /// Session of a queued question the island is not showing — what the
+    /// collapsed bar's question badge advertises and a click opens.
+    var hiddenPendingQuestionSessionId: String? {
+        guard let head = questionQueue.first else { return nil }
+        if case .questionCard = surface { return nil }
+        return head.event.sessionId ?? "default"
+    }
+
+    /// Open the card for a pending question on an explicit user action (a click
+    /// on the collapsed bar, "Answer" in the session list). Never gated by
+    /// auto-expand or Smart Suppress: those only decide what opens *by itself*.
+    func openPendingQuestionCard(sessionId: String? = nil) {
+        guard let sid = sessionId ?? hiddenPendingQuestionSessionId,
+              pendingQuestion(forSession: sid) != nil else { return }
+        activeSessionId = sid
+        withAnimation(NotchAnimation.open) {
+            surface = .questionCard(sessionId: sid)
+        }
+    }
+
     func shouldAutoOpenPendingSurface(
         for sessionId: String,
         isTerminalFrontmost: (SessionSnapshot) -> Bool = TerminalVisibilityDetector.isTerminalFrontmostForSession
@@ -1273,6 +1439,11 @@ final class AppState {
         return !isTerminalFrontmost(session)
     }
 
+    /// Smart Suppress for a question: may its card open by itself, as far as
+    /// "is the user already looking at the agent" goes? The "auto-expand on
+    /// question" switch is a separate, UI-only choice checked where the card
+    /// opens; folded in here, it read as "the user is looking" to anything
+    /// else that asked (the AskUserQuestion push once did).
     private func shouldAutoOpenQuestionSurface(for event: HookEvent) -> Bool {
         let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
         let nativeAskIsRacing = event.rawJSON["_codeisland_native_ask_racing"] as? Bool == true
@@ -1325,8 +1496,9 @@ final class AppState {
         deferCollapseOnMouseLeave = false
 
         autoCollapseTask?.cancel()
+        let delay = completionAutoCollapseDelay
         autoCollapseTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
             showNextCompletionOrCollapse()
         }
@@ -1344,8 +1516,8 @@ final class AppState {
             deferCollapseOnMouseLeave = true
             return
         }
-        // showNextPending handles: interactive items first, then completionQueue, then collapse
-        if showNextPending() { return }
+        // Interactive items first, then the next finished turn, then collapse.
+        if showNextPending() || showNextQueuedCompletion() { return }
         withAnimation(NotchAnimation.close) {
             surface = .collapsed
         }
@@ -1511,6 +1683,7 @@ final class AppState {
 
         let prevStatus = sessions[sessionId]?.status
         let wasWaiting = prevStatus == .waitingApproval || prevStatus == .waitingQuestion
+        let displayOnlyWaitBefore = displayOnlyWaitKind(forSession: sessionId)
         let cwdBeforeReduce = sessions[sessionId]?.cwd
 
         // Cache PreToolUse payloads so downstream events sharing tool_use_id can be
@@ -1551,6 +1724,9 @@ final class AppState {
         // so retry with a cooldown instead of giving up permanently on the first miss.
         if sessions[sessionId]?.isRemote != true {
             maybeBackfillModel(for: sessionId)
+            if let agentId = event.agentId {
+                maybeBackfillSubagentModel(sessionId: sessionId, agentId: agentId, event: event)
+            }
         }
 
         // Session was waiting and got an activity event. Historically we'd
@@ -1598,8 +1774,14 @@ final class AppState {
             sessions[sessionId]?.isYoloMode = Self.detectCursorYoloMode()
         }
 
+        pushAfterReduce(event, sessionId: sessionId, effects: effects)
+        // The normalizer folds StopFailure onto Stop; only the raw name says
+        // the turn died (same rule as its sound).
+        let turnFailed = EventSoundRouting.soundEvent(
+            rawEventName: event.eventName, normalizedEventName: normalizedEventName
+        ) == EventSoundRouting.turnFailed
         for effect in effects {
-            executeEffect(effect, sessionId: sessionId)
+            executeEffect(effect, sessionId: sessionId, turnFailed: turnFailed)
         }
 
         if normalizedEventName == "SessionStart" {
@@ -1625,6 +1807,14 @@ final class AppState {
                 activeSessionId = mostActiveSessionId()
             }
         }
+
+        // A terminal permission prompt announced by a Notification waits
+        // display-only until the next activity event clears it.
+        noteDisplayOnlyWait(
+            sessionId: sessionId,
+            was: displayOnlyWaitBefore,
+            asking: Self.displayOnlyWaitAsk(forHookEvent: event, normalizedEventName: normalizedEventName)
+        )
 
         scheduleSave()
         startRotationIfNeeded()
@@ -1775,10 +1965,10 @@ final class AppState {
         refreshDerivedState()
     }
 
-    private func executeEffect(_ effect: SideEffect, sessionId: String) {
+    private func executeEffect(_ effect: SideEffect, sessionId: String, turnFailed: Bool = false) {
         switch effect {
         case .playSound(let eventName):
-            SoundManager.shared.handleEvent(eventName)
+            SoundManager.shared.handleEvent(eventName, sessionId: sessionId)
         case .tryMonitorSession(let sid):
             tryMonitorSession(sid)
         case .stopMonitor(let sid):
@@ -1786,7 +1976,7 @@ final class AppState {
         case .removeSession(let sid):
             removeSession(sid)
         case .enqueueCompletion(let sid):
-            enqueueCompletion(sid)
+            enqueueCompletion(sid, turnFailed: turnFailed)
         case .setActiveSession(let sid):
             activeSessionId = sid
         }
@@ -1901,6 +2091,7 @@ final class AppState {
         // already in progress.
         let burstAlreadyInProgress = nextVisiblePermissionIndex() != nil
         permissionQueue.append(request)
+        pushPermissionQueued(event, sessionId: sessionId, smartSuppressed: !shouldAutoOpenPendingSurface(for: sessionId))
 
         // Show UI only when no approval card is already up to be stolen from.
         // showNextPending picks the first *visible* request, promotes it to the
@@ -1925,7 +2116,8 @@ final class AppState {
     /// resolve whichever request happened to be first, delivering the answer to
     /// the wrong CLI. Callers that know which session the card belongs to pass
     /// it in; `nil` keeps the head-of-queue behaviour for surfaces that only
-    /// ever mirror the head (keyboard shortcuts, iPhone/Watch Buddy). (#308)
+    /// ever mirror the head (the hardware Buddy, a companion command that names
+    /// no session). (#308)
     private func permissionIndex(expecting expected: String?) -> Int? {
         guard let expected else { return permissionQueue.isEmpty ? nil : 0 }
         return permissionQueue.firstIndex { ($0.event.sessionId ?? "default") == expected }
@@ -2274,10 +2466,11 @@ final class AppState {
 
         let request = QuestionRequest(event: event, question: question, continuation: continuation)
         questionQueue.append(request)
+        pushQuestionQueued(request, sessionId: sessionId, smartSuppressed: !shouldAutoOpenPendingSurface(for: sessionId))
 
         if questionQueue.count == 1 {
             activeSessionId = sessionId
-            if shouldAutoOpenPendingSurface(for: sessionId) {
+            if Self.autoExpandOnQuestion(), shouldAutoOpenPendingSurface(for: sessionId) {
                 withAnimation(NotchAnimation.open) {
                     surface = .questionCard(sessionId: sessionId)
                 }
@@ -2399,10 +2592,21 @@ final class AppState {
             askUserQuestionState: askState
         )
         questionQueue.append(request)
+        // Smart Suppress alone: whether the island opens the card by itself
+        // (the "auto-expand on question" switch) says nothing about whether
+        // the person is looking at the question in their terminal.
+        pushQuestionQueued(
+            request,
+            sessionId: sessionId,
+            smartSuppressed: !shouldAutoOpenPendingSurface(
+                for: sessionId,
+                isTerminalFrontmost: questionTerminalFrontmostDetector
+            )
+        )
 
         if questionQueue.count == 1 {
             activeSessionId = sessionId
-            if shouldAutoOpenQuestionSurface(for: event) {
+            if Self.autoExpandOnQuestion(), shouldAutoOpenQuestionSurface(for: event) {
                 withAnimation(NotchAnimation.open) {
                     surface = .questionCard(sessionId: sessionId)
                 }
@@ -2764,48 +2968,94 @@ final class AppState {
         }
     }
 
-    /// After dequeuing, show next pending item or collapse
+    /// After dequeuing, show the next pending item, else the next finished
+    /// turn, else collapse.
+    ///
+    /// Returns whether something the user can act on is on screen afterwards:
+    /// an approval / question card, or the session list (which answers them
+    /// inline), or the next completion card. A request that stays hidden —
+    /// its auto-expand switch is off, Smart Suppress holds it back — is not
+    /// on screen: a completion card whose time is up then moves on to the
+    /// next finished turn or folds, instead of staying up for nobody.
     @discardableResult
     func showNextPending() -> Bool {
         collapseStaleCardSurface()
+        let hasPending: Bool
         if let idx = nextVisiblePermissionIndex() {
-            let next = permissionQueue.remove(at: idx)
-            permissionQueue.insert(next, at: 0)
+            hasPending = true
+            // An approval card still showing the request it was opened for
+            // stays — the user may have picked it (session list, reminder)
+            // over the head. It becomes the head, so whatever mirrors the
+            // head (Buddy) agrees with the screen.
+            let shownIdx = shownApprovalIndex
+            // One assignment: removing and re-inserting in place would show
+            // the queue's observers (follow-up reminders) a moment where this
+            // request is gone, and its reminder would start over.
+            var queue = permissionQueue
+            let next = queue.remove(at: shownIdx ?? idx)
+            queue.insert(next, at: 0)
+            permissionQueue = queue
             let sid = next.event.sessionId ?? "default"
             activeSessionId = sid
+            if shownIdx != nil { return true }
             // When the session list is open, keep it open; approvals can be handled inline.
-            if surface != .sessionList,
-               Self.autoExpandOnPermission(),
-               shouldAutoOpenPendingSurface(for: sid) {
+            if surface == .sessionList { return true }
+            if Self.autoExpandOnPermission(), shouldAutoOpenPendingSurface(for: sid) {
                 surface = .approvalCard(sessionId: sid)
+                return true
             }
-            return true
+            // The approval stays hidden; a card already up stays with it.
+            if surface.approvalSessionId != nil || surface.questionSessionId != nil { return true }
         } else if let next = questionQueue.first {
+            hasPending = true
+            // A question card still showing the question it was opened for
+            // stays, even when it is not the head (the user clicked "Answer"
+            // on it, a reminder reopened it).
+            if let shown = shownQuestionSessionId {
+                activeSessionId = shown
+                return true
+            }
             let sid = next.event.sessionId ?? "default"
             activeSessionId = sid
-            if shouldAutoOpenQuestionSurface(for: next.event) {
+            if !Self.autoExpandOnQuestion() {
+                // Nothing opens by itself — and a card the user opened with a
+                // click stays put. Stale cards were already folded above.
+                if surface.questionSessionId != nil || surface == .sessionList { return true }
+            } else if shouldAutoOpenQuestionSurface(for: next.event) {
                 surface = .questionCard(sessionId: sid)
+                return true
             } else if case .questionCard = surface {
                 // Smart Suppress wants this card collapsed (e.g. an OMP ask
                 // whose terminal dialog is racing). Fold an inherited
                 // question-card surface so the promoted card does not render
                 // expanded on top of the previous question's surface.
                 surface = .collapsed
+            } else if surface == .sessionList {
+                return true
             }
+        } else {
+            hasPending = false
+        }
+        // Nothing interactive on screen. A completion card that is up keeps
+        // its own time (`showNextCompletionOrCollapse` moves on when it is
+        // over); a request arriving hidden must not cut it short.
+        if !hasPending || !isShowingCompletion, showNextQueuedCompletion() {
             return true
-        } else if !completionQueue.isEmpty {
-            while let next = completionQueue.first {
-                completionQueue.removeFirst()
-                if sessions[next] != nil {
-                    withAnimation(NotchAnimation.pop) { doShowCompletion(next) }
-                    return true
-                }
+        }
+        if surface.approvalSessionId != nil || surface.questionSessionId != nil {
+            surface = .collapsed
+        }
+        return false
+    }
+
+    /// Show the oldest queued completion whose session still exists.
+    private func showNextQueuedCompletion() -> Bool {
+        while let next = completionQueue.first {
+            completionQueue.removeFirst()
+            if sessions[next] != nil {
+                withAnimation(NotchAnimation.pop) { doShowCompletion(next) }
+                return true
             }
-            return false
-        } else if case .approvalCard = surface {
-            surface = .collapsed
-        } else if case .questionCard = surface {
-            surface = .collapsed
         }
         return false
     }
@@ -2840,8 +3090,9 @@ final class AppState {
     private nonisolated static func readModelFromTranscript(sessionId: String, cwd: String?) -> String? {
         guard let cwd = cwd else { return nil }
         let projectDir = cwd.claudeProjectDirEncoded()
-        let path = "\(ClaudeConfigPaths.projectsDir())/\(projectDir)/\(sessionId).jsonl"
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        // The transcript sits under whichever config dir (account) ran it.
+        guard let path = ClaudeConfigPaths.transcriptPath(projectDir: projectDir, sessionId: sessionId),
+              let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { handle.closeFile() }
         let chunk = handle.readData(ofLength: 32768)
         guard let text = String(data: chunk, encoding: .utf8) else { return nil }
@@ -2923,10 +3174,10 @@ final class AppState {
 
     private nonisolated static func readModelFromCodexStore(cwd: String?, processStart: Date?) -> String? {
         guard let cwd else { return nil }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let base = "\(home)/.codex/sessions"
         let fm = FileManager.default
-        guard let path = findRecentCodexSession(base: base, cwd: cwd, after: processStart, fm: fm) else {
+        guard let path = codexStateRoots().lazy.compactMap({
+            findRecentCodexSession(base: "\($0)/sessions", cwd: cwd, after: processStart, fm: fm)
+        }).first else {
             return nil
         }
         return readRecentFromCodexTranscript(path: path).0
@@ -3001,34 +3252,38 @@ final class AppState {
         cwd: String?,
         processStart: Date?
     ) -> String? {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let statePath = "\(home)/.codex/state_5.sqlite"
+        // The thread may belong to any Codex root (CODEX_HOME / account).
+        let roots = codexStateRoots()
+        for root in roots {
+            let statePath = "\(root)/state_5.sqlite"
 
-        if let path: String = withSQLiteDatabase(at: statePath, body: { db in
-            guard let statement = prepareSQLiteStatement(
-                db: db,
-                sql: """
-                    SELECT rollout_path
-                    FROM threads
-                    WHERE id = ?
-                    LIMIT 1;
-                    """
-            ) else {
-                return nil
+            if let path: String = withSQLiteDatabase(at: statePath, body: { db in
+                guard let statement = prepareSQLiteStatement(
+                    db: db,
+                    sql: """
+                        SELECT rollout_path
+                        FROM threads
+                        WHERE id = ?
+                        LIMIT 1;
+                        """
+                ) else {
+                    return nil
+                }
+                defer { sqlite3_finalize(statement) }
+
+                bindSQLiteText(sessionId, to: statement, index: 1)
+                guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+                return sqliteColumnString(statement, index: 0)
+            }),
+               FileManager.default.fileExists(atPath: path) {
+                return path
             }
-            defer { sqlite3_finalize(statement) }
-
-            bindSQLiteText(sessionId, to: statement, index: 1)
-            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
-            return sqliteColumnString(statement, index: 0)
-        }),
-           FileManager.default.fileExists(atPath: path) {
-            return path
         }
 
         guard let cwd else { return nil }
-        let base = "\(home)/.codex/sessions"
-        return findRecentCodexSession(base: base, cwd: cwd, after: processStart, fm: .default)
+        return roots.lazy.compactMap {
+            findRecentCodexSession(base: "\($0)/sessions", cwd: cwd, after: processStart, fm: .default)
+        }.first
     }
 
     /// Config roots a Qoder session's transcript can live under: the international
@@ -3177,8 +3432,20 @@ final class AppState {
             snapshot.herdrBinaryPath = p.herdrBinaryPath
             snapshot.lastActivity = p.lastActivity
             snapshot.transcriptPath = p.transcriptPath
+            snapshot.recap = p.recap
+            snapshot.reasoningEffort = p.reasoningEffort
+            // A prompt typed while CodeIsland wasn't running supersedes the
+            // saved recap; the transcript tail is the judge. Restored cards
+            // don't always get a tailer, so check now rather than on attach.
+            if snapshot.recap != nil, let path = snapshot.transcriptPath,
+               let scan = JSONLTailer.scanFileTail(path: path) {
+                _ = snapshot.applyTranscriptBackfill(scan)
+            }
             if let closed = p.closedSubagentIds, !closed.isEmpty {
                 snapshot.restoreClosedSubagentIds(closed)
+            }
+            if let agentTasks = p.agentTasks {
+                snapshot.agentTasks = agentTasks
             }
             // Restore persisted cliPid only if the process is still alive — avoids
             // stale sessions reappearing briefly after the app or IDE restarts (#46).
@@ -3292,6 +3559,9 @@ final class AppState {
         let candidates: [(String, String)] = [
             ("claude", ClaudeConfigPaths.projectsDir()),
             ("codex", "\(home)/.codex/sessions"),
+            // $CODEX_HOME when CodeIsland itself was launched with one; the
+            // same path as above otherwise (duplicates are dropped below).
+            ("codex", "\(ConfigInstaller.codexHome())/sessions"),
             ("gemini", "\(home)/.gemini/tmp"),
             ("qoder", "\(home)/.qoder/projects"),
             ("codebuddy", "\(home)/.codebuddy/projects"),
@@ -3304,8 +3574,12 @@ final class AppState {
             ("grok", "\(ConfigInstaller.grokHome())/sessions"),
         ]
         let fm = FileManager.default
-        var roots = candidates.compactMap { source, path -> String? in
-            guard ConfigInstaller.isEnabled(source: source), fm.fileExists(atPath: path) else { return nil }
+        // By identity: an extra dir that is a primary one under another
+        // spelling (symlink, case) must not be watched twice.
+        var seenRoots = Set<String>()
+        var roots = (candidates + extraConfigDirWatchRoots()).compactMap { source, path -> String? in
+            guard ConfigInstaller.isEnabled(source: source), fm.fileExists(atPath: path),
+                  seenRoots.insert(ExtraConfigDirs.identity(of: path)).inserted else { return nil }
             return path
         }
         if ConfigInstaller.isEnabled(source: "cline") {
@@ -3318,6 +3592,14 @@ final class AppState {
         return roots
     }
 
+    /// What a discovery scan runs. The real scan reads every process and the
+    /// agents' session stores under ~, and each session it returns gets a
+    /// process monitor — and the orphan reaper — on one of the user's real
+    /// CLIs. A test process scans nothing unless a test installs a scanner.
+    nonisolated(unsafe) static var discoveryScanner: @Sendable () -> [DiscoveredSession] = {
+        RuntimeEnvironment.isRunningTests ? [] : findDiscoveredSessions()
+    }
+
     private func requestDiscoveryScan() {
         if discoveryScanTask != nil {
             pendingDiscoveryRescan = true
@@ -3326,7 +3608,7 @@ final class AppState {
 
         pendingDiscoveryRescan = false
         discoveryScanTask = Task.detached { [weak self] in
-            let discovered = Self.findDiscoveredSessions()
+            let discovered = Self.discoveryScanner()
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -3431,6 +3713,15 @@ final class AppState {
         self.projectsWatcherBox = box
         self.fsEventStream = stream
         log.info("Discovery watcher started on \(watchRoots.joined(separator: ", "))")
+    }
+
+    /// Re-arm discovery after the watched roots changed — an extra config dir
+    /// was added, removed or paused in Settings → Hooks — and rescan at once so
+    /// sessions already running under a newly added root show up.
+    func restartProjectsWatcher() {
+        tearDownProjectsWatcher()
+        startProjectsWatcher()
+        requestDiscoveryScan()
     }
 
     /// Called by FSEventStream when a known session-store directory changes.
@@ -4284,7 +4575,10 @@ final class AppState {
                 child.source = "codex"
                 child.providerSessionId = agentId
                 child.cwd = child.cwd ?? parent.session.cwd
-                child.model = child.model ?? parent.session.model
+                // The child's own model (its hooks, then its rollout below) —
+                // never the parent's: children routinely run on another model.
+                child.model = child.model ?? subagent.model
+                child.reasoningEffort = child.reasoningEffort ?? subagent.reasoningEffort
                 child.permissionMode = child.permissionMode ?? parent.session.permissionMode
                 child.termApp = child.termApp ?? parent.session.termApp
                 child.itermSessionId = child.itermSessionId ?? parent.session.itermSessionId
@@ -4381,7 +4675,9 @@ final class AppState {
                 child.source = parent.session.source
                 child.providerSessionId = agentId
                 child.cwd = child.cwd ?? parent.session.cwd
-                child.model = child.model ?? parent.session.model
+                // Own model only, never the parent chat's (see the Codex split).
+                child.model = child.model ?? subagent.model
+                child.reasoningEffort = child.reasoningEffort ?? subagent.reasoningEffort
                 child.permissionMode = child.permissionMode ?? parent.session.permissionMode
                 child.termApp = child.termApp ?? parent.session.termApp
                 child.itermSessionId = child.itermSessionId ?? parent.session.itermSessionId
@@ -4637,70 +4933,96 @@ final class AppState {
         guard !claudePids.isEmpty else { return [] }
 
         let fm = FileManager.default
-        let claudeProjects = ClaudeConfigPaths.projectsDir()
-        var results: [DiscoveredSession] = []
-        var seenSessionIds: Set<String> = []
-
-        // Each claude process → its CWD → the single most recent .jsonl
-        for pid in claudePids {
-            guard let cwd = getCwd(for: pid), !cwd.isEmpty else { continue }
-
+        let processes = claudePids.compactMap { pid -> ClaudeDiscoveryProcess? in
+            guard let cwd = getCwd(for: pid), !cwd.isEmpty else { return nil }
             // Skip subagent worktrees — they are child tasks, not independent sessions
             if cwd.contains("/.claude/worktrees/agent-") || cwd.contains("/.git/worktrees/agent-") {
-                continue
+                return nil
             }
-
-            // Get process start time to filter stale transcript files
-            let processStart = getProcessStartTime(pid)
-
-            let projectDir = cwd.claudeProjectDirEncoded()
-            let projectPath = "\(claudeProjects)/\(projectDir)"
-            guard let files = try? fm.contentsOfDirectory(atPath: projectPath) else { continue }
-
-            // Find the most recently modified .jsonl that was written AFTER this process started
-            var bestFile: String?
-            var bestDate = Date.distantPast
-            for file in files where file.hasSuffix(".jsonl") {
-                let fullPath = "\(projectPath)/\(file)"
-                if let attrs = try? fm.attributesOfItem(atPath: fullPath),
-                   let modified = attrs[.modificationDate] as? Date,
-                   modified > bestDate {
-                    // Skip files from old sessions: must be modified after process started
-                    if let start = processStart, modified < start.addingTimeInterval(-10) {
-                        continue
-                    }
-                    bestDate = modified
-                    bestFile = file
-                }
-            }
-
-            guard let file = bestFile else { continue }
-
-            // Skip stale transcripts: only show sessions active within last 5 minutes.
-            // When processStart is unknown (proc_pidinfo failed), use a tighter 30s window
-            // to avoid resurrecting zombie sessions from stale transcript files.
-            let freshnessLimit: TimeInterval = processStart != nil ? -300 : -30
-            if bestDate.timeIntervalSinceNow < freshnessLimit { continue }
-
-            let sessionId = String(file.dropLast(6))
-            guard !seenSessionIds.contains(sessionId) else { continue }
-            seenSessionIds.insert(sessionId)
-
-            let fullPath = "\(projectPath)/\(file)"
-            let (model, messages) = readRecentFromTranscript(path: fullPath)
-
-            results.append(DiscoveredSession(
-                sessionId: sessionId,
-                cwd: cwd,
-                tty: nil,
-                model: model,
-                pid: pid,
-                modifiedAt: bestDate,
-                recentMessages: messages,
-                transcriptPath: fullPath
-            ))
+            // Process start time filters stale transcript files
+            return ClaudeDiscoveryProcess(pid: pid, cwd: cwd, startTime: getProcessStartTime(pid))
         }
-        return results
+
+        // Each process is matched in the config dir it writes to (its
+        // CLAUDE_CONFIG_DIR); ConfigRootDiscovery places the ones whose
+        // environment cannot be read and skips paused dirs.
+        let scan = configRootScan(for: .claude)
+        return ConfigRootDiscovery.run(
+            processes: processes,
+            lookup: { scan.lookup(pid: $0.pid) },
+            fallbackRoots: scan.fallbackRoots,
+            discover: { root, group, claimed in
+                var taken = claimed
+                return group.compactMap { process in
+                    guard let session = claudeSession(for: process, root: root, excluding: taken, fm: fm) else {
+                        return nil
+                    }
+                    taken.insert(session.sessionId)
+                    return session
+                }
+            },
+            sessionId: \.sessionId,
+            belongsTo: { $0.pid == $1.pid }
+        )
+    }
+
+    struct ClaudeDiscoveryProcess {
+        let pid: pid_t
+        let cwd: String
+        let startTime: Date?
+    }
+
+    /// One claude process → its CWD → the single most recent .jsonl under `root`.
+    private nonisolated static func claudeSession(
+        for process: ClaudeDiscoveryProcess,
+        root: String,
+        excluding claimed: Set<String>,
+        fm: FileManager
+    ) -> DiscoveredSession? {
+        let projectPath = "\(root)/projects/\(process.cwd.claudeProjectDirEncoded())"
+        guard let files = try? fm.contentsOfDirectory(atPath: projectPath) else { return nil }
+
+        // Find the most recently modified .jsonl that was written AFTER this process started
+        var bestFile: String?
+        var bestDate = Date.distantPast
+        for file in files where file.hasSuffix(".jsonl") {
+            let fullPath = "\(projectPath)/\(file)"
+            if let attrs = try? fm.attributesOfItem(atPath: fullPath),
+               let modified = attrs[.modificationDate] as? Date,
+               modified > bestDate {
+                // Skip files from old sessions: must be modified after process started
+                if let start = process.startTime, modified < start.addingTimeInterval(-10) {
+                    continue
+                }
+                bestDate = modified
+                bestFile = file
+            }
+        }
+
+        guard let file = bestFile else { return nil }
+
+        // Skip stale transcripts: only show sessions active within last 5 minutes.
+        // When processStart is unknown (proc_pidinfo failed), use a tighter 30s window
+        // to avoid resurrecting zombie sessions from stale transcript files.
+        let freshnessLimit: TimeInterval = process.startTime != nil ? -300 : -30
+        if bestDate.timeIntervalSinceNow < freshnessLimit { return nil }
+
+        let sessionId = String(file.dropLast(6))
+        guard !claimed.contains(sessionId) else { return nil }
+
+        let fullPath = "\(projectPath)/\(file)"
+        let (model, messages) = readRecentFromTranscript(path: fullPath)
+
+        return DiscoveredSession(
+            sessionId: sessionId,
+            cwd: process.cwd,
+            tty: nil,
+            model: model,
+            pid: process.pid,
+            modifiedAt: bestDate,
+            recentMessages: messages,
+            transcriptPath: fullPath
+        )
     }
 
     private nonisolated static func allProcessIds() -> [pid_t] {
@@ -5656,7 +5978,8 @@ final class AppState {
         fm: FileManager = .default
     ) -> GrokSessionCandidate? {
         // Model backfill runs on the main actor, and the index has no model.
-        grokSessionCandidates(cwd: cwd, includeIndex: false, fm: fm)
+        ConfigInstaller.grokHomes()
+            .flatMap { grokSessionCandidates(cwd: cwd, sessionsRoot: "\($0)/sessions", includeIndex: false, fm: fm) }
             .filter {
                 grokSessionProcessMatchScore(
                     createdAt: $0.createdAt,
@@ -5672,17 +5995,48 @@ final class AppState {
         guard !grokPids.isEmpty else { return [] }
 
         let fm = FileManager.default
-        let liveProcesses = grokPids.compactMap { pid -> (pid: pid_t, cwd: String, startedAt: Date?)? in
+        let liveProcesses = grokPids.compactMap { pid -> GrokDiscoveryProcess? in
             guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { return nil }
-            return (pid, cwd, getProcessStartTime(pid))
+            return GrokDiscoveryProcess(pid: pid, cwd: cwd, startedAt: getProcessStartTime(pid))
         }
-        let processGroups = Dictionary(grouping: liveProcesses) { $0.cwd }
+        // Processes compete for sessions only within one root (their
+        // GROK_HOME, grouped by identity) and one cwd: two accounts working in
+        // the same project keep separate stores. See ConfigRootDiscovery for
+        // processes whose environment cannot be read and for paused roots.
+        let scan = configRootScan(for: .grok)
+        return ConfigRootDiscovery.run(
+            processes: liveProcesses,
+            lookup: { scan.lookup(pid: $0.pid) },
+            fallbackRoots: scan.fallbackRoots,
+            discover: { root, processes, claimed in
+                grokSessions(for: processes, sessionsRoot: "\(root)/sessions", excluding: claimed, fm: fm)
+            },
+            sessionId: \.sessionId,
+            belongsTo: { $0.pid == $1.pid }
+        )
+    }
 
+    struct GrokDiscoveryProcess {
+        let pid: pid_t
+        let cwd: String
+        let startedAt: Date?
+    }
+
+    /// Grok sessions under one sessions root for `processes`, matched per cwd.
+    /// Sessions in `claimed` (already taken by another root's processes) are
+    /// not offered, so the matcher can hand a process its next-best one.
+    private nonisolated static func grokSessions(
+        for processes: [GrokDiscoveryProcess],
+        sessionsRoot: String,
+        excluding claimed: Set<String>,
+        fm: FileManager
+    ) -> [DiscoveredSession] {
         var results: [DiscoveredSession] = []
-        for (cwd, processes) in processGroups {
-            let candidates = grokSessionCandidates(cwd: cwd, fm: fm)
+        for (cwd, sameCwd) in Dictionary(grouping: processes, by: \.cwd) {
+            let candidates = grokSessionCandidates(cwd: cwd, sessionsRoot: sessionsRoot, fm: fm)
+                .filter { !claimed.contains($0.sessionId) }
             let assignments = matchGrokSessionsToProcesses(
-                processes: processes.map { ($0.pid, $0.startedAt) },
+                processes: sameCwd.map { ($0.pid, $0.startedAt) },
                 sessions: candidates.map { ($0.sessionId, $0.createdAt, $0.activityAt) }
             )
 
@@ -6857,13 +7211,27 @@ final class AppState {
             )
         }
 
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let sessionsBase = "\(home)/.codex/sessions"
-        let statePath = "\(home)/.codex/state_5.sqlite"
-        return discoverCodexSessions(
+        // Each process is matched against the root it runs with (its
+        // CODEX_HOME, grouped by identity). One whose environment cannot be
+        // read lands in the first fallback root that has a session for it —
+        // never in every root. Paused roots are skipped (ConfigRootDiscovery).
+        let scan = configRootScan(for: .codex)
+        return ConfigRootDiscovery.run(
             processes: processes,
-            sessionsBase: sessionsBase,
-            statePath: statePath
+            lookup: { scan.lookup(pid: $0.pid) },
+            fallbackRoots: scan.fallbackRoots,
+            discover: { root, group, _ in
+                discoverCodexSessions(
+                    processes: group,
+                    sessionsBase: "\(root)/sessions",
+                    statePath: "\(root)/state_5.sqlite"
+                )
+            },
+            sessionId: \.sessionId,
+            // Desktop threads come from the state DB without a pid.
+            belongsTo: { session, process in
+                session.pid == process.pid || (session.pid == nil && process.isDesktop)
+            }
         )
     }
 
@@ -7121,10 +7489,17 @@ final class AppState {
         statePath overrideStatePath: String? = nil
     ) -> [String: CodexSpawnEdgeRecord] {
         guard !threadIds.isEmpty else { return [:] }
-        let statePath = overrideStatePath ?? {
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            return "\(home)/.codex/state_5.sqlite"
-        }()
+        guard let statePath = overrideStatePath else {
+            // A thread can live in any Codex root; the first root that knows it wins.
+            var merged: [String: CodexSpawnEdgeRecord] = [:]
+            for root in codexStateRoots() {
+                let unresolved = threadIds.subtracting(merged.keys)
+                guard !unresolved.isEmpty else { break }
+                let found = codexSpawnEdgeRecords(threadIds: unresolved, statePath: "\(root)/state_5.sqlite")
+                merged.merge(found) { current, _ in current }
+            }
+            return merged
+        }
         return withSQLiteDatabase(at: statePath) { db in
             let edgeColumns = sqliteTableColumns(db: db, tableName: "thread_spawn_edges")
             guard Set(["parent_thread_id", "child_thread_id", "status"]).isSubset(of: edgeColumns) else {
@@ -7601,6 +7976,7 @@ final class AppState {
         guard let text = readTranscriptTail(path: path, maxBytes: 1048576) else { return (nil, []) }
 
         var model: String?
+        var turnModel: String?
         var userMessages: [(Int, String)] = []
         var fallbackUserMessage: (Int, String)?
         var assistantMessages: [(Int, String)] = []
@@ -7618,6 +7994,13 @@ final class AppState {
                let payload = json["payload"] as? [String: Any] {
                 model = payload["model"] as? String
                     ?? payload["model_provider"] as? String
+            }
+            // turn_context names the model each turn actually ran on; current
+            // session_meta only has the provider ("openai"), which is no label.
+            if type == "turn_context",
+               let payload = json["payload"] as? [String: Any],
+               let observation = ModelObservation.from(model: payload["model"], effort: nil) {
+                turnModel = observation.model
             }
 
             // Prefer event_msg (cleaner user messages from Codex).
@@ -7661,7 +8044,7 @@ final class AppState {
         combined.sort { $0.0 < $1.0 }
         let recent = Array(combined.suffix(3).map { $0.1 })
 
-        return (model, recent)
+        return (turnModel ?? model, recent)
     }
 
     /// Read model and last 3 user/assistant messages from a transcript file's tail
@@ -7735,7 +8118,16 @@ final class AppState {
 
             if let text = textContent, !text.isEmpty {
                 if normalizedRole == "user" || normalizedRole == "user_input" {
-                    userMessages.append((index, text))
+                    // Same rules as the live tail: injected (isMeta) rows and
+                    // local slash commands (/model) are not prompts; a prompt
+                    // command reads as typed ("/review foo").
+                    if json["isMeta"] as? Bool != true {
+                        switch JSONLTailer.claudeCommandEcho(text) {
+                        case .local?: break
+                        case .prompt(let command)?: userMessages.append((index, command))
+                        case nil: userMessages.append((index, text))
+                        }
+                    }
                 } else if normalizedRole == "assistant" || normalizedRole == "planner_response" {
                     assistantMessages.append((index, text))
                 }

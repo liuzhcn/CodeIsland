@@ -182,6 +182,23 @@ public struct SessionSnapshot: Sendable {
     /// (a turn may have switched branches). nil for non-repo and remote cwds.
     public var gitBranch: String?
     public var gitIsWorktree: Bool = false
+    /// The agent's own task checklist (TaskCreate/TaskUpdate, TodoWrite,
+    /// Codex update_plan), fed by hooks here and by the transcript tailer.
+    public var agentTasks = AgentTaskList()
+    /// Claude Code's `away_summary` recap of an idle session; cleared by the
+    /// next user prompt. See ``SessionRecap``.
+    public var recap: SessionRecap?
+    /// Reasoning effort of the latest turn ("xhigh", "max", …), read from the
+    /// transcript next to the turn's model. Hooks don't report it.
+    public var reasoningEffort: String?
+    /// When a hook last reported `model`. An attach-time transcript backfill
+    /// must not replace it with a model from an older line
+    /// (`claude --resume --model X` over a transcript that ran on Y).
+    public var modelReportedAt: Date?
+    /// What the latest `/model` switch said about the 1M context variant; nil
+    /// until one is seen. Transcript lines carry only the bare API id, so this
+    /// is the one place a switch *to or from* the `[1m]` variant shows up.
+    public var configuredLongContext: Bool?
 
     public init(startTime: Date = Date()) {
         self.startTime = startTime
@@ -464,6 +481,13 @@ public struct SessionSnapshot: Sendable {
     /// NSCache is thread-safe and evicts under memory pressure.
     private static let cursorLeafCache = NSCache<NSString, NSString>()
 
+    /// The stat behind that walk. Tests describe the folders they need here
+    /// instead of creating them in the user's real home — the old tests made
+    /// and then recursively deleted `~/myproject` and `~/my-sample-app`.
+    static var cursorProjectFolderExists: (String) -> Bool = { path in
+        FileManager.default.fileExists(atPath: path)
+    }
+
     static func displayNameLeafFromCursorProjectsPath(_ cwd: String) -> String? {
         if let cached = cursorLeafCache.object(forKey: cwd as NSString) {
             return cached.length == 0 ? nil : (cached as String)
@@ -494,7 +518,6 @@ public struct SessionSnapshot: Sendable {
         guard !parts.isEmpty else { return nil }
 
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fm = FileManager.default
         // Prefer the longest leaf whose prefix reconstructs to a real directory.
         for k in stride(from: parts.count - 1, through: 0, by: -1) {
             let leaf = parts[k...].joined(separator: "-")
@@ -503,7 +526,7 @@ public struct SessionSnapshot: Sendable {
                 return leaf
             }
             let relative = parts[..<k].joined(separator: "/") + "/" + leaf
-            if fm.fileExists(atPath: "\(home)/\(relative)") {
+            if cursorProjectFolderExists("\(home)/\(relative)") {
                 return leaf
             }
         }
@@ -1051,6 +1074,13 @@ public func reduceEvent(
 
     // Route subagent-specific events
     if let agentId = event.agentId {
+        // Subagents and teammates share the parent's task list: their
+        // TaskUpdate calls move the parent's rows too. Their own creates stay
+        // off the parent card (see applySharedUpdates).
+        let sharedTaskEvents = AgentTaskHookParser.events(from: event, normalizedEventName: eventName)
+        if !sharedTaskEvents.isEmpty {
+            sessions[sessionId]?.agentTasks.applySharedUpdates(sharedTaskEvents, now: Date())
+        }
         let handled = handleSubagentEvent(
             sessions: &sessions,
             sessionId: sessionId,
@@ -1060,6 +1090,7 @@ public func reduceEvent(
             maxHistory: maxHistory,
             effects: &effects
         )
+        recordSubagentModel(sessions: &sessions, sessionId: sessionId, agentId: agentId, event: event)
         if handled { return effects }
     }
 
@@ -1089,11 +1120,21 @@ public func reduceEvent(
     let isWaiting = sessions[sessionId]?.status == .waitingApproval
         || sessions[sessionId]?.status == .waitingQuestion
 
+    // Agent checklist progress. Subagent tool events were consumed by
+    // handleSubagentEvent above (after their shared-list updates), so a
+    // child's own list never lands here.
+    let agentTasksBeforeEvent = sessions[sessionId]?.agentTasks
+    let agentTaskEvents = AgentTaskHookParser.events(from: event, normalizedEventName: eventName)
+    if !agentTaskEvents.isEmpty {
+        sessions[sessionId]?.agentTasks.apply(agentTaskEvents, now: Date())
+    }
+
     // Update this session's state
     switch eventName {
     case "UserPromptSubmit":
         sessions[sessionId]?.interrupted = false
         sessions[sessionId]?.taskRoundEnded = false
+        sessions[sessionId]?.clearRecapIfSuperseded(byPromptAt: Date())
         if sessions[sessionId]?.source == "codex" {
             sessions[sessionId]?.liveCodexOutput = nil
         }
@@ -1314,7 +1355,10 @@ public func reduceEvent(
         sessions[sessionId] = SessionSnapshot(startTime: Date())
         // Re-apply metadata from this event (common extraction above wrote to the old session)
         if let cwd = event.rawJSON["cwd"] as? String, !cwd.isEmpty { sessions[sessionId]?.cwd = cwd }
-        if let model = event.rawJSON["model"] as? String, !model.isEmpty { sessions[sessionId]?.model = model }
+        if let model = event.rawJSON["model"] as? String, !model.isEmpty {
+            sessions[sessionId]?.model = model
+            sessions[sessionId]?.modelReportedAt = Date()
+        }
         if let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
             let newPid = pid_t(ppid)
             if sessions[sessionId]?.cliPid != newPid {
@@ -1449,6 +1493,15 @@ public func reduceEvent(
         break
     }
 
+    // SessionStart rebuilt the snapshot, but a resumed or compacted
+    // conversation is still working through the same checklist. /clear
+    // starts the conversation over — even when it keeps the session id — so
+    // the old checklist goes with it.
+    if eventName == "SessionStart", let agentTasksBeforeEvent,
+       (event.rawJSON["source"] as? String)?.lowercased() != "clear" {
+        sessions[sessionId]?.agentTasks = agentTasksBeforeEvent
+    }
+
     sessions[sessionId]?.lastActivity = Date()
 
     // Ensure process monitor is set up (covers sessions created implicitly)
@@ -1456,8 +1509,11 @@ public func reduceEvent(
         effects.append(.tryMonitorSession(sessionId: sessionId))
     }
 
-    // Trigger sound for this event
-    effects.append(.playSound(eventName))
+    // Trigger sound for this event. A single failed tool stays silent; only a
+    // turn that died (StopFailure) rings the error sound. See EventSoundRouting.
+    if let sound = EventSoundRouting.soundEvent(rawEventName: event.eventName, normalizedEventName: eventName) {
+        effects.append(.playSound(sound))
+    }
 
     // Switch display to the session that just had activity
     if eventName == "Stop" {
@@ -1583,7 +1639,11 @@ public func fillMissingParentMetadataFromSubagentEvent(
         }
     }
 
+    // Claude and Cursor child hooks carry the parent's transcript; a Codex
+    // child's is its own rollout. Tailing that as the parent's would label
+    // the parent with the child's model and effort.
     if sessions[sessionId]?.transcriptPath == nil,
+       !isCodexSubagentEvent(event, session: sessions[sessionId]),
        let transcriptPath = event.rawJSON["transcript_path"] as? String, !transcriptPath.isEmpty {
         sessions[sessionId]?.transcriptPath = transcriptPath
     }
@@ -1671,6 +1731,7 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     // it asynchronously after reduce (maybeRefreshGitBranch).
     if let model = event.rawJSON["model"] as? String, !model.isEmpty {
         sessions[sessionId]?.model = model
+        sessions[sessionId]?.modelReportedAt = Date()
     }
     if let mode = event.rawJSON["permission_mode"] as? String {
         sessions[sessionId]?.permissionMode = mode
@@ -1897,6 +1958,22 @@ private func ensureSubagent(
         )
     }
     return true
+}
+
+/// Keep a child's own `model` (Codex child threads report it on their hooks)
+/// on its SubagentState. The parent's model is never used as a stand-in —
+/// `extractMetadata` is skipped for subagent events for the same reason.
+private func recordSubagentModel(
+    sessions: inout [String: SessionSnapshot],
+    sessionId: String,
+    agentId: String,
+    event: HookEvent
+) {
+    guard sessions[sessionId]?.subagents[agentId] != nil,
+          let model = (event.rawJSON["model"] as? String)?
+              .trimmingCharacters(in: .whitespacesAndNewlines),
+          !model.isEmpty else { return }
+    sessions[sessionId]?.subagents[agentId]?.model = model
 }
 
 /// Handle subagent events. Returns true if the event was consumed.

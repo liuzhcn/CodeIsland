@@ -387,12 +387,15 @@ private struct BehaviorPage: View {
     @AppStorage(SettingsKey.collapseOnMouseLeave) private var collapseOnMouseLeave = SettingsDefaults.collapseOnMouseLeave
     @AppStorage(SettingsKey.autoCollapseAfterSessionJump) private var autoCollapseAfterSessionJump = SettingsDefaults.autoCollapseAfterSessionJump
     @AppStorage(SettingsKey.autoExpandOnPermission) private var autoExpandOnPermission = SettingsDefaults.autoExpandOnPermission
+    @AppStorage(SettingsKey.followUpReminderMinutes) private var followUpReminderMinutes = SettingsDefaults.followUpReminderMinutes
     // Seeded through the migration shim so a legacy autoExpandOnCompletion=false
     // shows up as "off" here; writes go to the new key via onChange.
     @State private var completionStyle: String = AppState.completionStyle().rawValue
     @AppStorage(SettingsKey.pluginSessionMode) private var pluginSessionMode = SettingsDefaults.pluginSessionMode
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
+    @AppStorage(SettingsKey.hoverExpandDelay) private var hoverExpandDelay = SettingsDefaults.hoverExpandDelay
+    @AppStorage(SettingsKey.autoExpandOnQuestion) private var autoExpandOnQuestion = SettingsDefaults.autoExpandOnQuestion
     @AppStorage(SettingsKey.sessionTimeout) private var sessionTimeout = SettingsDefaults.sessionTimeout
     @AppStorage(SettingsKey.rotationInterval) private var rotationInterval = SettingsDefaults.rotationInterval
     @AppStorage(SettingsKey.maxToolHistory) private var maxToolHistory = SettingsDefaults.maxToolHistory
@@ -454,6 +457,12 @@ private struct BehaviorPage: View {
                     animation: .smartSuppress
                 )
                 BehaviorToggleRow(
+                    title: l10n["auto_expand_on_question"],
+                    desc: l10n["auto_expand_on_question_desc"],
+                    isOn: $autoExpandOnQuestion,
+                    animation: .smartSuppress
+                )
+                BehaviorToggleRow(
                     title: l10n["collapse_on_mouse_leave"],
                     desc: l10n["collapse_on_mouse_leave_desc"],
                     isOn: $collapseOnMouseLeave,
@@ -475,6 +484,45 @@ private struct BehaviorPage: View {
                         UserDefaults.standard.set(newValue, forKey: SettingsKey.completionNotificationStyle)
                     }
                     Text(l10n["completion_notification_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Picker(l10n["follow_up_reminders"], selection: $followUpReminderMinutes) {
+                        ForEach(FollowUpReminderController.intervalChoices, id: \.self) { minutes in
+                            Text(minutes == 0
+                                 ? l10n["follow_up_off"]
+                                 : String(format: l10n["follow_up_after_minutes"], minutes))
+                                .tag(minutes)
+                        }
+                    }
+                    .onChange(of: followUpReminderMinutes) { _, _ in
+                        appState?.followUps.settingsChanged()
+                    }
+                    Text(l10n["follow_up_reminders_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    let delay = NotchHoverInteraction.expandDelay(forSetting: hoverExpandDelay)
+                    HStack {
+                        Text(l10n["hover_expand_delay"])
+                        Spacer()
+                        Text(String(format: l10n["hover_expand_delay_value"], delay))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { NotchHoverInteraction.expandDelay(forSetting: hoverExpandDelay) },
+                            set: { hoverExpandDelay = NotchHoverInteraction.expandDelay(forSetting: $0) }
+                        ),
+                        in: NotchHoverInteraction.expandDelayRange,
+                        step: NotchHoverInteraction.expandDelayStep
+                    )
+                    .accessibilityLabel(Text(l10n["hover_expand_delay"]))
+                    .accessibilityValue(Text(String(format: l10n["hover_expand_delay_value"], delay)))
+                    Text(l10n["hover_expand_delay_desc"])
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
@@ -539,6 +587,9 @@ private struct BehaviorPage: View {
                             ClaudeConfigPaths.displayPath(ClaudeConfigPaths.configDir())))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
+                Text(l10n["extra_config_dirs_more_hint"])
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
 
             Section(l10n["excluded_hook_cwd_title"]) {
@@ -569,6 +620,8 @@ private struct BehaviorPage: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            PushNotificationsSection()
 
             Section(l10n["sessions"]) {
                 Picker(selection: $sessionTimeout) {
@@ -627,6 +680,11 @@ private struct HooksPage: View {
     @State private var customConfigPath = ""
     @State private var customConfigKey = "hooks"
     @State private var customFormat: HookFormat = .claude
+    @State private var extraDirStatuses: [ExtraConfigDirStatus] = []
+    @State private var newExtraDirCLI: ConfigDirCLI = .claude
+    @State private var newExtraDirPath = ""
+    @State private var extraDirMessage = ""
+    @State private var extraDirMessageIsError = false
 
     private func refreshCLIStatuses() {
         for cli in ConfigInstaller.allCLIs {
@@ -635,6 +693,60 @@ private struct HooksPage: View {
         cliStatuses["opencode"] = ConfigInstaller.isInstalled(source: "opencode")
         cliStatuses["aiwork"] = ConfigInstaller.isInstalled(source: "aiwork")
         cliStatuses["aiwork-cli"] = ConfigInstaller.isInstalled(source: "aiwork-cli")
+        extraDirStatuses = ConfigInstaller.extraConfigDirStatuses()
+    }
+
+    // MARK: Extra config directories
+
+    private func addExtraConfigDir() {
+        let cli = newExtraDirCLI
+        switch ConfigInstaller.addExtraConfigDir(cli: cli, rawPath: newExtraDirPath) {
+        case .failure(let error):
+            extraDirMessage = ExtraConfigDirText.error(error, cli: cli, l10n: l10n)
+            extraDirMessageIsError = true
+        case .success(let added):
+            extraDirMessage = ExtraConfigDirText.added(added.dir, outcome: added.outcome, l10n: l10n)
+            extraDirMessageIsError = added.outcome == .failed
+            newExtraDirPath = ""
+            // Its session store joins the discovery watcher, and sessions
+            // already running under it show up without waiting for a hook.
+            appState?.restartProjectsWatcher()
+        }
+        refreshCLIStatuses()
+    }
+
+    private func removeExtraConfigDir(_ status: ExtraConfigDirStatus) {
+        if let removed = ConfigInstaller.removeExtraConfigDir(id: status.id) {
+            extraDirMessage = String(format: l10n["extra_config_dirs_removed"], ClaudeConfigPaths.displayPath(removed.path))
+            extraDirMessageIsError = false
+            appState?.restartProjectsWatcher()
+        }
+        refreshCLIStatuses()
+    }
+
+    private func setExtraConfigDir(_ status: ExtraConfigDirStatus, enabled: Bool) {
+        if let outcome = ConfigInstaller.setExtraConfigDirEnabled(id: status.id, enabled: enabled),
+           outcome == .failed {
+            extraDirMessage = String(format: l10n["extra_config_dirs_write_failed"], status.displayConfigPath)
+            extraDirMessageIsError = true
+        }
+        appState?.restartProjectsWatcher()
+        refreshCLIStatuses()
+    }
+
+    /// Config dirs are dot-directories, so the panel shows hidden files.
+    private func chooseExtraConfigDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        panel.message = String(format: l10n["extra_config_dirs_panel_message"], newExtraDirCLI.displayName)
+        panel.prompt = l10n["extra_config_dirs_choose_prompt"]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        newExtraDirPath = ClaudeConfigPaths.displayPath(url.path)
     }
 
     private func applySourceToggle(source: String, enabled: Bool) {
@@ -672,6 +784,14 @@ private struct HooksPage: View {
                         exists: exists
                     ) { enabled in applySourceToggle(source: cli.source, enabled: enabled) }
                     .id("\(cli.source)-\(refreshKey)")
+                    // Extra config roots of this CLI, each with its own status.
+                    ForEach(extraDirStatuses.filter { $0.dir.cli.source == cli.source }) { status in
+                        ExtraConfigDirRow(
+                            status: status,
+                            onToggle: { setExtraConfigDir(status, enabled: $0) },
+                            onRemove: { removeExtraConfigDir(status) }
+                        )
+                    }
                 }
                 // OpenCode (plugin-based, not hooks)
                 let ocInstalled = cliStatuses["opencode"] ?? false
@@ -710,6 +830,51 @@ private struct HooksPage: View {
                     exists: dtCliExists
                 ) { enabled in applySourceToggle(source: "aiwork-cli", enabled: enabled) }
                 .id("aiwork-cli-\(refreshKey)")
+            }
+
+            ClaudeDesktopCoworkSection(appState: appState)
+
+            Section(l10n["extra_config_dirs_title"]) {
+                Text(l10n["extra_config_dirs_desc"])
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Picker("", selection: $newExtraDirCLI) {
+                        ForEach(ConfigDirCLI.allCases, id: \.self) { cli in
+                            Text(cli.displayName).tag(cli)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    // Prompt inside the field: a Form row would otherwise render
+                    // the title as a label and squeeze the field between it and
+                    // the buttons.
+                    TextField(
+                        "",
+                        text: $newExtraDirPath,
+                        prompt: Text(String(format: l10n["extra_config_dirs_placeholder"], newExtraDirCLI.environmentKey))
+                    )
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .autocorrectionDisabled(true)
+                    .onSubmit(addExtraConfigDir)
+                    Button(l10n["extra_config_dirs_choose"], action: chooseExtraConfigDir)
+                    Button(l10n["extra_config_dirs_add"], action: addExtraConfigDir)
+                        .disabled(newExtraDirPath.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                if !extraDirMessage.isEmpty {
+                    HStack(alignment: .top, spacing: 4) {
+                        Image(systemName: extraDirMessageIsError ? "xmark.circle.fill" : "checkmark.circle.fill")
+                            .foregroundStyle(extraDirMessageIsError ? .red : .green)
+                        Text(extraDirMessage)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
 
             Section("Custom CLIs") {
@@ -851,6 +1016,167 @@ private struct HooksPage: View {
     }
 }
 
+/// One extra config root, listed under its CLI in "CLI status": where it is,
+/// whether its hooks are in, and — when they cannot be — why.
+private struct ExtraConfigDirRow: View {
+    @ObservedObject private var l10n = L10n.shared
+    let status: ExtraConfigDirStatus
+    let onToggle: (Bool) -> Void
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "arrow.turn.down.right")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .frame(width: 20)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(ClaudeConfigPaths.displayPath(status.dir.path))
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(status.dir.path)
+                detail
+            }
+            Spacer()
+            Toggle("", isOn: Binding(get: { status.dir.enabled }, set: onToggle))
+                .labelsHidden()
+                // The primary under another spelling: nothing to switch here.
+                .disabled(!status.sourceEnabled || status.sameAsPrimary)
+            Button(role: .destructive, action: onRemove) {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help(l10n["extra_config_dirs_remove_help"])
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        if let problem = ExtraConfigDirText.statusProblem(status, l10n: l10n) {
+            HStack(alignment: .top, spacing: 3) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(problem)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.system(size: 11))
+        } else if let note = ExtraConfigDirText.statusNote(status, l10n: l10n) {
+            Text(note)
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+        } else {
+            HStack(spacing: 2) {
+                Text(status.displayConfigPath)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: status.fullConfigPath)])
+                } label: {
+                    Image(systemName: "arrow.right.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.blue)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+/// User-facing wording for extra config roots. Every state that leaves a root
+/// without hooks says why — never a bare "skipped".
+enum ExtraConfigDirText {
+    static func inspection(_ inspection: ConfigDirInspection, cli: ConfigDirCLI, l10n: L10n) -> String? {
+        switch inspection {
+        case .ready:
+            return nil
+        case .missing:
+            return l10n["extra_dir_missing"]
+        case .notADirectory:
+            return l10n["extra_dir_not_directory"]
+        case .unrecognized:
+            return String(format: l10n["extra_dir_unrecognized"], cli.displayName, cli.environmentKey)
+        case .belongsTo(let other):
+            return String(format: l10n["extra_dir_belongs_to"], other.displayName, cli.displayName)
+        }
+    }
+
+    static func error(_ error: ExtraConfigDirError, cli: ConfigDirCLI, l10n: L10n) -> String {
+        switch error {
+        case .invalidPath:
+            return l10n["extra_dir_invalid_path"]
+        case .isPrimary:
+            return String(format: l10n["extra_dir_is_primary"], cli.displayName)
+        case .isHomeDirectory:
+            return String(format: l10n["extra_dir_is_home"], cli.environmentKey)
+        case .containsPrimary(let primary):
+            return String(
+                format: l10n["extra_dir_contains_primary"],
+                cli.displayName, ClaudeConfigPaths.displayPath(primary)
+            )
+        case .duplicate:
+            return l10n["extra_dir_duplicate"]
+        case .unusable(let inspection):
+            return self.inspection(inspection, cli: cli, l10n: l10n) ?? l10n["extra_dir_invalid_path"]
+        }
+    }
+
+    static func added(_ dir: ExtraConfigDir, outcome: ExtraConfigDirInstallOutcome, l10n: L10n) -> String {
+        let path = ClaudeConfigPaths.displayPath(dir.path)
+        switch outcome {
+        case .installed:
+            return String(format: l10n["extra_config_dirs_added"], path)
+        case .sourceDisabled:
+            return String(format: l10n["extra_config_dirs_added_source_off"], path, dir.cli.displayName)
+        case .skipped(let inspection):
+            let reason = self.inspection(inspection, cli: dir.cli, l10n: l10n) ?? ""
+            return String(format: l10n["extra_config_dirs_added_skipped"], path, reason)
+        case .shared(let owner):
+            let file = ConfigInstaller.extraConfigDirCLI(for: dir)?.configPath ?? ""
+            return String(
+                format: l10n["extra_config_dirs_added_shared"],
+                path, file, ClaudeConfigPaths.displayPath(owner)
+            )
+        case .failed:
+            let configPath = ConfigInstaller.extraConfigDirCLI(for: dir)?.displayConfigPath ?? path
+            return String(format: l10n["extra_config_dirs_write_failed"], configPath)
+        }
+    }
+
+    /// Why a registered root has no hooks right now, if something is wrong.
+    static func statusProblem(_ status: ExtraConfigDirStatus, l10n: L10n) -> String? {
+        guard status.sourceEnabled, status.dir.enabled, !status.sameAsPrimary else { return nil }
+        if let reason = inspection(status.inspection, cli: status.dir.cli, l10n: l10n) {
+            return String(format: l10n["extra_dir_hooks_skipped"], reason)
+        }
+        return nil
+    }
+
+    /// Neutral state line (same as the main dir, paused, CLI off, hooks file
+    /// shared with another root, not installed yet); nil when the hooks are
+    /// in and the row shows the config file instead.
+    static func statusNote(_ status: ExtraConfigDirStatus, l10n: L10n) -> String? {
+        // Not an account of its own — it is the primary under another spelling.
+        if status.sameAsPrimary {
+            return String(format: l10n["extra_dir_same_as_primary"], status.dir.cli.displayName)
+        }
+        if !status.sourceEnabled {
+            return String(format: l10n["extra_dir_source_off"], status.dir.cli.displayName)
+        }
+        if !status.dir.enabled { return l10n["extra_dir_paused"] }
+        if let owner = status.sharedHooksWith {
+            let file = String(status.fullConfigPath.dropFirst(status.dir.path.count + 1))
+            return String(format: l10n["extra_dir_shared_hooks"], file, ClaudeConfigPaths.displayPath(owner))
+        }
+        if !status.hooksInstalled { return l10n["not_installed"] }
+        return nil
+    }
+}
+
 private struct CLIStatusRow: View {
     @ObservedObject private var l10n = L10n.shared
     let name: String
@@ -921,6 +1247,13 @@ private struct CLIStatusRow: View {
 
 // MARK: - Appearance Page
 
+/// Card text sizes offered in Settings. The panel keeps a fixed width
+/// (≤ 620pt) and each card header stays on one row, so the range stops at
+/// 16pt rather than growing without bound.
+enum ContentFontSize {
+    static let choices = Array(10...16)
+}
+
 private struct AppearancePage: View {
     @ObservedObject private var l10n = L10n.shared
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
@@ -929,6 +1262,10 @@ private struct AppearancePage: View {
     @AppStorage(SettingsKey.showAgentDetails) private var showAgentDetails = SettingsDefaults.showAgentDetails
     @AppStorage(SettingsKey.showToolStatus) private var showToolStatus = SettingsDefaults.showToolStatus
     @AppStorage(SettingsKey.showGitBranch) private var showGitBranch = SettingsDefaults.showGitBranch
+    @AppStorage(SettingsKey.showTaskProgress) private var showTaskProgress = SettingsDefaults.showTaskProgress
+    @AppStorage(SettingsKey.showSessionRecap) private var showSessionRecap = SettingsDefaults.showSessionRecap
+    @AppStorage(SettingsKey.showModelLabel) private var showModelLabel = SettingsDefaults.showModelLabel
+    @AppStorage(SettingsKey.showProjectName) private var showProjectName = SettingsDefaults.showProjectName
     @AppStorage(SettingsKey.showUsageStats) private var showUsageStats = SettingsDefaults.showUsageStats
     @AppStorage(SettingsKey.showClaudeQuota) private var showClaudeQuota = SettingsDefaults.showClaudeQuota
     @AppStorage(SettingsKey.collapsedWidthScale) private var collapsedWidthScale = SettingsDefaults.collapsedWidthScale
@@ -1031,23 +1368,50 @@ private struct AppearancePage: View {
 
             Section(l10n["content"]) {
                 Picker(l10n["content_font_size"], selection: $contentFontSize) {
-                    Text("10pt").tag(10)
-                    Text(l10n["11pt_default"]).tag(11)
-                    Text("12pt").tag(12)
-                    Text("13pt").tag(13)
+                    ForEach(ContentFontSize.choices, id: \.self) { size in
+                        Text(size == SettingsDefaults.contentFontSize ? l10n["11pt_default"] : "\(size)pt")
+                            .tag(size)
+                    }
                 }
-                Picker(l10n["ai_reply_lines"], selection: $aiMessageLines) {
+                Picker(selection: $aiMessageLines) {
                     Text(l10n["1_line_default"]).tag(1)
                     Text(l10n["2_lines"]).tag(2)
                     Text(l10n["3_lines"]).tag(3)
                     Text(l10n["5_lines"]).tag(5)
                     Text(l10n["unlimited"]).tag(0)
+                } label: {
+                    Text(l10n["ai_reply_lines"])
+                    Text(l10n["ai_reply_lines_desc"])
                 }
                 Toggle(l10n["show_agent_details"], isOn: $showAgentDetails)
                 Toggle(l10n["show_tool_status"], isOn: $showToolStatus)
                 VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["show_project_name"], isOn: $showProjectName)
+                    Text(l10n["show_project_name_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
                     Toggle(l10n["show_git_branch"], isOn: $showGitBranch)
                     Text(l10n["show_git_branch_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["show_task_progress"], isOn: $showTaskProgress)
+                    Text(l10n["show_task_progress_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["show_session_recap"], isOn: $showSessionRecap)
+                    Text(l10n["show_session_recap_desc"])
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(l10n["show_model_label"], isOn: $showModelLabel)
+                    Text(l10n["show_model_label_desc"])
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
@@ -1078,6 +1442,11 @@ private struct AppearancePreview: View {
     private var fs: CGFloat { CGFloat(fontSize) }
     private let green = Color(red: 0.3, green: 0.85, blue: 0.4)
     private let aiColor = Color(red: 0.85, green: 0.47, blue: 0.34)
+    private static let sampleReply = """
+        Found the issue in `auth.ts`:
+        - token refresh was **skipping the expiry check**
+        - stale sessions were never invalidated
+        """
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
@@ -1121,16 +1490,17 @@ private struct AppearancePreview: View {
                             .foregroundStyle(.white.opacity(0.9))
                             .lineLimit(1)
                     }
-                    // AI reply
+                    // AI reply — Markdown, so the preview shows what the
+                    // line cap does to it: a flattened line, or full blocks.
                     HStack(alignment: .top, spacing: 4) {
                         Text("$")
                             .font(.system(size: fs, weight: .bold, design: .monospaced))
                             .foregroundStyle(aiColor)
-                        Text("I've analyzed the codebase and found the issue in the authentication module. The token validation was skipping the expiry check when refreshing sessions.")
-                            .font(.system(size: fs, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.85))
-                            .lineLimit(lineLimit > 0 ? lineLimit : nil)
-                            .truncationMode(.tail)
+                        AssistantReplyText(
+                            text: Self.sampleReply,
+                            fontSize: fs,
+                            lineLimit: lineLimit > 0 ? lineLimit : nil
+                        )
                     }
                     // Working indicator
                     HStack(spacing: 4) {
@@ -1302,6 +1672,7 @@ private struct SoundPage: View {
     @AppStorage(SettingsKey.quietHoursEnabled) private var quietHoursEnabled = SettingsDefaults.quietHoursEnabled
     @AppStorage(SettingsKey.quietHoursStart) private var quietHoursStart = SettingsDefaults.quietHoursStart
     @AppStorage(SettingsKey.quietHoursEnd) private var quietHoursEnd = SettingsDefaults.quietHoursEnd
+    @AppStorage(SettingsKey.autoMuteWhenAway) private var autoMuteWhenAway = SettingsDefaults.autoMuteWhenAway
 
     /// DatePicker works in wall-clock Dates; storage is minutes since midnight.
     private func timeBinding(_ minutes: Binding<Int>) -> Binding<Date> {
@@ -1337,7 +1708,9 @@ private struct SoundPage: View {
                                 set: { soundVolume = Int($0) }
                             ),
                             in: 0...100,
-                            step: 5
+                            // 1 % steps: the low end is tapered (SoundVolumeCurve),
+                            // so single percents are audibly different there.
+                            step: 1
                         )
                         Image(systemName: "speaker.wave.3.fill")
                             .font(.system(size: 10))
@@ -1387,6 +1760,12 @@ private struct SoundPage: View {
                             )
                         }
                         .datePickerStyle(.field)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Toggle(l10n["auto_mute_when_away"], isOn: $autoMuteWhenAway)
+                        Text(l10n["auto_mute_when_away_desc"])
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
                     }
                 }
             }
@@ -1880,10 +2259,19 @@ private struct AboutPage: View {
                 HStack(spacing: 12) {
                     aboutLink("GitHub", icon: "chevron.left.forwardslash.chevron.right", url: "https://github.com/wxtsky/CodeIsland")
                     aboutLink("Issues", icon: "ladybug", url: "https://github.com/wxtsky/CodeIsland/issues")
+                    aboutLink(
+                        String(format: l10n["release_notes_for_version"], AppVersion.current),
+                        icon: "doc.text",
+                        url: ReleaseNotesLink.url(forVersion: AppVersion.current).absoluteString
+                    )
                 }
 
                 // In-app update section
                 updateSection
+
+                if let reason = updater.readOnlyInstallReason {
+                    readOnlyLocationNotice(reason)
+                }
 
                 Button {
                     DiagnosticsExporter.export()
@@ -2000,6 +2388,37 @@ private struct AboutPage: View {
                 }
             }
         }
+    }
+
+    /// Sparkle cannot replace a bundle it may not write, and its failure alert
+    /// never says why. Say it up front, with the one fix that works.
+    private func readOnlyLocationNotice(_ reason: AppInstallLocation.ReadOnlyReason) -> some View {
+        let message: String
+        switch reason {
+        case .translocated: message = l10n["readonly_location_translocated"]
+        case .diskImage: message = l10n["readonly_location_disk_image"]
+        case .readOnlyVolume: message = l10n["readonly_location_volume"]
+        }
+        return VStack(spacing: 8) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.system(size: 13))
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            aboutButton(l10n["open_applications_folder"], icon: "folder") {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications", isDirectory: true))
+            }
+        }
+        .frame(maxWidth: 420)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.08))
+        )
     }
 
     private func aboutButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {

@@ -17,6 +17,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Read before anything else: the launch Apple Event that says "login
+        // item" is only current during this synchronous call.
+        let isLoginLaunch = LaunchContext.isCurrentLaunchAtLogin()
         ProcessInfo.processInfo.disableAutomaticTermination("CodeIsland must stay running")
         ProcessInfo.processInfo.disableSuddenTermination()
         // Pre-set app icon so Dock/menu bar use the packaged bundle icon.
@@ -57,6 +60,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Watch system sleep/wake so the mascot animations pause and re-anchor
         // their periodic schedules instead of pinning a core after wake (#225).
         MascotAnimationGate.shared.start()
+        // Lock / screen saver / display sleep → event sounds hold off.
+        SceneMuteMonitor.shared.start()
+        // Back at the screen: follow-ups held back meanwhile go out now.
+        // Gone from it: approvals / questions a push skipped while the user
+        // was still there go to the phone now.
+        SceneMuteMonitor.shared.onQuietChanged = { [weak appState] isQuiet in
+            if isQuiet {
+                PushNotifier.shared.userLeft()
+            } else {
+                appState?.followUps.wake()
+            }
+        }
+        // Follow-up reminders also reach the phone / chat push channels.
+        appState.connectPushToFollowUps()
 
         panelController = PanelWindowController(appState: appState)
         panelController?.showPanel()
@@ -64,6 +81,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appState.startSessionDiscovery()
         appState.startCodexAppServerWatcher()
         appState.startAiWorkWatcher()
+        appState.startCoworkWatcher()
         RemoteManager.shared.startup()
         codexFailureWatcher = CodexFailureWatcher(state: appState)
         codexFailureWatcher?.start()
@@ -150,7 +168,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // no-ops for Homebrew-installed builds (brew owns those upgrades).
         UpdateChecker.shared.start()
 
-        SoundManager.shared.playBoot()
+        // The jingle confirms a launch the user just made; at login it is
+        // noise on every boot for everyone with Launch at Login on.
+        if isLoginLaunch {
+            Self.log.info("Launched at login — skipping boot sound")
+        } else {
+            SoundManager.shared.playBoot()
+        }
         setupGlobalShortcut()
 
         // Boot animation: brief expand to confirm app is running
@@ -241,16 +265,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-        // Shortcuts act on the card currently on screen, so they target that
-        // card's session rather than the head of the queue. (#308)
-        case .approve:
-            appState.approvePermission(expectedSessionId: appState.surface.approvalSessionId)
-        case .approveAlways:
-            appState.approvePermission(always: true, expectedSessionId: appState.surface.approvalSessionId)
-        case .deny:
-            appState.denyPermission(expectedSessionId: appState.surface.approvalSessionId)
-        case .skipQuestion:
-            appState.skipQuestion(expectedSessionId: appState.surface.questionSessionId)
+        // Card shortcuts act only on the card on screen (#308); with the
+        // request hidden they open its card instead of acting unseen.
+        case .approve, .approveAlways, .deny, .skipQuestion:
+            appState.performCardShortcut(action)
         case .jumpToTerminal:
             if let id = appState.activeSessionId, let session = appState.sessions[id] {
                 TerminalActivator.activate(session: session, sessionId: id)

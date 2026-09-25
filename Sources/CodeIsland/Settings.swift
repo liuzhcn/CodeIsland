@@ -38,8 +38,13 @@ enum SettingsKey {
     static let autoExpandOnPermission = "autoExpandOnPermission"
     static let autoExpandOnCompletion = "autoExpandOnCompletion"
     static let pluginSessionMode = "pluginSessionMode"  // "separate" | "merge" | "hide"
+    // Read-only watch of Claude Desktop's Cowork / local Chat session store
+    static let trackClaudeDesktopCowork = "trackClaudeDesktopCowork"
     static let hapticOnHover = "hapticOnHover"
     static let hapticIntensity = "hapticIntensity"      // 1=light, 2=medium, 3=strong
+    static let hoverExpandDelay = "hoverExpandDelay"    // seconds the pointer rests before the island opens (0.1–1.0)
+    static let showProjectName = "showProjectName"      // false = cards lead with the session title instead of the folder
+    static let autoExpandOnQuestion = "autoExpandOnQuestion"
     static let sessionTimeout = "sessionTimeout"
 
     // Display
@@ -64,9 +69,17 @@ enum SettingsKey {
     static let quietHoursEnabled = "quietHoursEnabled"
     static let quietHoursStart = "quietHoursStart"
     static let quietHoursEnd = "quietHoursEnd"
+    // Follow-up reminders: minutes before re-announcing a waiting approval /
+    // question / unseen completion; 0 = off (see FollowUpReminderController)
+    static let followUpReminderMinutes = "followUpReminderMinutes"
+    // Mute event sounds while the screen is locked or the screen saver runs;
+    // displays that only went to sleep do not count (see SceneMuteState)
+    static let autoMuteWhenAway = "autoMuteWhenAway"
 
     // Session cards
     static let showGitBranch = "showGitBranch"
+    static let showSessionRecap = "showSessionRecap"
+    static let showModelLabel = "showModelLabel"
 
     // Token-usage footer (local Claude transcript aggregation)
     static let showUsageStats = "showUsageStats"
@@ -91,6 +104,8 @@ enum SettingsKey {
 
     // Advanced
     static let maxToolHistory = "maxToolHistory"
+    /// Session cards: agent checklist progress (TaskCreate / TodoWrite / update_plan).
+    static let showTaskProgress = "showTaskProgress"
 
     // Mascot
     static let mascotSpeed = "mascotSpeed"
@@ -133,11 +148,20 @@ enum SettingsKey {
     // Claude Code config dir override (empty = auto-detect). Must match
     // ClaudeConfigPaths.preferenceKey — that resolver is the only reader.
     static let claudeConfigDir = "claude_config_dir"
+    // Extra Claude Code / Codex / Grok config roots (JSON list, Settings → Hooks).
+    // Must match ExtraConfigDirs.preferenceKey — CodeIslandCore reads it directly.
+    static let extraConfigDirs = "extra_config_dirs_v1"
 
     // Webhook forwarding: POST hook events to an external URL
     static let webhookEnabled = "webhookEnabled"
     static let webhookURL = "webhookURL"
     static let webhookEventFilter = "webhookEventFilter"  // comma-separated allow-list; empty = forward all
+    // Push notifications to a phone / chat (Bark, ntfy, DingTalk, Feishu, WeCom, Slack, Telegram)
+    static let pushEnabled = "pushEnabled"
+    static let pushOnlyWhenAway = "pushOnlyWhenAway"
+    static let pushAwayIdleMinutes = "pushAwayIdleMinutes"
+    static let pushSummaryLength = "pushSummaryLength"
+    static let pushChannels = "pushChannels"  // JSON [PushChannelConfig]; empty = nothing configured
 }
 
 struct SettingsDefaults {
@@ -154,8 +178,12 @@ struct SettingsDefaults {
     static let autoExpandOnPermission = true
     static let autoExpandOnCompletion = true
     static let pluginSessionMode = "separate"
+    static let trackClaudeDesktopCowork = true
     static let hapticOnHover = false
     static let hapticIntensity = 1          // 1=light
+    static let hoverExpandDelay = NotchHoverInteraction.expandDelay
+    static let showProjectName = true
+    static let autoExpandOnQuestion = true
     static let sessionTimeout = 30
 
     static let maxPanelHeight = 560
@@ -177,13 +205,18 @@ struct SettingsDefaults {
     static let quietHoursEnabled = false
     static let quietHoursStart = 22 * 60
     static let quietHoursEnd = 8 * 60
+    static let followUpReminderMinutes = 0
+    static let autoMuteWhenAway = true
     static let showGitBranch = true
+    static let showSessionRecap = true
+    static let showModelLabel = false
     static let showUsageStats = true
     static let showClaudeQuota = false
 
     static let rotationInterval = 5
 
     static let maxToolHistory = 20
+    static let showTaskProgress = true
 
     static let mascotSpeed = 100  // percentage: 0–300, 0 = silent
 
@@ -216,10 +249,16 @@ struct SettingsDefaults {
     static let excludedHookCwdSubstrings = ""
 
     static let claudeConfigDir = ""
+    static let extraConfigDirs = ""
 
     static let webhookEnabled = false
     static let webhookURL = ""
     static let webhookEventFilter = ""
+    static let pushEnabled = false
+    static let pushOnlyWhenAway = true
+    static let pushAwayIdleMinutes = 5
+    static let pushSummaryLength = PushMessageFormatter.defaultSummaryLimit
+    static let pushChannels = ""
 }
 
 @MainActor
@@ -243,8 +282,12 @@ class SettingsManager {
             SettingsKey.autoExpandOnPermission: SettingsDefaults.autoExpandOnPermission,
             SettingsKey.autoExpandOnCompletion: SettingsDefaults.autoExpandOnCompletion,
             SettingsKey.pluginSessionMode: SettingsDefaults.pluginSessionMode,
+            SettingsKey.trackClaudeDesktopCowork: SettingsDefaults.trackClaudeDesktopCowork,
             SettingsKey.hapticOnHover: SettingsDefaults.hapticOnHover,
             SettingsKey.hapticIntensity: SettingsDefaults.hapticIntensity,
+            SettingsKey.hoverExpandDelay: SettingsDefaults.hoverExpandDelay,
+            SettingsKey.showProjectName: SettingsDefaults.showProjectName,
+            SettingsKey.autoExpandOnQuestion: SettingsDefaults.autoExpandOnQuestion,
             SettingsKey.sessionTimeout: SettingsDefaults.sessionTimeout,
             SettingsKey.maxPanelHeight: SettingsDefaults.maxPanelHeight,
             SettingsKey.maxVisibleSessions: SettingsDefaults.maxVisibleSessions,
@@ -264,11 +307,16 @@ class SettingsManager {
             SettingsKey.quietHoursEnabled: SettingsDefaults.quietHoursEnabled,
             SettingsKey.quietHoursStart: SettingsDefaults.quietHoursStart,
             SettingsKey.quietHoursEnd: SettingsDefaults.quietHoursEnd,
+            SettingsKey.followUpReminderMinutes: SettingsDefaults.followUpReminderMinutes,
+            SettingsKey.autoMuteWhenAway: SettingsDefaults.autoMuteWhenAway,
             SettingsKey.showGitBranch: SettingsDefaults.showGitBranch,
+            SettingsKey.showSessionRecap: SettingsDefaults.showSessionRecap,
+            SettingsKey.showModelLabel: SettingsDefaults.showModelLabel,
             SettingsKey.showUsageStats: SettingsDefaults.showUsageStats,
             SettingsKey.showClaudeQuota: SettingsDefaults.showClaudeQuota,
             SettingsKey.rotationInterval: SettingsDefaults.rotationInterval,
             SettingsKey.maxToolHistory: SettingsDefaults.maxToolHistory,
+            SettingsKey.showTaskProgress: SettingsDefaults.showTaskProgress,
             SettingsKey.mascotSpeed: SettingsDefaults.mascotSpeed,
             SettingsKey.sessionGroupingMode: SettingsDefaults.sessionGroupingMode,
             SettingsKey.showToolStatus: SettingsDefaults.showToolStatus,
@@ -286,9 +334,15 @@ class SettingsManager {
             SettingsKey.autoApproveSources: SettingsDefaults.autoApproveSources,
             SettingsKey.excludedHookCwdSubstrings: SettingsDefaults.excludedHookCwdSubstrings,
             SettingsKey.claudeConfigDir: SettingsDefaults.claudeConfigDir,
+            SettingsKey.extraConfigDirs: SettingsDefaults.extraConfigDirs,
             SettingsKey.webhookEnabled: SettingsDefaults.webhookEnabled,
             SettingsKey.webhookURL: SettingsDefaults.webhookURL,
             SettingsKey.webhookEventFilter: SettingsDefaults.webhookEventFilter,
+            SettingsKey.pushEnabled: SettingsDefaults.pushEnabled,
+            SettingsKey.pushOnlyWhenAway: SettingsDefaults.pushOnlyWhenAway,
+            SettingsKey.pushAwayIdleMinutes: SettingsDefaults.pushAwayIdleMinutes,
+            SettingsKey.pushSummaryLength: SettingsDefaults.pushSummaryLength,
+            SettingsKey.pushChannels: SettingsDefaults.pushChannels,
         ])
     }
 

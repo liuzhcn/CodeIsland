@@ -1,4 +1,5 @@
 import AppKit
+import CodeIslandCore
 
 /// Plays 8-bit sound effects in response to hook events
 @MainActor
@@ -12,12 +13,18 @@ class SoundManager {
         ("SessionStart",      "8bit_start",    SettingsKey.soundSessionStart,   "会话开始"),
         ("TaskRoundComplete", "8bit_complete",  SettingsKey.soundTaskComplete,   "任务完成"),
         ("Stop",              "8bit_complete",  SettingsKey.soundTaskComplete,   "任务完成"),
-        ("PostToolUseFailure","8bit_error",     SettingsKey.soundTaskError,      "任务错误"),
+        // A whole turn that died (API error, rate limit…) — not a single failed
+        // tool call, which the agent recovers from on its own.
+        (EventSoundRouting.turnFailed, "8bit_error", SettingsKey.soundTaskError, "任务错误"),
         ("PermissionRequest", "8bit_approval",  SettingsKey.soundApprovalNeeded, "需要审批"),
         ("UserPromptSubmit",  "8bit_submit",    SettingsKey.soundPromptSubmit,   "任务确认"),
     ]
 
     private var soundCache: [String: NSSound] = [:]
+
+    /// A failing session tends to fail again seconds later (the user retries
+    /// into the same rate limit); one error jingle per burst is the signal.
+    private var turnFailureDebouncer = SoundDebouncer(window: 60)
 
     /// Where a *decided* event sound goes. Production plays it; a test installs
     /// a recorder and asserts on the names it receives.
@@ -50,19 +57,24 @@ class SoundManager {
         }
     }
 
-    /// Called from AppState.handleEvent() to trigger appropriate sounds
-    func handleEvent(_ eventName: String) {
+    /// Called from AppState.handleEvent() to trigger appropriate sounds.
+    /// `sessionId` scopes the turn-failure debounce; nil shares one bucket.
+    func handleEvent(_ eventName: String, sessionId: String? = nil, now: Date = Date()) {
         guard defaults.bool(forKey: SettingsKey.soundEnabled) else { return }
-        guard !quietHoursActive else { return }
+        guard !isEventSoundDeferred else { return }
         guard let entry = Self.eventSounds.first(where: { $0.event == eventName }) else { return }
         guard defaults.bool(forKey: entry.key) else { return }
+        if eventName == EventSoundRouting.turnFailed,
+           !turnFailureDebouncer.shouldPlay(key: sessionId ?? "", now: now) {
+            return
+        }
         emit(entry.sound)
     }
 
     /// Play boot sound on app launch
     func playBoot() {
         guard defaults.bool(forKey: SettingsKey.soundEnabled) else { return }
-        guard !quietHoursActive else { return }
+        guard !isEventSoundDeferred else { return }
         guard defaults.bool(forKey: SettingsKey.soundBoot) else { return }
         emit("8bit_boot")
     }
@@ -76,7 +88,25 @@ class SoundManager {
         return m >= start || m < end
     }
 
+    /// Whether event sounds are held back right now for a reason that will
+    /// pass on its own — quiet hours, or nobody at the screen (locked, screen
+    /// saver running). Distinct from the master toggle and the
+    /// per-event toggles, which are standing choices: follow-up reminders
+    /// wait out a deferral and catch up afterwards, but never a choice.
     /// Settings previews stay audible: only event-driven sounds are gated.
+    var isEventSoundDeferred: Bool {
+        quietHoursActive || awayMuteActive
+    }
+
+    /// Scene auto-mute, on unless the user turned it off. Read through
+    /// `object(forKey:)` so an unregistered default still means "on".
+    private var awayMuteActive: Bool {
+        let enabled = defaults.object(forKey: SettingsKey.autoMuteWhenAway) == nil
+            ? SettingsDefaults.autoMuteWhenAway
+            : defaults.bool(forKey: SettingsKey.autoMuteWhenAway)
+        return enabled && SceneMuteMonitor.shared.isQuietScene
+    }
+
     private var quietHoursActive: Bool {
         guard defaults.bool(forKey: SettingsKey.quietHoursEnabled) else { return false }
         let comps = Calendar.current.dateComponents([.hour, .minute], from: Date())
@@ -105,8 +135,7 @@ class SoundManager {
             return
         }
         if sound.isPlaying { sound.stop() }
-        let volume = defaults.integer(forKey: SettingsKey.soundVolume)
-        sound.volume = Float(volume) / 100.0
+        sound.volume = SoundVolumeCurve.amplitude(forPercent: defaults.integer(forKey: SettingsKey.soundVolume))
         sound.play()
     }
 
@@ -118,8 +147,7 @@ class SoundManager {
             return
         }
         if sound.isPlaying { sound.stop() }
-        let volume = defaults.integer(forKey: SettingsKey.soundVolume)
-        sound.volume = Float(volume) / 100.0
+        sound.volume = SoundVolumeCurve.amplitude(forPercent: defaults.integer(forKey: SettingsKey.soundVolume))
         sound.play()
     }
 

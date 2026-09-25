@@ -40,6 +40,19 @@ public struct ConversationTailDelta: Equatable, Sendable {
     /// File path paired with `attachmentToken`; an additional guard against
     /// applying a delta after the session switched rollout files.
     public let filePath: String?
+    /// Checklist events (TaskCreate/TodoWrite/update_plan rows, new prompts)
+    /// in transcript order. See `AgentTaskTranscript`.
+    public let taskEvents: [AgentTaskEvent]
+    // Session metadata (recap + model label).
+    /// Newest `away_summary` recap that no later user prompt in the chunk superseded.
+    public let sessionRecap: SessionRecap?
+    /// Model / reasoning effort of the newest main-thread turn in the chunk.
+    public let modelObservation: ModelObservation?
+    /// The file was replaced and this chunk re-reads it from the start: it is
+    /// the new file's history, not things that just happened.
+    public let replaysWholeFile: Bool
+    /// A `/model` switch in the chunk turned the 1M context variant on or off.
+    public let configuredLongContext: Bool?
 
     public init(
         sessionId: String,
@@ -49,7 +62,12 @@ public struct ConversationTailDelta: Equatable, Sendable {
         hasActivity: Bool = false,
         cursorQuestion: CursorQuestionSignal? = nil,
         attachmentToken: UUID? = nil,
-        filePath: String? = nil
+        filePath: String? = nil,
+        taskEvents: [AgentTaskEvent] = [],
+        sessionRecap: SessionRecap? = nil,
+        modelObservation: ModelObservation? = nil,
+        replaysWholeFile: Bool = false,
+        configuredLongContext: Bool? = nil
     ) {
         self.sessionId = sessionId
         self.lastUserPrompt = lastUserPrompt
@@ -59,12 +77,20 @@ public struct ConversationTailDelta: Equatable, Sendable {
         self.cursorQuestion = cursorQuestion
         self.attachmentToken = attachmentToken
         self.filePath = filePath
+        self.taskEvents = taskEvents
+        self.sessionRecap = sessionRecap
+        self.modelObservation = modelObservation
+        self.replaysWholeFile = replaysWholeFile
+        self.configuredLongContext = configuredLongContext
     }
 
     /// A delta only carries signal when at least one field is non-nil.
     public var isEmpty: Bool {
         lastUserPrompt == nil && lastAssistantMessage == nil && turnStatus == nil
             && !hasActivity && cursorQuestion == nil
+            && taskEvents.isEmpty
+            && sessionRecap == nil && modelObservation == nil
+            && configuredLongContext == nil
     }
 }
 
@@ -92,6 +118,8 @@ public final class JSONLTailer: @unchecked Sendable {
         var source: DispatchSourceFileSystemObject
         let generation: UInt64
         let attachmentToken: UUID
+        /// The next read re-reads a replaced file from its start.
+        var replayPending: Bool
 
         init(
             sessionId: String,
@@ -101,7 +129,8 @@ public final class JSONLTailer: @unchecked Sendable {
             inode: ino_t,
             source: DispatchSourceFileSystemObject,
             generation: UInt64,
-            attachmentToken: UUID
+            attachmentToken: UUID,
+            replayPending: Bool
         ) {
             self.sessionId = sessionId
             self.filePath = filePath
@@ -112,6 +141,7 @@ public final class JSONLTailer: @unchecked Sendable {
             self.source = source
             self.generation = generation
             self.attachmentToken = attachmentToken
+            self.replayPending = replayPending
         }
     }
 
@@ -140,8 +170,15 @@ public final class JSONLTailer: @unchecked Sendable {
 
     // MARK: - Public API
 
+    /// Start tailing `filePath`.
+    ///
+    /// - Parameter initialOffset: where the caller's own backfill stopped
+    ///   (``scanTailForAttach(path:maxBytes:)``'s `endOffset`). Lines from
+    ///   there on are delivered — including any appended before the watch was
+    ///   armed, read right away rather than on the next write. nil starts at
+    ///   the end of the file as it is when the watch opens it.
     @discardableResult
-    public func attach(sessionId: String, filePath: String) -> UUID {
+    public func attach(sessionId: String, filePath: String, initialOffset: UInt64? = nil) -> UUID {
         let attachmentToken = UUID()
         queue.async { [weak self] in
             guard let self else { return }
@@ -151,7 +188,8 @@ public final class JSONLTailer: @unchecked Sendable {
             self.attachOnQueue(
                 sessionId: sessionId,
                 filePath: filePath,
-                initialOffset: nil,
+                initialOffset: initialOffset.map { off_t(clamping: $0) },
+                readPendingBytes: initialOffset != nil,
                 generation: generation,
                 attachmentToken: attachmentToken
             )
@@ -196,6 +234,8 @@ public final class JSONLTailer: @unchecked Sendable {
         sessionId: String,
         filePath: String,
         initialOffset: off_t?,
+        readPendingBytes: Bool = false,
+        replacesFile: Bool = false,
         generation: UInt64,
         attachmentToken: UUID
     ) {
@@ -225,7 +265,9 @@ public final class JSONLTailer: @unchecked Sendable {
             inode: fileStat.st_ino,
             source: source,
             generation: generation,
-            attachmentToken: attachmentToken
+            attachmentToken: attachmentToken,
+            // An empty replacement has no history; what it gets next is news.
+            replayPending: replacesFile && fileStat.st_size > offset
         )
 
         source.setEventHandler { [weak self] in
@@ -239,6 +281,14 @@ public final class JSONLTailer: @unchecked Sendable {
 
         watches[sessionId] = watch
         source.resume()
+        // Bytes written after the caller's backfill stopped but before the
+        // source was armed raise no event of their own; don't leave them
+        // waiting for the next write (a finished turn may never write again).
+        // A replaced file's history is read now too, as its own replay chunk,
+        // so the next write arrives as live news.
+        if readPendingBytes || replacesFile, fileStat.st_size > offset {
+            handleEvents([], watch: watch)
+        }
     }
 
     private func detachOnQueue(sessionId: String) {
@@ -267,6 +317,7 @@ public final class JSONLTailer: @unchecked Sendable {
                     sessionId: sid,
                     filePath: path,
                     initialOffset: 0,
+                    replacesFile: true,
                     generation: watch.generation,
                     attachmentToken: watch.attachmentToken
                 )
@@ -285,6 +336,7 @@ public final class JSONLTailer: @unchecked Sendable {
                     sessionId: sid,
                     filePath: path,
                     initialOffset: 0,
+                    replacesFile: true,
                     generation: watch.generation,
                     attachmentToken: watch.attachmentToken
                 )
@@ -298,6 +350,8 @@ public final class JSONLTailer: @unchecked Sendable {
         }
 
         guard let appended = readFromOffset(watch: watch) else { return }
+        let replaysWholeFile = watch.replayPending
+        watch.replayPending = false
         let combined = watch.pendingFragment + appended
 
         let scan = JSONLTailer.scanLines(combined)
@@ -320,7 +374,12 @@ public final class JSONLTailer: @unchecked Sendable {
                 hasActivity: scan.delta.hasActivity,
                 cursorQuestion: scan.delta.cursorQuestion,
                 attachmentToken: watch.attachmentToken,
-                filePath: watch.filePath
+                filePath: watch.filePath,
+                taskEvents: scan.delta.taskEvents,
+                sessionRecap: scan.delta.sessionRecap,
+                modelObservation: scan.delta.modelObservation,
+                replaysWholeFile: replaysWholeFile,
+                configuredLongContext: scan.delta.configuredLongContext
             )
             onDelta(delta)
         }
@@ -351,14 +410,27 @@ public final class JSONLTailer: @unchecked Sendable {
 
     public struct ScanResult: Equatable {
         public struct Delta: Equatable {
-            public var lastUserPrompt: String?
+            public var lastUserPrompt: String? {
+                // Lines are applied in file order, so a prompt seen after a
+                // recap in the same chunk means the recap is already stale.
+                didSet { if lastUserPrompt != nil { sessionRecap = nil } }
+            }
             public var lastAssistantMessage: String?
             public var turnStatus: ConversationTurnStatus?
             public var hasActivity = false
             public var cursorQuestion: CursorQuestionSignal?
+            public var taskEvents: [AgentTaskEvent] = []
+            // Session metadata (recap + model label).
+            public var sessionRecap: SessionRecap?
+            public var modelObservation: ModelObservation?
+            /// A `/model` switch's word on the 1M context variant.
+            public var configuredLongContext: Bool?
             public var isEmpty: Bool {
                 lastUserPrompt == nil && lastAssistantMessage == nil && turnStatus == nil
                     && !hasActivity && cursorQuestion == nil
+                    && taskEvents.isEmpty
+                    && sessionRecap == nil && modelObservation == nil
+                    && configuredLongContext == nil
             }
         }
         public let delta: Delta
@@ -400,6 +472,68 @@ public final class JSONLTailer: @unchecked Sendable {
         scanLines(data).delta.cursorQuestion
     }
 
+    /// Scan the last `maxBytes` of a transcript with the same rules as the live
+    /// tail, for attach-time backfill of recap / model state. The first line of
+    /// the window is usually cut mid-way; it fails to parse and is skipped.
+    /// nil when the file can't be read.
+    public static func scanFileTail(path: String, maxBytes: Int = 128 * 1024) -> ScanResult.Delta? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return nil }
+        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              var data = try? handle.readToEnd() else { return nil }
+        // The last line may still be mid-write; a newline makes the scan treat
+        // it as complete, and an incomplete one simply fails to parse.
+        data.append(0x0A)
+        return scanLines(data).delta
+    }
+
+    /// An attach-time scan of a transcript's tail, plus where it stopped.
+    public struct AttachScan: Equatable {
+        public let delta: ScanResult.Delta
+        /// Just past the last complete line when the scan ran. Hand it to
+        /// ``attach(sessionId:filePath:initialOffset:)`` (and to any other
+        /// backfill) so every line is read exactly once: a line still being
+        /// written, or appended after the scan, belongs to the live tail.
+        public let endOffset: UInt64
+    }
+
+    /// Scan the last `maxBytes` of a transcript — the attach-time backfill of
+    /// recap / model state, by the same rules as the live tail. nil when the
+    /// file can't be read.
+    public static func scanTailForAttach(path: String, maxBytes: Int = 128 * 1024) -> AttachScan? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return nil }
+        // One byte before the window says whether it starts on a line boundary.
+        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) - 1 : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.read(upToCount: Int(size - start)) ?? Data() else { return nil }
+
+        var firstLine = data.startIndex
+        if start > 0 {
+            // The window's first line is cut unless the byte before it ended
+            // one. No newline at all: the window sits inside one huge row (a
+            // tool result) — nothing to scan, and the tailer starts at the end.
+            guard let boundary = data.firstIndex(of: 0x0A) else {
+                return AttachScan(delta: ScanResult.Delta(), endOffset: size)
+            }
+            firstLine = data.index(after: boundary)
+        }
+        // The tailer starts after the last newline. The unterminated rest is
+        // either a row still being written (it fails to parse here, and the
+        // tailer completes it) or a writer that never ends its last row with a
+        // newline (Cursor), whose row is parsed now and again once terminated —
+        // harmless for the idempotent recap / model / prompt fields.
+        let endOffset = data.lastIndex(of: 0x0A).map {
+            start + UInt64(data.distance(from: data.startIndex, to: $0) + 1)
+        } ?? start
+        var window = Data(data[firstLine...])
+        window.append(0x0A)
+        return AttachScan(delta: scanLines(window).delta, endOffset: endOffset)
+    }
+
     private static func apply(line: Data.SubSequence, into delta: inout ScanResult.Delta) {
         // Materialize the slice once so the byte probe and the JSON parser share a
         // single allocation. Going through `Data(line)` also sidesteps a Foundation
@@ -416,6 +550,11 @@ public final class JSONLTailer: @unchecked Sendable {
         guard let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { return }
         if json["isMeta"] as? Bool == true { return }
 
+        // Checklist progress rides on rows this scanner already decodes
+        // (Claude user/assistant, Codex event_msg + update_plan calls), so it
+        // costs no extra JSON parse on the streaming path.
+        delta.taskEvents.append(contentsOf: AgentTaskTranscript.events(fromLine: json))
+
         // Re-verify the type after a real parse — the byte probe can be fooled by
         // nested content that happens to contain the literal `"type":"assistant"`.
         let type = json["type"] as? String
@@ -424,7 +563,21 @@ public final class JSONLTailer: @unchecked Sendable {
         switch type {
         case "user", "USER_INPUT":
             if let text = extractText(from: message["content"]) {
-                delta.lastUserPrompt = text
+                switch claudeCommandEcho(text) {
+                case .local?:
+                    // /model, /effort, /clear…: no turn, so no new prompt —
+                    // and no reason to drop the recap. /model's output is the
+                    // only record of a switch to or from the 1M variant; a
+                    // model seen earlier in the chunk predates it.
+                    if let longContext = ModelLabel.longContextSwitch(inCommandOutput: text) {
+                        delta.configuredLongContext = longContext
+                        delta.modelObservation = nil
+                    }
+                case .prompt(let command)?:
+                    delta.lastUserPrompt = command
+                case nil:
+                    delta.lastUserPrompt = text
+                }
             }
         case "assistant", "PLANNER_RESPONSE":
             if let text = extractText(from: message["content"]) {
@@ -434,6 +587,27 @@ public final class JSONLTailer: @unchecked Sendable {
                 if !trimmed.isEmpty {
                     delta.lastAssistantMessage = trimmed
                 }
+            }
+            // Claude: `message.model` + top-level effort. Sidechain lines are a
+            // subagent's turns (older CLIs inlined them in the parent file) and
+            // must not relabel the parent with the subagent's model.
+            if json["isSidechain"] as? Bool != true,
+               let observation = ModelObservation.from(
+                   model: message["model"],
+                   effort: (json["perTurnEffort"] as? String) ?? (json["effort"] as? String),
+                   timestamp: json["timestamp"]
+               ) {
+                delta.modelObservation = observation
+            }
+        case "system":
+            // Claude Code's idle recap; other system subtypes carry nothing we show.
+            if let recap = SessionRecap.from(transcriptLine: json) {
+                delta.sessionRecap = recap
+            }
+        case "turn_context":
+            // Codex writes the turn's model and effort once per turn.
+            if let observation = ModelObservation.fromCodexTurnContext(json) {
+                delta.modelObservation = observation
             }
         case "response_item":
             if let payload = json["payload"] as? [String: Any],
@@ -484,6 +658,45 @@ public final class JSONLTailer: @unchecked Sendable {
                 applyCursorRoleLine(role: role, message: message, into: &delta)
             }
         }
+    }
+
+    /// How Claude Code records a slash command typed in the terminal.
+    public enum ClaudeCommandEcho: Equatable {
+        /// A built-in the CLI handles itself (/model, /effort, /clear,
+        /// /compact) or that command's output. Written as a plain user row
+        /// (`isMeta: false`), but it starts no turn and is not a prompt.
+        case local
+        /// A prompt command (skill, custom command) that does start a turn,
+        /// as the user typed it: "/design tidy the layout".
+        case prompt(String)
+    }
+
+    /// Classify a user row's text as a slash-command echo, or nil for an
+    /// ordinary prompt. Built-ins lead with `<command-name>` and are followed
+    /// by `<local-command-stdout>`; prompt commands lead with
+    /// `<command-message>` and are followed by their expanded prompt (an
+    /// `isMeta` row).
+    public static func claudeCommandEcho(_ text: String) -> ClaudeCommandEcho? {
+        let trimmed = text.drop { $0.isWhitespace }
+        guard trimmed.first == "<" else { return nil }
+        for tag in localCommandTags where trimmed.hasPrefix(tag) {
+            return .local
+        }
+        guard trimmed.hasPrefix("<command-message>"),
+              var name = taggedValue("command-name", in: trimmed), !name.isEmpty else { return nil }
+        if !name.hasPrefix("/") { name = "/" + name }
+        let args = taggedValue("command-args", in: trimmed) ?? ""
+        return .prompt(args.isEmpty ? name : "\(name) \(args)")
+    }
+
+    private static let localCommandTags = [
+        "<command-name>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+    ]
+
+    private static func taggedValue(_ tag: String, in text: Substring) -> String? {
+        guard let open = text.range(of: "<\(tag)>"),
+              let close = text.range(of: "</\(tag)>", range: open.upperBound..<text.endIndex) else { return nil }
+        return text[open.upperBound..<close.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Extract assistant text that Codex deliberately persists for display.
@@ -648,6 +861,10 @@ public final class JSONLTailer: @unchecked Sendable {
         case codexEvent
         case codexResponseItem
         case cursorRole
+        /// Claude `system` line whose subtype is `away_summary` (session recap).
+        case claudeRecap
+        /// Codex `turn_context` (the turn's model + reasoning effort).
+        case codexTurnContext
         case irrelevant
     }
 
@@ -707,7 +924,21 @@ public final class JSONLTailer: @unchecked Sendable {
                         case 0x72:  // 'r'
                             if hasExactValue(ptr, at: valueStart, total: total, expect: responseItemBytes) {
                                 return isCodexPublicResponseCandidate(ptr, total: total)
+                                    || isCodexPlanUpdateCandidate(ptr, total: total)
                                     ? .codexResponseItem : .irrelevant
+                            }
+                        case 0x73:  // 's'
+                            // Only the recap subtype earns a parse; turn_duration /
+                            // stop_hook_summary rows stay on the skip path. The
+                            // subtype sits right after `type`, so a bounded probe
+                            // keeps an unusually long system row O(1) here.
+                            if hasExactValue(ptr, at: valueStart, total: total, expect: systemBytes),
+                               containsMarker(ptr, total: min(total, 4096), marker: awaySummaryMarker) {
+                                return .claudeRecap
+                            }
+                        case 0x74:  // 't'
+                            if hasExactValue(ptr, at: valueStart, total: total, expect: turnContextBytes) {
+                                return .codexTurnContext
                             }
                         default:
                             break
@@ -759,6 +990,9 @@ public final class JSONLTailer: @unchecked Sendable {
 
     private static let eventMsgBytes: [UInt8] = Array(#"event_msg""#.utf8)
     private static let responseItemBytes: [UInt8] = Array(#"response_item""#.utf8)
+    private static let systemBytes: [UInt8] = Array(#"system""#.utf8)
+    private static let awaySummaryMarker: [UInt8] = Array(#""subtype":"away_summary""#.utf8)
+    private static let turnContextBytes: [UInt8] = Array(#"turn_context""#.utf8)
     private static let codexMessagePayloadMarker: [UInt8] = Array(
         #""payload":{"type":"message","#.utf8
     )
@@ -784,6 +1018,18 @@ public final class JSONLTailer: @unchecked Sendable {
         return containsMarker(ptr, total: prefixLength, marker: codexMessagePayloadMarker)
             && containsMarker(ptr, total: prefixLength, marker: codexAssistantRoleMarker)
             && containsMarker(ptr, total: prefixLength, marker: codexOutputTextMarker)
+    }
+
+    private static let codexPlanUpdateMarker: [UInt8] = Array(#""name":"update_plan""#.utf8)
+
+    /// `update_plan` calls carry the checklist (`AgentTaskTranscript`). The
+    /// tool name sits right after the payload type, so the same bounded prefix
+    /// probe keeps every other function call on the no-parse path.
+    private static func isCodexPlanUpdateCandidate(
+        _ ptr: UnsafePointer<UInt8>,
+        total: Int
+    ) -> Bool {
+        containsMarker(ptr, total: min(total, 4096), marker: codexPlanUpdateMarker)
     }
 
     private static func containsMarker(

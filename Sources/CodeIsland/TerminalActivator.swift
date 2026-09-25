@@ -95,8 +95,21 @@ struct TerminalActivator {
         sessionId: String? = nil,
         allowHerdr: Bool = true
     ) {
+        guard session.canActivateSession else { return }
+        // Every caller is a user action (click, shortcut, Buddy button): the
+        // user is now dealing with this session, so its follow-ups stop.
+        if let sessionId {
+            NotificationCenter.default.post(
+                name: .codeIslandDidJumpToSession, object: nil, userInfo: ["sessionId": sessionId]
+            )
+        }
         if let url = session.codexDesktopURL, NSWorkspace.shared.open(url) { return }
         guard !session.isRemote else { return }
+        // Claude Desktop Cowork/Chat cards come from Claude's session store, not
+        // a terminal: open that exact conversation in Claude Desktop.
+        if let sessionId, AppState.openCoworkSession(sessionKey: sessionId) {
+            return
+        }
         // A UI harness (T3 Code) owns the conversation: the terminal/multiplexer
         // env the CLI inherited belongs to wherever the harness server was
         // started, so jump to the harness instead — before Herdr/tmux routing,
@@ -422,6 +435,7 @@ struct TerminalActivator {
         // already off-main — match the rest of the activator and run it on a
         // userInitiated background queue so a stuck `tmux display-message`
         // can't freeze the UI. See #139.
+        let scriptRunner = AppleScriptRunner.current
         DispatchQueue.global(qos: .userInitiated).async {
         // Resolve tmux title prefix (most reliable for tmux sessions in Ghostty).
         // Example Ghostty title often contains: "<session>:<winIdx>:<winName> - ..."
@@ -618,11 +632,10 @@ struct TerminalActivator {
             end tell
         end try
         """
-        // Use /usr/bin/osascript to run AppleScript out-of-process (tmuxcc uses the same approach).
-        // This avoids relying on NSAppleScript execution inside the app process.
-        // Already on a background queue (see DispatchQueue.global wrap above) — call the
-        // _Sync variant to skip an extra dispatch hop.
-        runOsaScriptSync(script)
+        // Out of process like every other activation script (see AppleScriptRunner).
+        // Already on a background queue (see DispatchQueue.global wrap above), so
+        // launch directly instead of paying runAppleScript's extra dispatch hop.
+        scriptRunner.launch(script)
         } // end DispatchQueue.global async
     }
 
@@ -1329,31 +1342,16 @@ struct TerminalActivator {
         return "Terminal"
     }
 
+    /// Fire-and-forget, off the caller's queue as before, so a click on the main
+    /// thread never waits for osascript to spawn. Out of process rather than
+    /// NSAppleScript, which is main-thread-only — see AppleScriptRunner. The
+    /// runner is read here, not on the queue, so a test that swaps it around a
+    /// call sees that call's script.
     private static func runAppleScript(_ source: String) {
+        let runner = AppleScriptRunner.current
         DispatchQueue.global(qos: .userInitiated).async {
-            if let script = NSAppleScript(source: source) {
-                var error: NSDictionary?
-                script.executeAndReturnError(&error)
-            }
+            runner.launch(source)
         }
-    }
-
-    private static func runOsaScript(_ source: String) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            runOsaScriptSync(source)
-        }
-    }
-
-    /// Run osascript on the current queue (no extra dispatch). Use from
-    /// callers that are already on a background queue to avoid the double
-    /// hop activateGhostty would otherwise pay (#139 review).
-    private static func runOsaScriptSync(_ source: String) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", source]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
     }
 
     /// Escape special characters for AppleScript string interpolation
