@@ -82,10 +82,37 @@ final class RemoteManagerTests: XCTestCase {
             XCTAssertEqual(state.sessions.count, 1)
             XCTAssertEqual(state.activeSessionCount, 1)
             XCTAssertEqual(state.sessions["remote:remote-test:same-thread"]?.providerSessionId, record.id)
-            state.handleEvent(try hook("Stop"))
+            // A missed Stop hook must still be reconciled by the next scan.
             state.reconcileRemoteCodexSessions([], hostId: "remote-test", hostName: "server", cwdFilter: "")
             XCTAssertEqual(state.activeSessionCount, 0)
         }
+    }
+
+    func testRemoteScanRemovesHookOnlyCardWithoutStop() throws {
+        let state = AppState()
+        let data = try JSONSerialization.data(withJSONObject: [
+            "hook_event_name": "UserPromptSubmit", "session_id": "ended-thread",
+            "_source": "codex", "_remote_host_id": "remote-test",
+            "cwd": "/remote/project"
+        ])
+        state.handleEvent(try XCTUnwrap(HookEvent(from: data)))
+        XCTAssertEqual(state.activeSessionCount, 1)
+        // An unknown hook may be a CLI task, so an empty desktop scan keeps it.
+        state.reconcileRemoteCodexSessions([], hostId: "remote-test", hostName: "server", cwdFilter: "")
+        XCTAssertEqual(state.activeSessionCount, 1)
+        let cliData = try JSONSerialization.data(withJSONObject: [
+            "hook_event_name": "UserPromptSubmit", "session_id": "cli-thread",
+            "_source": "codex", "_remote_host_id": "remote-test",
+            "cwd": "/remote/project"
+        ])
+        state.handleEvent(try XCTUnwrap(HookEvent(from: cliData)))
+        let ended = RemoteCodexSession(id: "ended-thread", cwd: "/remote/project", model: nil,
+                                       title: nil, modifiedAt: Date().timeIntervalSince1970,
+                                       startedAt: 0, isActive: false)
+        state.reconcileRemoteCodexSessions([ended], hostId: "remote-test", hostName: "server", cwdFilter: "")
+        XCTAssertEqual(state.activeSessionCount, 1)
+        XCTAssertNil(state.sessions["remote:remote-test:ended-thread"])
+        XCTAssertNotNil(state.sessions["remote:remote-test:cli-thread"])
     }
 
     func testRecoverySkipsManualDisconnectAndInFlightConnections() {

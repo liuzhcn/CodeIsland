@@ -384,6 +384,18 @@ final class AppState {
         return daemonBackedSources.contains(normalized)
     }
 
+    nonisolated static func shouldExpireUnmonitoredSession(_ session: SessionSnapshot, now: Date = Date()) -> Bool {
+        // Desktop turns are ended by lifecycle/transcript events, not silence while thinking.
+        guard session.status != .idle, !session.isRemote,
+              !(session.source == "codex" && session.termBundleId == codexAppBundleId) else { return false }
+        let threshold: TimeInterval
+        switch session.status {
+        case .waitingApproval, .waitingQuestion: threshold = 300
+        default: threshold = session.currentTool != nil ? 180 : 300
+        }
+        return now.timeIntervalSince(session.lastActivity) > threshold
+    }
+
     private func cleanupIdleSessions() {
         // 1. Verify monitored PIDs are still alive (DispatchSource can silently miss exits)
         //    Also kill orphaned processes (ppid <= 1, terminal closed but process survived).
@@ -429,17 +441,8 @@ final class AppState {
         //    events for >180s shouldn't be force-flipped to idle here — it'll then be
         //    swept by Section 4. Remote session lifecycle is driven by remote-end hooks
         //    and SSH connection state in RemoteManager, not by local timeouts. (#121)
-        for (key, session) in sessions
-            where processMonitors[key] == nil
-            && session.status != .idle
-            && !session.isRemote {
-            let elapsed = -session.lastActivity.timeIntervalSinceNow
-            let threshold: TimeInterval
-            switch session.status {
-            case .waitingApproval, .waitingQuestion: threshold = 300
-            default: threshold = session.currentTool != nil ? 180 : 300
-            }
-            if elapsed > threshold {
+        for (key, session) in sessions where processMonitors[key] == nil {
+            if Self.shouldExpireUnmonitoredSession(session) {
                 sessions[key]?.status = .idle
                 sessions[key]?.currentTool = nil
                 sessions[key]?.toolDescription = nil
@@ -1725,21 +1728,26 @@ final class AppState {
         let visible = records.filter {
             HookServer.remoteEventPassesCwdFilter(cwd: $0.cwd, filterCSV: cwdFilter)
         }
-        let activeIds = Set(visible.map { "remote:\(hostId):\($0.id)" })
+        let active = visible.filter(\.isActive)
+        let activeIds = Set(active.map { "remote:\(hostId):\($0.id)" })
+        let knownIds = Set(visible.map { "remote:\(hostId):\($0.id)" })
         var discoveredIds = remoteDiscoveredCodexIds[hostId] ?? []
         if visible.isEmpty && discoveredIds.isEmpty { return }
-        for id in discoveredIds.subtracting(activeIds) where sessions[id]?.remoteHostId == hostId {
+        // Only desktop IDs confirmed by the scan are authoritative here;
+        // remote CLI Codex cards are hook-driven and absent from this DB query.
+        for id in discoveredIds.union(knownIds).subtracting(activeIds)
+            where sessions[id]?.remoteHostId == hostId {
             removeSession(id)
         }
         discoveredIds.formIntersection(activeIds)
-        for record in visible {
+        for record in active {
             // Use the same host-scoped identity as HookEvent.
             let sessionId = "remote:\(hostId):\(record.id)"
             guard !record.id.isEmpty, !record.cwd.isEmpty,
                   sessions[sessionId] == nil || sessions[sessionId]?.remoteHostId == hostId else { continue }
-            if sessions[sessionId] == nil {
-                discoveredIds.insert(sessionId)
-            }
+            // Scan reconciliation also owns cards first created by a hook;
+            // interrupted turns may never deliver a Stop hook.
+            discoveredIds.insert(sessionId)
             let turnStart = Date(timeIntervalSince1970: record.startedAt > 0 ? record.startedAt : record.modifiedAt)
             var session = sessions[sessionId] ?? SessionSnapshot(startTime: turnStart)
             if sessions[sessionId] == nil { session.lastActivity = turnStart }
@@ -3353,9 +3361,12 @@ final class AppState {
 
     func requestCodexDesktopDiscoveryScan() {
         guard codexDesktopDiscoveryScanTask == nil else { return }
+        let hostStartedAt = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == Self.codexAppBundleId })
+            .flatMap { Self.getProcessStartTime($0.processIdentifier) }
         codexDesktopDiscoveryScanTask = Task.detached { [weak self] in
             let discovered = ConfigInstaller.isEnabled(source: "codex")
-                ? Self.findRecentCodexDesktopSessions()
+                ? Self.findRecentCodexDesktopSessions(hostStartedAt: hostStartedAt)
                 : []
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
@@ -6728,16 +6739,16 @@ final class AppState {
         now: Date = Date(),
         freshnessWindow: TimeInterval = 600,
         completionSettleWindow: TimeInterval = 30,
+        hostStartedAt: Date? = nil,
         fileManager: FileManager = .default
     ) -> [CodexDesktopThreadRecord] {
         let statePath = overrideStatePath ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/state_5.sqlite").path
-        // `has_user_event` is not a reliable visibility bit for Desktop threads:
-        // current ChatGPT/Codex builds may keep it at 0 while a user turn is
-        // actively writing to the rollout. Pull a slightly wider DB candidate
-        // window, then enforce the tighter freshness window from DB/file mtimes.
-        let candidateWindow = max(freshnessWindow, 60 * 60)
-        let cutoff = now.addingTimeInterval(-candidateWindow).timeIntervalSince1970
+        // A running turn can go silent for hours. Search back to the host's
+        // launch instead of treating an old file mtime as proof it finished.
+        // `has_user_event` is unreliable for Desktop threads, even while active.
+        let cutoff = (hostStartedAt?.addingTimeInterval(-60)
+            ?? now.addingTimeInterval(-max(freshnessWindow, 60 * 60))).timeIntervalSince1970
 
         return withSQLiteDatabase(at: statePath) { db in
             let columns = sqliteTableColumns(db: db, tableName: "threads")
@@ -6779,8 +6790,7 @@ final class AppState {
                         OR thread.source = 'appServer'
                         OR thread.source LIKE '{"subagent"%'
                       )
-                      ORDER BY \(updatedAtExpression) DESC
-                      LIMIT 50;
+                      ORDER BY \(updatedAtExpression) DESC;
                     """
             ) else { return [] }
             defer { sqlite3_finalize(statement) }
@@ -6808,17 +6818,14 @@ final class AppState {
                 let dbUpdatedAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
                 let fileModifiedAt = (try? fileManager.attributesOfItem(atPath: transcriptPath))?[.modificationDate] as? Date
                 let modifiedAt = max(dbUpdatedAt, fileModifiedAt ?? dbUpdatedAt)
-                guard modifiedAt >= now.addingTimeInterval(-freshnessWindow) else { continue }
-
-                let dbModel = sqliteColumnString(statement, index: 4)
-                let (transcriptModel, messages) = readRecentFromCodexTranscript(path: transcriptPath)
                 let turnStatus = latestCodexTurnStatus(path: transcriptPath)
-                let isFresh = now.timeIntervalSince(modifiedAt) <= 300
-                let isActive = isFresh && turnStatus == .processing
+                let isActive = turnStatus == .processing
                 if !isActive,
                    now.timeIntervalSince(modifiedAt) > completionSettleWindow {
                     continue
                 }
+                let dbModel = sqliteColumnString(statement, index: 4)
+                let (transcriptModel, messages) = readRecentFromCodexTranscript(path: transcriptPath)
 
                 records.append(CodexDesktopThreadRecord(
                     sessionId: sessionId,
@@ -7001,6 +7008,7 @@ final class AppState {
                 excluding: seenDesktopSessionIds,
                 statePath: statePath,
                 now: now,
+                hostStartedAt: processes.filter(\.isDesktop).compactMap(\.startTime).min(),
                 fileManager: fm
             ))
         }
@@ -7011,6 +7019,7 @@ final class AppState {
         excluding excludedSessionIds: Set<String> = [],
         statePath: String? = nil,
         now: Date = Date(),
+        hostStartedAt: Date? = nil,
         fileManager: FileManager = .default
     ) -> [DiscoveredSession] {
         let resolvedStatePath = statePath ?? FileManager.default.homeDirectoryForCurrentUser
@@ -7019,6 +7028,7 @@ final class AppState {
         return recentCodexDesktopThreadRecords(
             statePath: resolvedStatePath,
             now: now,
+            hostStartedAt: hostStartedAt,
             fileManager: fileManager
         ).compactMap { record in
             guard !excludedSessionIds.contains(record.sessionId) else { return nil }

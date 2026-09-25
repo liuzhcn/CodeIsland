@@ -5,6 +5,23 @@ import SQLite3
 
 @MainActor
 final class AppStateCodexTranscriptTests: XCTestCase {
+    func testSilentDesktopTurnDoesNotExpireBetweenDiscoveryScans() {
+        let now = Date()
+        var session = SessionSnapshot()
+        session.source = "codex"
+        session.termBundleId = AppState.codexAppBundleId
+        session.lastActivity = now.addingTimeInterval(-3600)
+        for status: AgentStatus in [.processing, .running, .waitingApproval, .waitingQuestion] {
+            session.status = status
+            XCTAssertFalse(AppState.shouldExpireUnmonitoredSession(session, now: now))
+        }
+        session.termBundleId = nil
+        session.status = .processing
+        XCTAssertTrue(AppState.shouldExpireUnmonitoredSession(session, now: now))
+        session.lastActivity = now
+        XCTAssertFalse(AppState.shouldExpireUnmonitoredSession(session, now: now))
+    }
+
     func testCodexBackfillReadsPublicOutputButNotReasoning() throws {
         let transcript = FileManager.default.temporaryDirectory
             .appendingPathComponent("codeisland-codex-public-output-\(UUID().uuidString).jsonl")
@@ -138,6 +155,10 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         try ([started, finished].joined(separator: "\n") + "\n")
             .write(to: completed, atomically: true, encoding: .utf8)
         try fm.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-7_200)],
+            ofItemAtPath: activeSibling.path
+        )
+        try fm.setAttributes(
             [.modificationDate: now.addingTimeInterval(-60)],
             ofItemAtPath: completed.path
         )
@@ -150,6 +171,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         let current = Int64(now.timeIntervalSince1970)
         let laggingDesktopUpdate = current - 1_800
         let old = current - 60
+        let silentActive = current - 7_200
         let sql = """
         CREATE TABLE threads (
             id TEXT PRIMARY KEY,
@@ -162,8 +184,11 @@ final class AppStateCodexTranscriptTests: XCTestCase {
             source TEXT NOT NULL
         );
         INSERT INTO threads VALUES ('root-thread', '\(activeRoot.path)', '/same/repo', \(laggingDesktopUpdate), 'gpt-test', 0, 0, 'vscode');
-        INSERT INTO threads VALUES ('sibling-thread', '\(activeSibling.path)', '/same/repo', \(current), 'gpt-test', 0, 1, 'appServer');
+        INSERT INTO threads VALUES ('sibling-thread', '\(activeSibling.path)', '/same/repo', \(silentActive), 'gpt-test', 0, 1, 'appServer');
         INSERT INTO threads VALUES ('completed-thread', '\(completed.path)', '/same/repo', \(old), 'gpt-test', 0, 1, 'vscode');
+        INSERT INTO threads VALUES ('prelaunch-thread', '\(activeSibling.path)', '/same/repo', \(current - 11_000), 'gpt-test', 0, 1, 'vscode');
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 55)
+        INSERT INTO threads SELECT 'finished-' || x, '\(completed.path)', '/same/repo', \(old), 'gpt-test', 0, 1, 'vscode' FROM n;
         """
         XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
 
@@ -172,6 +197,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
             now: now,
             freshnessWindow: 600,
             completionSettleWindow: 30,
+            hostStartedAt: now.addingTimeInterval(-10_000),
             fileManager: fm
         )
 
