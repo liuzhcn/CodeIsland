@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Network
+import CodeIslandCore
 
 @MainActor
 final class RemoteManager: ObservableObject {
@@ -15,7 +16,9 @@ final class RemoteManager: ObservableObject {
     var onCodexSessions: ((String, String, String, [RemoteCodexSession]) -> Void)?
 
     private var forwarders: [String: SSHForwarder] = [:]
-    private var codexScanTasks: [String: Task<Void, Never>] = [:]
+    private var codexReconnectTasks: [String: Task<Void, Never>] = [:]
+    private var codexClients: [String: CodexAppServerClient] = [:]
+    private var codexRecords: [String: [String: RemoteCodexSession]] = [:]
     // Per-user remote socket path resolved at connect time (#193). Keyed by host id;
     // reused by installHooks so the SSH -R forward and the remote hooks agree.
     private var remoteSocketPaths: [String: String] = [:]
@@ -166,8 +169,7 @@ final class RemoteManager: ObservableObject {
 
     func disconnect(id: String) {
         manuallyDisconnected.insert(id)
-        codexScanTasks[id]?.cancel()
-        codexScanTasks[id] = nil
+        stopCodexEvents(hostId: id)
         forwarders[id]?.onStatusChange = nil
         cancelScheduledReconnect(id: id)
         reconnectAttempts[id] = nil
@@ -179,6 +181,96 @@ final class RemoteManager: ObservableObject {
         onDisconnect?(id)
     }
 
+    private func stopCodexEvents(hostId: String) {
+        codexReconnectTasks.removeValue(forKey: hostId)?.cancel()
+        let client = codexClients.removeValue(forKey: hostId)
+        client?.onExit = nil
+        client?.stop()
+        codexRecords[hostId] = nil
+    }
+
+    private func startCodexEvents(host: RemoteHost) {
+        stopCodexEvents(hostId: host.id)
+        guard let url = Bundle.appModule.url(forResource: "codex-event-transport", withExtension: "py", subdirectory: "Resources"),
+              let script = try? Data(contentsOf: url) else { return }
+        let command = "python3 -u -c 'import base64;exec(base64.b64decode(\"\(script.base64EncodedString())\"))'"
+        let client = CodexAppServerClient(executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
+            arguments: RemoteInstaller.sshArguments(host: host) + [command])
+        codexClients[host.id] = client
+        client.onMessage = { [weak self, weak client] message in
+            Task { @MainActor in
+                guard let self, let client, self.codexClients[host.id] === client else { return }
+                self.handleCodexEventMessage(message, host: host, client: client)
+            }
+        }
+        client.onExit = { [weak self, weak client] _ in
+            Task { @MainActor in
+                guard let self, let client, self.codexClients[host.id] === client else { return }
+                self.codexClients[host.id] = nil
+                self.lastMessage[host.id] = "Codex event stream disconnected; reconnecting"
+                self.onCodexSessions?(host.id, host.name, host.cwdFilter, [])
+                self.codexReconnectTasks[host.id] = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(3))
+                    guard !Task.isCancelled, let self, self.connectionStatus[host.id] == .connected else { return }
+                    self.startCodexEvents(host: host)
+                }
+            }
+        }
+        do {
+            try client.start()
+            try client.initializeHandshake(clientName: "CodeIsland", clientVersion: "1")
+        } catch {
+            lastMessage[host.id] = "Codex event connection failed: \(error.localizedDescription)"
+            stopCodexEvents(hostId: host.id)
+        }
+    }
+
+    private func handleCodexEventMessage(_ message: CodexJSONRPCMessage, host: RemoteHost, client: CodexAppServerClient) {
+        let result = message.raw["result"]?.asObject ?? [:]
+        let params = message.raw["params"]?.asObject ?? [:]
+        do {
+            if case .response(id: .int(1)) = message.kind {
+                try client.sendNotification(method: "initialized")
+                try client.sendRequest(method: "thread/loaded/list", params: [:])
+            } else if case .array(let ids)? = result["data"] {
+                for id in ids.compactMap(\.asString) {
+                    try client.sendRequest(method: "thread/read", params: ["threadId": id, "includeTurns": false])
+                }
+                if let cursor = result["nextCursor"]?.asString {
+                    try client.sendRequest(method: "thread/loaded/list", params: ["cursor": cursor])
+                }
+            }
+            if let thread = result["thread"]?.asObject ?? params["thread"]?.asObject {
+                updateRemoteCodexThread(thread, host: host)
+            } else if case .notification(let method) = message.kind,
+                      ["thread/status/changed", "thread/closed", "thread/archived"].contains(method),
+                      let id = params["threadId"]?.asString {
+                // Read the current authoritative snapshot after each notification.
+                // Concurrent responses can never replay an older notification status.
+                if method == "thread/status/changed" {
+                    try client.sendRequest(method: "thread/read", params: ["threadId": id, "includeTurns": false])
+                } else {
+                    codexRecords[host.id]?[id] = nil
+                    onCodexSessions?(host.id, host.name, host.cwdFilter, Array((codexRecords[host.id] ?? [:]).values))
+                }
+            }
+        } catch {
+            lastMessage[host.id] = "Codex event request failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func updateRemoteCodexThread(_ thread: [String: AnyCodableLike], host: RemoteHost) {
+        guard let id = thread["id"]?.asString, let cwd = thread["cwd"]?.asString else { return }
+        // Child agents are represented by their parent task, not extra sidebar tasks.
+        guard thread["source"]?.asObject == nil else { return }
+        let active = thread["status"]?.asObject?["type"]?.asString == "active"
+        let now = Date().timeIntervalSince1970
+        codexRecords[host.id, default: [:]][id] = RemoteCodexSession(
+            id: id, cwd: cwd, model: nil, title: thread["name"]?.asString ?? thread["preview"]?.asString,
+            modifiedAt: now, startedAt: now, isActive: active)
+        onCodexSessions?(host.id, host.name, host.cwdFilter, Array((codexRecords[host.id] ?? [:]).values))
+    }
+
     private func handleStatusChange(_ status: SSHForwarder.Status, for host: RemoteHost) {
         connectionStatus[host.id] = status
 
@@ -188,27 +280,15 @@ final class RemoteManager: ObservableObject {
             reconnectAttempts[host.id] = nil
             cancelScheduledReconnect(id: host.id)
             Task { await installHooks(for: host) }
-            codexScanTasks[host.id]?.cancel()
-            codexScanTasks[host.id] = Task { [weak self] in
-                while !Task.isCancelled {
-                    if let sessions = await RemoteInstaller.recentCodexSessions(host: host),
-                       !Task.isCancelled,
-                       self?.connectionStatus[host.id] == .connected {
-                        self?.onCodexSessions?(host.id, host.name, host.cwdFilter, sessions)
-                    }
-                    try? await Task.sleep(for: .seconds(10))
-                }
-            }
+            startCodexEvents(host: host)
         case .failed(let message):
-            codexScanTasks[host.id]?.cancel()
-            codexScanTasks[host.id] = nil
+            stopCodexEvents(hostId: host.id)
             installRunning[host.id] = false
             lastMessage[host.id] = message
             onDisconnect?(host.id)
             scheduleReconnect(for: host)
         case .disconnected:
-            codexScanTasks[host.id]?.cancel()
-            codexScanTasks[host.id] = nil
+            stopCodexEvents(hostId: host.id)
             // User-initiated disconnects go through disconnect(id:) which already
             // cleared reconnect state before we get here.
             installRunning[host.id] = false

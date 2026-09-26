@@ -1,6 +1,22 @@
 import Foundation
 
 public enum CLIProcessResolver {
+    /// Resolve the owning desktop bundle, including the nested CodexCLI.app layout.
+    public static func isCodexDesktopExecutablePath(_ path: String) -> Bool {
+        var url = URL(fileURLWithPath: path).standardizedFileURL
+        guard url.lastPathComponent.lowercased() == "codex" else { return false }
+        while url.path != "/" {
+            url.deleteLastPathComponent()
+            guard url.pathExtension.lowercased() == "app" else { continue }
+            let name = url.deletingPathExtension().lastPathComponent.lowercased()
+            if Bundle(url: url)?.bundleIdentifier == "com.openai.codex"
+                || name == "codex" || name == "chatgpt" {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Lowercased bundle markers of the Trae CN desktop IDE (bundle id
     /// `cn.trae.app`). It has shipped as `Trae CN.app` since its first macOS
     /// build (Homebrew `trae-cn` cask; TraeCode CN 3.3.104 still is), with

@@ -5,7 +5,7 @@ import SQLite3
 
 @MainActor
 final class AppStateCodexTranscriptTests: XCTestCase {
-    func testSilentDesktopTurnDoesNotExpireBetweenDiscoveryScans() {
+    func testSilentCodexTurnWaitsForEventsInsteadOfExpiring() {
         let now = Date()
         var session = SessionSnapshot()
         session.source = "codex"
@@ -17,7 +17,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         }
         session.termBundleId = nil
         session.status = .processing
-        XCTAssertTrue(AppState.shouldExpireUnmonitoredSession(session, now: now))
+        XCTAssertFalse(AppState.shouldExpireUnmonitoredSession(session, now: now))
         session.lastActivity = now
         XCTAssertFalse(AppState.shouldExpireUnmonitoredSession(session, now: now))
     }
@@ -43,12 +43,12 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         XCTAssertFalse(messages.contains { $0.text.contains("hidden chain") })
     }
 
-    func testTaskStartedClearsPreviousCodexLiveOutputWithoutDeletingHistory() {
+    func testTranscriptLifecycleCannotOverrideCodexHookState() {
         let appState = AppState()
         let sessionId = "codex-live-output"
         var session = SessionSnapshot()
         session.source = "codex"
-        session.status = .processing
+        session.status = .idle
         session.liveCodexOutput = "Previous turn"
         session.recentMessages = [ChatMessage(isUser: false, text: "Previous turn")]
         appState.sessions[sessionId] = session
@@ -61,7 +61,8 @@ final class AppStateCodexTranscriptTests: XCTestCase {
             hasActivity: true
         ))
 
-        XCTAssertNil(appState.sessions[sessionId]?.liveCodexOutput)
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .idle)
+        XCTAssertEqual(appState.sessions[sessionId]?.liveCodexOutput, "Previous turn")
         XCTAssertEqual(appState.sessions[sessionId]?.recentMessages.map(\.text), ["Previous turn"])
     }
 

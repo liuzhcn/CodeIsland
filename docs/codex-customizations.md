@@ -52,3 +52,23 @@ jumps also stop the new follow-up reminders.
 Validation: full Swift suite (1,914 tests, 4 skipped, no failures), 52 focused
 reminder/deep-link tests after the jump integration, and RemoteHook Python checks.
 The previous source state is retained as `backup/before-v1.0.35-20260925`.
+
+## Event-driven Codex task counts (2026-09-26)
+
+Codex task lifecycle now comes from hooks and the running service's notifications.
+Local desktop IPC supplies runtime snapshots and subsequent state changes; remote
+connections attach to the existing app-server control socket, hydrate its loaded
+threads once, and reread live metadata on status notifications. Reconnection
+rehydrates live state. No Codex rollout/state-DB discovery is scheduled, and
+transcript appends cannot change a Codex card's running/idle state. Transcript
+text/model/checklist enrichment remains separate from lifecycle.
+
+The bridge and process detection recognize ChatGPT's nested CodexCLI.app binary.
+Desktop hooks therefore share the same `codexapp:` identity as live desktop state,
+including when `__CFBundleIdentifier` is absent. Existing local snapshots supply
+identities only; live IPC refreshes their status. Newly started local sessions are
+discovered through hooks. If CodeIsland was absent for an entire session's first
+activity and has no saved identity, that session appears on its next hook.
+
+Validation: 1,916 Swift tests (4 skipped), remote title checks, websocket framing
+checks, and read-only connections to the live desktop IPC and remote app-server.

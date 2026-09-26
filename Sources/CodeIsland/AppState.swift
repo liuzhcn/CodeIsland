@@ -398,8 +398,6 @@ final class AppState {
     nonisolated(unsafe) private var discoveryScanTask: Task<Void, Never>?
     private var pendingDiscoveryRescan = false
     @ObservationIgnored
-    nonisolated(unsafe) private var codexDesktopDiscoveryScanTask: Task<Void, Never>?
-    private var lastCodexDesktopDiscoveryPollAt: Date?
     private var isShowingCompletion: Bool {
         if case .completionCard = surface { return true }
         return false
@@ -503,7 +501,7 @@ final class AppState {
     nonisolated static func shouldExpireUnmonitoredSession(_ session: SessionSnapshot, now: Date = Date()) -> Bool {
         // Desktop turns are ended by lifecycle/transcript events, not silence while thinking.
         guard session.status != .idle, !session.isRemote,
-              !(session.source == "codex" && session.termBundleId == codexAppBundleId) else { return false }
+              session.source != "codex" else { return false }
         let threshold: TimeInterval
         switch session.status {
         case .waitingApproval, .waitingQuestion: threshold = 300
@@ -579,6 +577,7 @@ final class AppState {
         let codexTerminalTurnSettleTime: TimeInterval = 3
         for (key, session) in sessions
             where session.status == .processing
+            && session.source != "codex"
             && session.currentTool == nil
             && session.toolDescription == nil {
             let elapsed = -session.lastActivity.timeIntervalSinceNow
@@ -651,21 +650,6 @@ final class AppState {
                 removeSession(key)
             }
         }
-        let discoveryPollNow = Date()
-        // Check the cheap clock predicate before the expensive app list: the poll
-        // is rate-limited to every 6s, so five of every six ticks can skip it.
-        let codexPollIntervalElapsed = lastCodexDesktopDiscoveryPollAt.map {
-            discoveryPollNow.timeIntervalSince($0) >= 6
-        } ?? true
-        if codexPollIntervalElapsed, Self.shouldPollCodexDesktopDiscovery(
-            runningBundleIdentifiers: runningBundleIds(),
-            lastPollAt: lastCodexDesktopDiscoveryPollAt,
-            now: discoveryPollNow
-        ) {
-            lastCodexDesktopDiscoveryPollAt = discoveryPollNow
-            requestCodexDesktopDiscoveryScan()
-        }
-
         // 4. Remove idle sessions past timeout (user setting, or 10 min default for no-monitor sessions)
         let userTimeout = SettingsManager.shared.sessionTimeout
         let defaultStaleMinutes = 10  // for sessions without process monitor
@@ -3396,7 +3380,11 @@ final class AppState {
                 sessionId: p.sessionId,
                 source: source,
                 providerSessionId: p.providerSessionId,
-                termBundleId: p.termBundleId
+                termBundleId: p.termBundleId,
+                executablePath: p.cliPid.flatMap { pid in
+                    Self.isLiveProcess(ProcessIdentity(pid: pid, startTime: p.cliStartTime))
+                        ? Self.executablePath(for: pid) : nil
+                }
             )
             guard sessions[restoredSessionId] == nil else { continue }
             var snapshot = SessionSnapshot(startTime: p.startTime)
@@ -3421,7 +3409,8 @@ final class AppState {
             snapshot.tmuxPane = p.tmuxPane
             snapshot.tmuxClientTty = p.tmuxClientTty
             snapshot.tmuxEnv = p.tmuxEnv
-            snapshot.termBundleId = p.termBundleId
+            snapshot.termBundleId = restoredSessionId.hasPrefix(Self.codexAppSessionPrefix)
+                ? Self.codexAppBundleId : p.termBundleId
             snapshot.cmuxSurfaceId = p.cmuxSurfaceId
             snapshot.cmuxWorkspaceId = p.cmuxWorkspaceId
             snapshot.zellijPaneId = p.zellijPaneId
@@ -3517,9 +3506,6 @@ final class AppState {
         var discovered: [DiscoveredSession] = []
         if ConfigInstaller.isEnabled(source: "claude") {
             discovered.append(contentsOf: findActiveClaudeSessions(candidatePids: candidatePids))
-        }
-        if ConfigInstaller.isEnabled(source: "codex") {
-            discovered.append(contentsOf: findActiveCodexSessions(candidatePids: candidatePids))
         }
         if ConfigInstaller.isEnabled(source: "gemini") {
             discovered.append(contentsOf: findActiveGeminiSessions(candidatePids: candidatePids))
@@ -3639,28 +3625,6 @@ final class AppState {
         guard runningBundleIdentifiers.contains(codexAppBundleId) else { return false }
         guard let lastPollAt else { return true }
         return now.timeIntervalSince(lastPollAt) >= interval
-    }
-
-    func requestCodexDesktopDiscoveryScan() {
-        guard codexDesktopDiscoveryScanTask == nil else { return }
-        let hostStartedAt = NSWorkspace.shared.runningApplications
-            .first(where: { $0.bundleIdentifier == Self.codexAppBundleId })
-            .flatMap { Self.getProcessStartTime($0.processIdentifier) }
-        codexDesktopDiscoveryScanTask = Task.detached { [weak self] in
-            let discovered = ConfigInstaller.isEnabled(source: "codex")
-                ? Self.findRecentCodexDesktopSessions(hostStartedAt: hostStartedAt)
-                : []
-            guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                guard !Task.isCancelled else {
-                    self.codexDesktopDiscoveryScanTask = nil
-                    return
-                }
-                self.integrateDiscovered(discovered)
-                self.codexDesktopDiscoveryScanTask = nil
-            }
-        }
     }
 
     func startSessionDiscovery() {
@@ -4832,9 +4796,6 @@ final class AppState {
         discoveryScanTask?.cancel()
         discoveryScanTask = nil
         pendingDiscoveryRescan = false
-        codexDesktopDiscoveryScanTask?.cancel()
-        codexDesktopDiscoveryScanTask = nil
-        lastCodexDesktopDiscoveryPollAt = nil
         for key in Array(processMonitors.keys) { stopMonitor(key) }
     }
 
@@ -4875,7 +4836,6 @@ final class AppState {
         // + main-synced Timer/FSEvents teardown keep discovery crash-free.
         tearDownMainThreadResources()
         discoveryScanTask?.cancel()
-        codexDesktopDiscoveryScanTask?.cancel()
         codexAppServerReconnectTask?.cancel()
         for (_, monitor) in processMonitors {
             monitor.source.cancel()
@@ -6843,26 +6803,7 @@ final class AppState {
     /// Find running Codex processes.
     /// Checks both executable path (Desktop app) and command-line args (npm/Homebrew: node script).
     nonisolated static func isCodexExecutablePath(_ path: String) -> Bool {
-        let executableURL = URL(fileURLWithPath: path).standardizedFileURL
-        let lowerPath = executableURL.path.lowercased()
-        let resourceSuffix = "/contents/resources/codex"
-        guard lowerPath.hasSuffix(resourceSuffix) else { return false }
-
-        // Since Codex was folded into ChatGPT Desktop, the same com.openai.codex
-        // bundle can now be installed as ChatGPT.app instead of Codex.app. Read
-        // the bundle identifier first so future app renames continue to work.
-        let appURL = executableURL
-            .deletingLastPathComponent() // Resources
-            .deletingLastPathComponent() // Contents
-            .deletingLastPathComponent() // *.app
-        if Bundle(url: appURL)?.bundleIdentifier == AppState.codexAppBundleId {
-            return true
-        }
-
-        // Keep the legacy path check for synthetic/test bundles without an
-        // Info.plist and for older installations whose bundle cannot be read.
-        let appName = appURL.deletingPathExtension().lastPathComponent.lowercased()
-        return appName == "codex" || appName == "chatgpt"
+        CLIProcessResolver.isCodexDesktopExecutablePath(path)
     }
 
     /// Codex Desktop's shared app-server is launched with `/` as its cwd. Its
@@ -6912,9 +6853,12 @@ final class AppState {
         sessionId: String,
         source: String,
         providerSessionId: String?,
-        termBundleId: String?
+        termBundleId: String?,
+        executablePath: String? = nil
     ) -> String {
-        guard source == "codex", termBundleId == codexAppBundleId else {
+        guard source == "codex",
+              termBundleId == codexAppBundleId
+                || executablePath.map(Self.isCodexExecutablePath) == true else {
             return sessionId
         }
         if sessionId.hasPrefix(codexAppSessionPrefix) {

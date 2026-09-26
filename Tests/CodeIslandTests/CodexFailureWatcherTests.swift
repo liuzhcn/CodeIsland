@@ -4,6 +4,27 @@ import XCTest
 
 @MainActor
 final class CodexFailureWatcherTests: XCTestCase {
+    func testLocalRuntimeEventsRecoverSilentTurnsAndStopWithoutLogs() {
+        let state = AppState()
+        var session = SessionSnapshot()
+        session.source = "codex"
+        session.status = .idle
+        state.sessions["codexapp:local"] = session
+        let watcher = CodexFailureWatcher(state: state)
+        watcher.observe(sessionId: "codexapp:local", host: "local", thread: "local")
+        watcher.accept(["method": "thread-stream-state-changed", "params": [
+            "hostId": "local", "conversationId": "local", "change": [
+                "conversationState": ["threadRuntimeStatus": ["type": "active", "activeFlags": []]]]]])
+        XCTAssertEqual(state.activeSessionCount, 1)
+        let stopped: [String: Any] = ["method": "thread-stream-state-changed", "params": [
+            "hostId": "local", "conversationId": "local", "change": ["patches": [
+                ["op": "replace", "path": ["threadRuntimeStatus"], "value": ["type": "idle"]]]]]]
+        watcher.accept(stopped)
+        watcher.accept(stopped)
+        XCTAssertEqual(state.activeSessionCount, 0)
+        XCTAssertEqual(state.sessions.count, 1)
+    }
+
     func testFramingHandlesConsecutiveAndPartialFrames() throws {
         var bytes = Data([9, 1, 0, 0, 0, 65, 2, 0, 0, 0, 66])
         bytes.removeFirst() // Data can have a nonzero startIndex.

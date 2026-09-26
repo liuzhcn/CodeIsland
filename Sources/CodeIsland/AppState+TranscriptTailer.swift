@@ -55,28 +55,6 @@ extension AppState {
             sessions[sessionId] = session
         }
 
-        if sessions[sessionId]?.source == "codex",
-           let turnStatus = Self.latestCodexTurnStatus(path: path),
-           var session = sessions[sessionId] {
-            switch turnStatus {
-            case .processing:
-                session.status = .processing
-                session.interrupted = false
-                session.taskRoundEnded = false
-                if session.source == "codex" {
-                    session.liveCodexOutput = nil
-                }
-            case .idle:
-                session.status = .idle
-                session.currentTool = nil
-                session.toolDescription = nil
-            }
-            if let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date {
-                session.lastActivity = modifiedAt
-            }
-            sessions[sessionId] = session
-        }
-
         // Cursor stuck-question recovery (#265): if the transcript already ends
         // with an unanswered AskQuestion (e.g. CodeIsland launched or the session
         // was discovered while Cursor sat on a question), surface the wait now
@@ -225,12 +203,14 @@ extension AppState {
         let waitBefore = displayOnlyWaitKind(forSession: delta.sessionId)
         var mutated = false
 
-        if delta.hasActivity {
+        if delta.hasActivity && session.source != "codex" {
             session.lastActivity = Date()
             mutated = true
         }
 
-        if let turnStatus = delta.turnStatus {
+        // Codex lifecycle belongs to hooks / live app-server notifications.
+        // A delayed transcript append must never restart a stopped task.
+        if session.source != "codex", let turnStatus = delta.turnStatus {
             switch turnStatus {
             case .processing:
                 session.status = .processing

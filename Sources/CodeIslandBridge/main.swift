@@ -505,6 +505,16 @@ if let termApp = env["TERM_PROGRAM"], !termApp.isEmpty {
 if let termBundle = env["__CFBundleIdentifier"], !termBundle.isEmpty {
     json["_term_bundle"] = termBundle
 }
+// __CFBundleIdentifier may be absent or name the nested CLI helper. The
+// nearest Codex process identifies the host without relabeling a nested CLI.
+if effectiveSource == "codex",
+   let codex = coreAncestry.first(where: {
+       $0.executablePath.map { CLIProcessResolver.sourceMatchesExecutablePath($0, source: "codex") } == true
+   }),
+   let path = codex.executablePath,
+   CLIProcessResolver.isCodexDesktopExecutablePath(path) {
+    json["_term_bundle"] = "com.openai.codex"
+}
 
 // iTerm2 session — extract GUID after "w0t0p0:" prefix for AppleScript matching
 if let iterm = env["ITERM_SESSION_ID"], !iterm.isEmpty {

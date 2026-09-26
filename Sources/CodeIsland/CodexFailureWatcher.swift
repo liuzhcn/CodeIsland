@@ -3,8 +3,8 @@ import Network
 import os.log
 import CodeIslandCore
 
-/// Codex does not run Stop hooks for failed turns. Reconcile only explicit
-/// failures from the desktop's internal IPC; hooks remain the primary source.
+/// Subscribe to the running desktop's live state. No transcript inference.
+/// Local hooks provide discovery; IPC snapshots recover silent/failed turns.
 @MainActor
 final class CodexFailureWatcher {
     struct Turn {
@@ -60,8 +60,8 @@ final class CodexFailureWatcher {
         }
         guard clientId != nil else { return }
         let wanted = state.sessions.filter { _, s in
-            s.source == "codex" && s.remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true
-                && (s.status == .processing || s.status == .running)
+            s.source == "codex" && (s.termBundleId == AppState.codexAppBundleId
+                || s.remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true)
         }
         for id in Array(subscriptions.keys) where wanted[id] == nil {
             follow(id, false)
@@ -69,8 +69,8 @@ final class CodexFailureWatcher {
             turns[id] = nil
         }
         for (id, s) in wanted where subscriptions[id] == nil {
-            guard let host = s.remoteHostId, let thread = s.providerSessionId else { continue }
-            observe(sessionId: id, host: host, thread: thread)
+            guard let thread = s.providerSessionId else { continue }
+            observe(sessionId: id, host: s.remoteHostId ?? "local", thread: thread)
         }
     }
     func observe(sessionId: String, host: String, thread: String) {
@@ -136,6 +136,18 @@ final class CodexFailureWatcher {
               let p = value["params"] as? [String: Any],
               let id = subscriptions.first(where: { $0.value.host == p["hostId"] as? String && $0.value.thread == p["conversationId"] as? String })?.key,
               let change = p["change"] as? [String: Any] else { return }
+        if subscriptions[id]?.host == "local" {
+            if let snapshot = change["conversationState"] as? [String: Any],
+               let runtime = snapshot["threadRuntimeStatus"] as? [String: Any] {
+                state?.applyCodexRuntimeSnapshot(sessionId: id, runtime: runtime)
+            }
+            for patch in change["patches"] as? [[String: Any]] ?? [] {
+                if patch["path"] as? [String] == ["threadRuntimeStatus"],
+                   let runtime = patch["value"] as? [String: Any] {
+                    state?.applyCodexRuntimeSnapshot(sessionId: id, runtime: runtime)
+                }
+            }
+        }
         if let snapshot = change["conversationState"] as? [String: Any],
            let history = snapshot["turnHistory"] as? [String: Any],
            let items = history["history"] as? [String: Any], let entities = items["entitiesByKey"] as? [String: [String: Any]] {
@@ -166,6 +178,14 @@ final class CodexFailureWatcher {
 }
 
 extension AppState {
+    func applyCodexRuntimeSnapshot(sessionId: String, runtime: [String: Any]) {
+        guard var session = sessions[sessionId], session.source == "codex",
+              let status = AnyCodableLike.from(runtime).asObject else { return }
+        Self.applyCodexThreadStatus(&session, status: status)
+        sessions[sessionId] = session
+        refreshDerivedState()
+    }
+
     func reconcileCodexFailure(sessionId: String, ended: Date) {
         guard let session = sessions[sessionId], session.source == "codex",
               session.status == .running || session.status == .processing,

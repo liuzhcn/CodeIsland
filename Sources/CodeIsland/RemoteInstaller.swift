@@ -80,68 +80,6 @@ enum RemoteInstaller {
         return nil
     }
 
-    /// Read active remote Codex turns when desktop sessions do not fire hooks.
-    static func recentCodexSessions(host: RemoteHost) async -> [RemoteCodexSession]? {
-        let script = """
-import datetime, json, pathlib, sqlite3, subprocess, sys, time
-home = pathlib.Path.home()
-db = home / '.codex/state_5.sqlite'
-now = time.time()
-try:
-    processes = subprocess.check_output(['ps', '-eo', 'etimes=,args='], text=True, timeout=2)
-    uptimes = []
-    for line in processes.splitlines():
-        age, command = line.split(None, 1)
-        if 'codex' in command.split(' ', 1)[0] and ' app-server ' in command and ' --listen ' in command:
-            uptimes.append(int(age))
-    # Ignore turns from before the current app-server process, but keep silent live turns.
-    cutoff = now - max(uptimes, default=3600) - 60
-    connection = sqlite3.connect(f'file:{db}?mode=ro', uri=True, timeout=0.2)
-    columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
-    updated = 'COALESCE(NULLIF(updated_at_ms, 0) / 1000.0, updated_at)' if 'updated_at_ms' in columns else 'updated_at'
-    rows = connection.execute(f'''SELECT id, cwd, rollout_path, model, title, name, {updated}
-        FROM threads WHERE archived = 0 AND source IN ('vscode', 'appServer')
-        ORDER BY {updated} DESC''')
-    result = []
-    for sid, cwd, path, model, title, name, changed in rows:
-        record = dict(id=sid, cwd=cwd or '', model=model, title=(name or title or '')[:200], modifiedAt=changed, startedAt=0, isActive=False)
-        if changed < cutoff:
-            result.append(record)
-            continue
-        try:
-            transcript = pathlib.Path(path)
-            modified = max(changed, transcript.stat().st_mtime)
-            with transcript.open('rb') as stream:
-                stream.seek(max(0, transcript.stat().st_size - 4 * 1024 * 1024))
-                lines = stream.read().splitlines()
-            status = None
-            started = 0
-            for line in reversed(lines):
-                try:
-                    item = json.loads(line)
-                    event = item.get('payload') or {}
-                    if item.get('type') == 'event_msg' and event.get('type') in ('task_started', 'task_complete', 'turn_aborted'):
-                        status = event['type']
-                        if status == 'task_started':
-                            started = datetime.datetime.fromisoformat(item['timestamp'].replace('Z', '+00:00')).timestamp()
-                        break
-                except (ValueError, TypeError, KeyError): pass
-            record['modifiedAt'] = modified
-            record['startedAt'] = started
-            record['isActive'] = status == 'task_started' or (status is None and now - modified <= 300)
-            result.append(record)
-        except (OSError, ValueError, TypeError): pass
-    print(json.dumps(result))
-except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
-    sys.exit(1)
-"""
-        let encoded = Data(script.utf8).base64EncodedString()
-        let command = "python3 -c 'import base64;exec(base64.b64decode(\"\(encoded)\"))'"
-        let result = await runSSH(host: host, command: command, timeout: 8)
-        guard result.ok, let data = result.stdout.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode([RemoteCodexSession].self, from: data)
-    }
-
     static func remoteHookSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-remote-hook", withExtension: "py", subdirectory: "Resources"),
            let src = try? String(contentsOf: url) {
@@ -1112,7 +1050,7 @@ print(" · ".join(parts))
         }
     }
 
-    private static func sshArguments(host: RemoteHost) -> [String] {
+    static func sshArguments(host: RemoteHost) -> [String] {
         var args: [String] = [
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=8",
@@ -1125,6 +1063,9 @@ print(" · ".join(parts))
         let trimmedIdentity = host.identityFile.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedIdentity.isEmpty {
             args += ["-i", trimmedIdentity]
+        }
+        if !host.authSocket.isEmpty {
+            args += ["-o", "IdentityAgent=\(host.authSocket)"]
         }
         args.append(host.sshTarget)
         return args

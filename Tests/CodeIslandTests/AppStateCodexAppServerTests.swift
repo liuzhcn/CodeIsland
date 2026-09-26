@@ -10,6 +10,20 @@ final class AppStateCodexAppServerTests: XCTestCase {
         ))
     }
 
+    func testNestedDesktopExecutableAndPersistedHookUseDesktopIdentity() {
+        let path = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        XCTAssertTrue(AppState.isCodexExecutablePath(path))
+        XCTAssertFalse(AppState.isCodexExecutablePath("/opt/homebrew/bin/codex"))
+        XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
+            sessionId: "thread", source: "codex", providerSessionId: "thread",
+            termBundleId: nil, executablePath: path
+        ), "codexapp:thread")
+        XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
+            sessionId: "thread", source: "codex", providerSessionId: "thread",
+            termBundleId: nil, executablePath: "/opt/homebrew/bin/codex"
+        ), "thread")
+    }
+
     func testCodexExecutablePathRejectsUnrelatedResourceBinary() {
         XCTAssertFalse(AppState.isCodexExecutablePath(
             "/Applications/OtherAgent.app/Contents/Resources/codex"
