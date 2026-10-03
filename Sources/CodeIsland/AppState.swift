@@ -1599,6 +1599,7 @@ final class AppState {
     }
 
     func handleEvent(_ event: HookEvent) {
+        let event = canonicalizedCodexHook(event)
         // Skip events from subagent worktrees — tracked via parent's SubagentStart/Stop
         if let cwd = event.rawJSON["cwd"] as? String,
            cwd.contains("/.claude/worktrees/agent-") || cwd.contains("/.git/worktrees/agent-") {
@@ -1652,6 +1653,12 @@ final class AppState {
                     return
                 }
             }
+        }
+
+        if source == "codex", sessionId.hasPrefix(Self.codexAppSessionPrefix) {
+            adoptLegacyCodexDesktopSession(
+                threadID: String(sessionId.dropFirst(Self.codexAppSessionPrefix.count))
+            )
         }
 
         // Skip Codex APP internal sessions (title generation, etc.) — they have no transcript
@@ -4994,7 +5001,7 @@ final class AppState {
         return Array(pids.prefix(count)).filter { $0 > 0 }
     }
 
-    private nonisolated static func executablePath(for pid: pid_t) -> String? {
+    nonisolated static func executablePath(for pid: pid_t) -> String? {
         var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         let len = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
         guard len > 0 else { return nil }

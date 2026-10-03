@@ -114,6 +114,86 @@ final class AppStateCodexAppServerTests: XCTestCase {
         XCTAssertEqual(appState.sessions[sessionId]?.providerSessionId, rawId)
     }
 
+    func testStopMigratesLegacyDesktopCardInsteadOfLeavingItRunning() throws {
+        let state = AppState()
+        let rawID = "legacy-desktop"
+        var legacy = SessionSnapshot()
+        legacy.source = "codex"
+        legacy.providerSessionId = rawID
+        legacy.termBundleId = AppState.codexAppBundleId
+        legacy.status = .running
+        legacy.currentTool = "Bash"
+        legacy.lastUserPrompt = "Preserve the original prompt"
+        state.sessions[rawID] = legacy
+        let stop = try XCTUnwrap(HookEvent(from: Data(
+            #"{"hook_event_name":"Stop","cwd":"/repo","session_id":"legacy-desktop","_source":"codex","_term_bundle":"com.openai.codex","turn_id":"turn-1"}"#.utf8)))
+        state.handleEvent(stop)
+        XCTAssertNil(state.sessions[rawID])
+        XCTAssertEqual(state.sessions["codexapp:" + rawID]?.status, .idle)
+        XCTAssertEqual(state.sessions["codexapp:" + rawID]?.lastUserPrompt, legacy.lastUserPrompt)
+        XCTAssertEqual(state.activeSessionCount, 0)
+        XCTAssertEqual(state.totalSessionCount, 1)
+    }
+
+    func testStopWithoutBundleMetadataClosesKnownDesktopCard() throws {
+        let state = AppState()
+        var session = SessionSnapshot()
+        session.source = "codex"
+        session.providerSessionId = "known-desktop"
+        session.termBundleId = AppState.codexAppBundleId
+        session.status = .running
+        state.sessions["codexapp:known-desktop"] = session
+        let stop = try XCTUnwrap(HookEvent(from: Data(
+            #"{"hook_event_name":"Stop","cwd":"/repo","session_id":"known-desktop","_source":"codex","turn_id":"turn-1"}"#.utf8)))
+        state.handleEvent(stop)
+        XCTAssertNil(state.sessions["known-desktop"])
+        XCTAssertEqual(state.sessions["codexapp:known-desktop"]?.status, .idle)
+        XCTAssertEqual(state.activeSessionCount, 0)
+    }
+
+    func testExplicitTerminalHookDoesNotCloseDesktopWithSameProviderID() throws {
+        let state = AppState()
+        var desktop = SessionSnapshot()
+        desktop.source = "codex"
+        desktop.termBundleId = AppState.codexAppBundleId
+        desktop.status = .running
+        state.sessions["codexapp:shared-thread"] = desktop
+        let stop = try XCTUnwrap(HookEvent(from: Data(
+            #"{"hook_event_name":"Stop","cwd":"/repo","session_id":"shared-thread","_source":"codex","_term_bundle":"com.apple.Terminal"}"#.utf8)))
+        state.handleEvent(stop)
+        XCTAssertEqual(state.sessions["codexapp:shared-thread"]?.status, .running)
+        XCTAssertEqual(state.sessions["shared-thread"]?.status, .idle)
+    }
+
+    func testRemoteStopCannotCloseLocalDesktopWithSameProviderID() throws {
+        let state = AppState()
+        var desktop = SessionSnapshot()
+        desktop.source = "codex"
+        desktop.termBundleId = AppState.codexAppBundleId
+        desktop.status = .running
+        state.sessions["codexapp:shared-thread"] = desktop
+        let stop = try XCTUnwrap(HookEvent(from: Data(
+            #"{"hook_event_name":"Stop","cwd":"/repo","session_id":"shared-thread","_source":"codex","_remote_host_id":"host-a"}"#.utf8)))
+        state.handleEvent(stop)
+        XCTAssertEqual(state.sessions["codexapp:shared-thread"]?.status, .running)
+        XCTAssertEqual(state.sessions["remote:host-a:shared-thread"]?.status, .idle)
+    }
+
+    func testAppServerIdleSettlesLegacyDesktopIdentity() throws {
+        let state = AppState()
+        var legacy = SessionSnapshot()
+        legacy.source = "codex"
+        legacy.termBundleId = AppState.codexAppBundleId
+        legacy.status = .running
+        state.sessions["legacy-idle"] = legacy
+        let idle = try XCTUnwrap(CodexAppServerClient.parseMessage(Data(
+            #"{"jsonrpc":"2.0","method":"thread/status/changed","params":{"threadId":"legacy-idle","status":{"type":"idle"}}}"#.utf8)))
+        state.handleCodexAppServerMessage(idle)
+        XCTAssertNil(state.sessions["legacy-idle"])
+        XCTAssertEqual(state.sessions["codexapp:legacy-idle"]?.status, .idle)
+        XCTAssertEqual(state.activeSessionCount, 0)
+    }
+
     func testCodexCLIHookKeepsRawSessionId() throws {
         let payload: [String: Any] = [
             "hook_event_name": "SessionStart",

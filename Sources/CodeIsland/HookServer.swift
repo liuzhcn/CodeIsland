@@ -669,10 +669,11 @@ class HookServer {
         }
         let processedData = routed.processedData
 
-        guard let event = HookEvent(from: processedData) else {
+        guard let parsedEvent = HookEvent(from: processedData) else {
             sendResponse(connection: connection, data: Data("{\"error\":\"parse_failed\"}".utf8))
             return
         }
+        let event = appState.canonicalizedCodexHook(parsedEvent)
 
         // Diagnostics ring buffer (#103): record the post-merge view of the
         // event so the export reflects what was actually dispatched. Also

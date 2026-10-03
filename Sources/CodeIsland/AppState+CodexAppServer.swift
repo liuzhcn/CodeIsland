@@ -18,6 +18,58 @@ extension AppState {
     // Sendable warnings.
     nonisolated static let codexAppBundleId = "com.openai.codex"
 
+    /// Resolve hook identity on receipt as well as in the bridge. Environment
+    /// metadata may be missing on a later hook; a live desktop PID or an already
+    /// known desktop card still identifies its owner without scanning history.
+    func canonicalizedCodexHook(_ event: HookEvent) -> HookEvent {
+        guard event.rawJSON["_source"] as? String == "codex",
+              event.rawJSON["_remote_host_id"] == nil,
+              let rawID = event.rawJSON["session_id"] as? String else { return event }
+        let providerID = rawID.hasPrefix(Self.codexAppSessionPrefix)
+            ? String(rawID.dropFirst(Self.codexAppSessionPrefix.count)) : rawID
+        let bundle = event.rawJSON["_term_bundle"] as? String
+        let processPath = (event.rawJSON["_ppid"] as? Int)
+            .flatMap { $0 > 1 ? Self.executablePath(for: pid_t($0)) : nil }
+        let fromDesktop = bundle == Self.codexAppBundleId
+            || processPath.map(Self.isCodexExecutablePath) == true
+        // An explicit terminal owner must never be folded into a desktop chat,
+        // even when it resumed the same provider UUID.
+        let knownDesktop = bundle == nil && processPath == nil
+            && (sessions[providerID] == nil
+                || sessions[providerID]?.termBundleId == Self.codexAppBundleId)
+            && sessions[Self.codexAppSessionPrefix + providerID]?.source == "codex"
+        guard fromDesktop || knownDesktop else { return event }
+        var payload = event.rawJSON
+        payload["session_id"] = providerID
+        payload["_term_bundle"] = Self.codexAppBundleId
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let normalized = HookEvent(from: data) else { return event }
+        return normalized
+    }
+
+    /// A running raw-ID card from an older/missing-metadata hook must not be
+    /// stranded when the next event starts using the desktop namespace.
+    func adoptLegacyCodexDesktopSession(threadID: String) {
+        guard var legacy = sessions[threadID], legacy.source == "codex",
+              !legacy.isRemote else { return }
+        let path = legacy.cliPid.flatMap { pid in
+            Self.isLiveProcess(ProcessIdentity(pid: pid, startTime: legacy.cliStartTime))
+                ? Self.executablePath(for: pid) : nil
+        }
+        let canonicalID = Self.canonicalRestoredCodexSessionId(
+            sessionId: threadID, source: legacy.source, providerSessionId: threadID,
+            termBundleId: legacy.termBundleId, executablePath: path
+        )
+        guard canonicalID != threadID else { return }
+        // Never resolve a live approval/question as a side effect of deduping.
+        guard !permissionQueue.contains(where: { $0.event.sessionId == threadID }),
+              !questionQueue.contains(where: { $0.event.sessionId == threadID }) else { return }
+        legacy.termBundleId = Self.codexAppBundleId
+        legacy.providerSessionId = threadID
+        if sessions[canonicalID] == nil { sessions[canonicalID] = legacy }
+        removeSession(threadID)
+    }
+
     // MARK: - Public lifecycle
 
     /// Start watching `com.openai.codex` in NSWorkspace and, whenever it's
@@ -411,6 +463,7 @@ extension AppState {
         guard let thread = params["thread"]?.asObject else { return }
         guard let threadId = thread["id"]?.asString else { return }
         let sessionId = AppState.codexAppSessionPrefix + threadId
+        adoptLegacyCodexDesktopSession(threadID: threadId)
         closedCodexAppThreads.removeValue(forKey: threadId)
 
         var snapshot = sessions[sessionId] ?? SessionSnapshot(startTime: Date())
@@ -446,6 +499,7 @@ extension AppState {
     private func applyCodexThreadStatusNotification(params: [String: AnyCodableLike]) {
         guard let threadId = params["threadId"]?.asString else { return }
         let sessionId = AppState.codexAppSessionPrefix + threadId
+        adoptLegacyCodexDesktopSession(threadID: threadId)
         guard var snapshot = sessions[sessionId] else { return }
 
         let waitBefore = displayOnlyWaitKind(forSession: sessionId)
@@ -459,6 +513,7 @@ extension AppState {
     private func applyCodexThreadClosedNotification(params: [String: AnyCodableLike]) {
         guard let threadId = params["threadId"]?.asString else { return }
         let sessionId = AppState.codexAppSessionPrefix + threadId
+        adoptLegacyCodexDesktopSession(threadID: threadId)
         closedCodexAppThreads[threadId] = Date()
         removeSession(sessionId)
     }
