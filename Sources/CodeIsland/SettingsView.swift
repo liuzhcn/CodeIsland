@@ -193,6 +193,7 @@ private struct RemoteHostRow: View {
     let host: RemoteHost
 
     @State private var cwdFilterDraft = ""
+    @State private var editingHost: RemoteHost?
 
     private var status: SSHForwarder.Status {
         remoteManager.connectionStatus[host.id] ?? .disconnected
@@ -253,6 +254,10 @@ private struct RemoteHostRow: View {
                 .onSubmit { saveCwdFilter() }
 
             HStack(spacing: 8) {
+                Button(l10n["remote_edit"]) {
+                    editingHost = host
+                }
+
                 switch status {
                 case .connected, .connecting:
                     Button(l10n["remote_disconnect"]) {
@@ -277,6 +282,9 @@ private struct RemoteHostRow: View {
             .buttonStyle(.bordered)
         }
         .padding(.vertical, 4)
+        .sheet(item: $editingHost) { host in
+            RemoteHostEditor(host: host)
+        }
     }
 
     private func saveCwdFilter() {
@@ -285,6 +293,82 @@ private struct RemoteHostRow: View {
         var updated = host
         updated.cwdFilter = trimmed
         remoteManager.updateHost(updated)
+    }
+}
+
+private struct RemoteHostEditor: View {
+    @ObservedObject private var l10n = L10n.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: RemoteHost
+    @State private var port: String
+
+    init(host: RemoteHost) {
+        _draft = State(initialValue: host)
+        _port = State(initialValue: host.port.map(String.init) ?? "")
+    }
+
+    private var trimmedPort: String {
+        port.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var validPort: Bool {
+        trimmedPort.isEmpty || Int(trimmedPort).map { (1...65535).contains($0) } == true
+    }
+
+    private var canSave: Bool {
+        !draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !draft.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && validPort
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(l10n["remote_edit_title"])
+                .font(.headline)
+
+            Form {
+                TextField(l10n["remote_name"], text: $draft.name)
+                TextField(l10n["remote_host"], text: $draft.host)
+                TextField(l10n["remote_user"], text: $draft.user)
+                TextField(l10n["remote_port"], text: $port)
+                if !validPort {
+                    Text(l10n["remote_port_invalid"])
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                TextField(l10n["remote_identity"], text: $draft.identityFile)
+                TextField(l10n["remote_auth_socket"], text: $draft.authSocket,
+                          prompt: Text(l10n["remote_auth_socket_placeholder"]))
+                TextField(l10n["remote_cwd_filter"], text: $draft.cwdFilter,
+                          prompt: Text(l10n["remote_cwd_filter_placeholder"]))
+                Toggle(l10n["remote_auto_connect"], isOn: $draft.autoConnect)
+            }
+
+            HStack {
+                Spacer()
+                Button(l10n["remote_edit_cancel"]) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button(l10n["remote_edit_save"]) { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canSave)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
+    }
+
+    private func save() {
+        guard canSave else { return }
+        var updated = draft
+        updated.name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.host = draft.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.user = draft.user.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.port = Int(trimmedPort)
+        updated.identityFile = draft.identityFile.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.authSocket = draft.authSocket.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.cwdFilter = draft.cwdFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        RemoteManager.shared.updateHost(updated)
+        dismiss()
     }
 }
 

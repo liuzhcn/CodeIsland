@@ -93,7 +93,8 @@ final class RemoteManager: ObservableObject {
     func updateHost(_ host: RemoteHost) {
         guard let index = hosts.firstIndex(where: { $0.id == host.id }) else { return }
         let previous = hosts[index]
-        let wasConnected = (connectionStatus[host.id] == .connected)
+        let wasActive = connectionStatus[host.id] == .connected
+            || connectionStatus[host.id] == .connecting
         hosts[index] = host
         save()
         // Only bounce the tunnel when a field the SSH connection depends on
@@ -104,7 +105,7 @@ final class RemoteManager: ObservableObject {
             || previous.port != host.port
             || previous.identityFile != host.identityFile
             || previous.authSocket != host.authSocket
-        if wasConnected && connectionChanged {
+        if wasActive && connectionChanged {
             reconnect(id: host.id)
         }
     }

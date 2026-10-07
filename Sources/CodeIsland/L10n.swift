@@ -424,6 +424,11 @@ final class L10n: ObservableObject {
         "remote_disconnected": "Disconnected",
         "remote_disconnect": "Disconnect",
         "remote_remove": "Remove",
+        "remote_edit": "Edit",
+        "remote_edit_title": "Edit Remote Host",
+        "remote_edit_cancel": "Cancel",
+        "remote_edit_save": "Save",
+        "remote_port_invalid": "Enter an SSH port from 1 to 65535, or leave it empty to use SSH configuration.",
 
         // Buddy
         "buddy": "Buddy",
@@ -928,6 +933,11 @@ final class L10n: ObservableObject {
         "remote_disconnected": "Getrennt",
         "remote_disconnect": "Trennen",
         "remote_remove": "Entfernen",
+        "remote_edit": "Bearbeiten",
+        "remote_edit_title": "Remote-Host bearbeiten",
+        "remote_edit_cancel": "Abbrechen",
+        "remote_edit_save": "Speichern",
+        "remote_port_invalid": "SSH-Port von 1 bis 65535 eingeben oder für die SSH-Konfiguration leer lassen.",
 
         // Buddy
         "buddy": "Buddy",
@@ -1436,6 +1446,11 @@ final class L10n: ObservableObject {
         "remote_disconnected": "未连接",
         "remote_disconnect": "断开",
         "remote_remove": "删除",
+        "remote_edit": "编辑",
+        "remote_edit_title": "编辑远程主机",
+        "remote_edit_cancel": "取消",
+        "remote_edit_save": "保存",
+        "remote_port_invalid": "端口须为 1–65535 的整数；留空则使用 SSH 配置。",
 
         // Buddy
         "buddy": "Buddy",
@@ -1944,6 +1959,11 @@ final class L10n: ObservableObject {
         "remote_disconnected": "未連線",
         "remote_disconnect": "中斷連線",
         "remote_remove": "刪除",
+        "remote_edit": "編輯",
+        "remote_edit_title": "編輯遠端主機",
+        "remote_edit_cancel": "取消",
+        "remote_edit_save": "儲存",
+        "remote_port_invalid": "連接埠須為 1–65535 的整數；留空則使用 SSH 設定。",
 
         // Buddy
         "buddy": "Buddy",
@@ -2452,6 +2472,11 @@ final class L10n: ObservableObject {
         "remote_disconnected": "未接続",
         "remote_disconnect": "切断",
         "remote_remove": "削除",
+        "remote_edit": "編集",
+        "remote_edit_title": "リモートホストを編集",
+        "remote_edit_cancel": "キャンセル",
+        "remote_edit_save": "保存",
+        "remote_port_invalid": "SSH ポートは 1〜65535 の整数を入力してください。空欄の場合は SSH 設定を使用します。",
 
         // Buddy
         "buddy": "Buddy",
@@ -2960,6 +2985,11 @@ final class L10n: ObservableObject {
         "remote_disconnected": "연결 끊김",
         "remote_disconnect": "연결 해제",
         "remote_remove": "삭제",
+        "remote_edit": "편집",
+        "remote_edit_title": "원격 호스트 편집",
+        "remote_edit_cancel": "취소",
+        "remote_edit_save": "저장",
+        "remote_port_invalid": "SSH 포트는 1~65535의 정수여야 합니다. 비워 두면 SSH 설정을 사용합니다.",
 
         // Buddy
         "buddy": "Buddy",
@@ -3468,6 +3498,11 @@ final class L10n: ObservableObject {
         "remote_disconnected": "Bağlı Değil",
         "remote_disconnect": "Bağlantıyı Kes",
         "remote_remove": "Kaldır",
+        "remote_edit": "Düzenle",
+        "remote_edit_title": "Uzaktan Hostu Düzenle",
+        "remote_edit_cancel": "İptal",
+        "remote_edit_save": "Kaydet",
+        "remote_port_invalid": "1 ile 65535 arasında bir SSH bağlantı noktası girin veya SSH yapılandırması için boş bırakın.",
 
         // Buddy
         "buddy": "Buddy",
