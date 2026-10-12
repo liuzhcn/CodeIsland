@@ -10,13 +10,18 @@ final class AppStateCodexAppServerTests: XCTestCase {
         ))
     }
 
-    func testNestedDesktopExecutableAndPersistedHookUseDesktopIdentity() {
+    func testBundledExecutableRequiresDesktopBundleToRestoreDesktopIdentity() {
         let path = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
-        XCTAssertTrue(AppState.isCodexExecutablePath(path))
+        XCTAssertTrue(AppState.isBundledCodexCLIPath(path))
+        XCTAssertFalse(AppState.isCodexExecutablePath(path))
         XCTAssertFalse(AppState.isCodexExecutablePath("/opt/homebrew/bin/codex"))
         XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
             sessionId: "thread", source: "codex", providerSessionId: "thread",
             termBundleId: nil, executablePath: path
+        ), "thread")
+        XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
+            sessionId: "thread", source: "codex", providerSessionId: "thread",
+            termBundleId: "com.openai.codex", executablePath: path
         ), "codexapp:thread")
         XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
             sessionId: "thread", source: "codex", providerSessionId: "thread",
