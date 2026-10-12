@@ -49,6 +49,13 @@ struct PersistedSession: Codable {
     // against the transcript by the attach-time backfill.
     var recap: SessionRecap? = nil
     var reasoningEffort: String? = nil
+    /// Claude Desktop Code-tab session id, so a restored card still opens its
+    /// exact session. Defaulted like the fields above for older files.
+    var claudeDesktopSessionId: String? = nil
+    /// A Hermes gateway chat (see `SessionSnapshot.hermesChatElsewhere`): its
+    /// restored card is bound to the gateway daemon again and must still be
+    /// swept like a hook-only one. nil = false, as in older files.
+    var hermesChatElsewhere: Bool? = nil
 }
 
 enum SessionPersistence {
@@ -125,7 +132,9 @@ enum SessionPersistence {
                 closedSubagentIds: s.closedSubagentIds.isEmpty ? nil : s.closedSubagentIds,
                 agentTasks: s.agentTasks.isEmpty ? nil : s.agentTasks,
                 recap: s.recap,
-                reasoningEffort: s.reasoningEffort
+                reasoningEffort: s.reasoningEffort,
+                claudeDesktopSessionId: s.claudeDesktopSessionId,
+                hermesChatElsewhere: s.hermesChatElsewhere ? true : nil
             )
         }
         do {

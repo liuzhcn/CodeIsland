@@ -131,19 +131,23 @@ It works with **30+ AI coding tools**, installs its hooks for you, and keeps eve
 <td align="center"><img src="docs/images/mascots/kiro.gif" width="48" alt=""><br><sub><b>Kiro CLI</b></sub></td>
 <td align="center"><img src="docs/images/mascots/stepfun.gif" width="48" alt=""><br><sub><b>StepFun</b></sub></td>
 <td align="center"><img src="docs/images/mascots/workbuddy.gif" width="48" alt=""><br><sub><b>WorkBuddy</b></sub></td>
+<td align="center"><img src="Sources/CodeIsland/Resources/cli-icons/minimax.png" width="40" alt=""><br><sub><b>MiniMax Code CLI</b></sub></td>
 <td align="center"><img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="40" alt=""><br><sub><b>DeepSeek Harness</b></sub></td>
 <td align="center"><img src="docs/images/mascots/aiwork.gif" width="48" alt=""><br><sub><b>AiWork</b></sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/mascots/mimo.gif" width="48" alt=""><br><sub><b>MiMo Code /<br>Xiaomi MiMo</b></sub></td>
 <td align="center"><sub><b>+ more</b><br>see below ↓</sub></td>
 </tr>
 </table>
 
-**Also covered:** Trae CN, Trae CLI / Trae CLI Next, Qoder CN, QoderWork and Qoder CLI, Cursor CLI, CodeBuddy CN, Claude Desktop (Code tab, and [Cowork](#cowork)), ZCode — plus any tool with Claude-style hooks, added as a **custom CLI** in Settings → Hooks.
+**Also covered:** Trae CN, Trae CLI / Trae CLI Next, Qoder CN, Qoder App, QoderWork and Qoder CLI, Cursor CLI, CodeBuddy CN, Claude Desktop (Code tab, and [Cowork](#cowork)), ZCode — plus any tool with Claude-style hooks, added as a **custom CLI** in Settings → Hooks.
 
 **Several accounts?** Register extra Claude Code, Codex and Grok config directories (e.g. a second `CLAUDE_CONFIG_DIR`) in **Settings → Hooks**; each gets its own hooks and status, and sessions, transcripts and usage cover all of them.
 
 **Knows where it runs:** sessions inside **tmux**, **zellij**, **Herdr** or **T3 Code** get a chip next to the terminal badge, and click-to-jump goes to the right pane or thread.
 
-**Approvals & questions** can be answered from the island for tools whose hooks wait for a decision — Claude Code, Codex, Gemini CLI, Qoder, Qwen Code, Trae CLI Next, ZCode, OpenCode, Pi / Oh My Pi, DeepSeek Harness and others. Tools whose hooks can't carry a decision (Google Antigravity, AiWork) are shown read-only, and approvals stay in their own UI.
+**Approvals & questions** can be answered from the island for tools whose hooks wait for a decision — Claude Code, Codex, Gemini CLI, Qoder, Qwen Code, Trae CLI Next, ZCode, OpenCode, MiMo Code / Xiaomi MiMo, Pi / Oh My Pi, DeepSeek Harness and others; MiniMax Code CLI for the 10 seconds mcode lets a hook wait. Tools whose hooks can't carry a decision (Google Antigravity, AiWork) are shown read-only, and approvals stay in their own UI.
 
 <details>
 <summary><b>Where each integration is installed</b></summary>
@@ -160,17 +164,19 @@ CodeIsland writes these for you on launch (and repairs them if they drift); each
 | Google Antigravity | `~/.gemini/config/hooks.json` |
 | Cursor / Cursor CLI | `~/.cursor/hooks.json` |
 | Grok CLI | `~/.grok/hooks/codeisland.json` |
-| Qoder / Qoder CN / QoderWork | `~/.qoder/`, `~/.qoder-cn/`, `~/.qoderwork/` `settings.json` |
+| Qoder (IDE and Qoder App) / Qoder CN / QoderWork | `~/.qoder/`, `~/.qoder-cn/`, `~/.qoderwork/` `settings.json` |
 | Trae / Trae CN | `~/.trae/hooks.json`, `~/.trae-cn/hooks.json` (turn on global hooks in Trae) |
 | Trae CLI / Trae CLI Next | `~/.trae/traecli.yaml`, `~/.trae/cli/hooks.json` |
 | Factory, CodeBuddy, StepFun, WorkBuddy, Qwen Code | `~/.<tool>/settings.json` |
 | Copilot CLI | `~/.copilot/hooks/codeisland.json` |
 | Kimi Code CLI | `~/.kimi-code/config.toml` (or legacy `~/.kimi/`) |
 | Kiro CLI | `~/.kiro/agents/codeisland.json` — launch with `kiro --agent codeisland` |
-| Hermes | `~/.hermes/config.yaml` |
+| Hermes | `~/.hermes/config.yaml` — [approve the hooks once](#hermes) |
 | ZCode | `~/.zcode/cli/config.json` |
+| MiniMax Code CLI | plugin at `~/.minimax/plugins/codeisland/` (honours `$MINIMAX_DATA_DIR`) |
 | Cline | `~/Documents/Cline/Hooks` |
 | OpenCode | plugin at `~/.config/opencode/plugins/codeisland.js` |
+| MiMo Code / Xiaomi MiMo | plugin at `~/.config/mimocode/plugins/codeisland.js` — [see below](#mimo) |
 | Pi / Oh My Pi | extension at `~/.pi/agent/extensions/codeisland.ts` / `~/.omp/agent/extensions/codeisland.ts` |
 | OpenClaw | plugin at `~/.openclaw/codeisland-plugin/` |
 | DeepSeek Harness | [dsh-island](https://github.com/cdxiaodong/dsh-island) plugin — see [below](#deepseek-harness) |
@@ -219,6 +225,8 @@ A small ESP32 screen on your desk, driven over Bluetooth: it sleeps when your ag
 
 Codex won't run a hook it hasn't been shown. After installing, Codex prints `1 hook needs review before it can run.` — run `/hooks`, review the CodeIsland entries and trust them. Until you do, Codex silently ignores them, which looks exactly like CodeIsland not supporting Codex. Codex stores a hash per trusted hook in `~/.codex/config.toml` under `[hooks.state]`, so if a CodeIsland update rewrites `~/.codex/hooks.json`, review them once more.
 
+Codex Auto Review stays with Codex. When a turn runs under Auto Review, CodeIsland hands its permission requests back to Codex without approving or denying them. It takes the turn's reviewer from the session's local rollout (`turn_context`), so a choice made in the Codex desktop permission menu counts, and falls back to `approvals_reviewer` in `config.toml`. Turns set to human review, and questions, still come to the island.
+
 While a Codex turn runs, the collapsed bar shows the agent's latest public output when no tool is active. Hidden reasoning, encrypted content, tool results and internal subagent messages are never displayed.
 
 </details>
@@ -229,6 +237,28 @@ While a Codex turn runs, the collapsed bar shows the agent's latest public outpu
 <br>
 
 A single JS plugin talks to the socket directly — no bridge binary. The same file serves OpenCode 1.x (`server()`) and OpenCode 2 (`setup()`); OpenCode 2 auto-loads it from `~/.config/opencode/plugins/`. Under OpenCode 2's shared background service, click-to-jump reaches the terminal app but not the exact tab, and questions are answered through the service's local HTTP API.
+
+</details>
+
+<a name="mimo"></a>
+<details>
+<summary><b>MiMo Code and Xiaomi MiMo desktop</b></summary>
+
+<br>
+
+MiMo Code is an OpenCode 1.x fork, and the Xiaomi MiMo desktop app runs it as its engine, so both load the OpenCode plugin from `~/.config/mimocode/plugins/` — CodeIsland writes it there labelled as MiMo and leaves `mimocode.json` alone. MiMo reads plugins when its engine starts, so restart the app (or `mimo`) once after the plugin is installed. Approvals and questions can be answered on the island or in MiMo, whichever comes first. Clicking a desktop session brings Xiaomi MiMo to the front; the app's `xiaomi-mimo://` links only join shared sessions, so there is no way to open one specific conversation.
+
+</details>
+
+<a name="hermes"></a>
+<details>
+<summary><b>Hermes — approve the hooks once</b></summary>
+
+<br>
+
+Hermes asks before it runs a hook it hasn't seen, once per hook. The next time you start `hermes` in a terminal, answer `y` to each CodeIsland entry (`codeisland-bridge --source hermes`; on an SSH host, the `codeisland-remote-hook.py` ones). Hermes running without a terminal — the gateway service, the desktop app — can't ask, so it skips a hook nobody approved, which looks like CodeIsland not seeing those sessions. Approve them in a terminal once (the approval is kept per Hermes home, so it covers the gateway and the desktop app too), or set `hooks_auto_accept: true` in `~/.hermes/config.yaml`. A CodeIsland update that adds a hook asks again for the new one.
+
+Gateway chats (Telegram, Discord, Slack, WhatsApp, email and the rest, and the API server) get cards too, but they don't pop a completion card or play a sound, and an idle one goes after 10 minutes. A card goes when its session ends: `/new`, quitting `hermes`, closing a desktop conversation, or the gateway shutting down. Session titles are read from Hermes's own `state.db`, read-only.
 
 </details>
 

@@ -51,6 +51,8 @@ struct MascotView: View {
                 StepFunView(status: status, size: size)
             case "opencode":
                 OpenCodeView(status: status, size: size)
+            case "mimo":
+                MiMoView(status: status, size: size)
             case "qwen":
                 QwenView(status: status, size: size)
             case "antigravity":
@@ -71,6 +73,8 @@ struct MascotView: View {
                 ClineView(status: status, size: size)
             case "aiwork", "aiwork-cli":
                 AiWorkView(status: status, size: size)
+            case "minimax":
+                MinimaxView(status: status, size: size)
             default:
                 ClawdView(status: status, size: size)
             }

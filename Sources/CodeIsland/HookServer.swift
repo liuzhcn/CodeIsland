@@ -395,7 +395,11 @@ class HookServer {
             return parentSessionId
         }
 
-        guard let ppid = Self.pluginPpid(from: raw) else { return nil }
+        // Every Codex Desktop thread runs in the one shared app-server, so a
+        // same-PID card says nothing about parentage there (it can even be the
+        // thread's own card). Desktop children are found by metadata above.
+        guard raw["_term_bundle"] as? String != AppState.codexAppBundleId,
+              let ppid = Self.pluginPpid(from: raw) else { return nil }
 
         // Current Codex hook payloads do not expose parent session metadata for
         // native subagents, but child sessions run inside the same Codex CLI
@@ -628,6 +632,13 @@ class HookServer {
 
         switch mode {
         case "hide":
+            // Hiding the card must not approve what Codex's auto reviewer
+            // would otherwise judge (#165): hand it back undecided instead.
+            if Self.rawEventName(from: raw).map(EventNormalizer.normalize) == "PermissionRequest",
+               let event = HookEvent(from: data),
+               Self.shouldDeferPermissionRequestToProvider(event) {
+                return (data, Data("{}".utf8))
+            }
             return (data, Self.hiddenPluginResponse(for: raw))
         case "merge":
             guard let parentSessionId else { return (data, nil) }

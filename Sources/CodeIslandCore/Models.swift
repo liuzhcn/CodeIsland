@@ -1,22 +1,14 @@
 import Foundation
 
-public enum CLIProcessResolver {
-    /// Resolve the owning desktop bundle, including the nested CodexCLI.app layout.
-    public static func isCodexDesktopExecutablePath(_ path: String) -> Bool {
-        var url = URL(fileURLWithPath: path).standardizedFileURL
-        guard url.lastPathComponent.lowercased() == "codex" else { return false }
-        while url.path != "/" {
-            url.deleteLastPathComponent()
-            guard url.pathExtension.lowercased() == "app" else { continue }
-            let name = url.deletingPathExtension().lastPathComponent.lowercased()
-            if Bundle(url: url)?.bundleIdentifier == "com.openai.codex"
-                || name == "codex" || name == "chatgpt" {
-                return true
-            }
-        }
-        return false
-    }
+/// A running Codex process that session discovery maps rollouts to.
+public enum CodexProcessRole: Equatable, Sendable {
+    /// Codex Desktop's shared app-server: every Desktop thread, any cwd.
+    case desktopHost
+    /// A process that owns the rollouts started in its own cwd.
+    case session
+}
 
+public enum CLIProcessResolver {
     /// Lowercased bundle markers of the Trae CN desktop IDE (bundle id
     /// `cn.trae.app`). It has shipped as `Trae CN.app` since its first macOS
     /// build (Homebrew `trae-cn` cask; TraeCode CN 3.3.104 still is), with
@@ -33,6 +25,38 @@ public enum CLIProcessResolver {
     public static func isTraeCNBundlePath(_ path: String) -> Bool {
         let lowercasedPath = path.lowercased()
         return traeCNBundlePathMarkers.contains { lowercasedPath.contains($0) }
+    }
+
+    /// The MiMo Code CLI binary, however it was installed: the curl installer
+    /// writes `~/.mimocode/bin/mimo`; npm's `@mimo-ai/cli` keeps the real
+    /// binary at `bin/.mimocode` (its `bin/mimo` is a Node launcher, so the
+    /// process is `node`) or runs `@mimo-ai/mimocode-<os>-<arch>/bin/mimo`.
+    ///
+    /// Deliberately not the Xiaomi MiMo desktop app: it runs the same engine
+    /// inside its Electron main process and has an integrated terminal, so
+    /// claiming its bundle here would pin any agent started in that terminal
+    /// on MiMo during ancestry inference. The desktop reports itself through
+    /// the plugin's `_source` instead.
+    public static func isMimoCLIPath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        let basename = (lowercasedPath as NSString).lastPathComponent
+        return basename == "mimo"
+            || (basename == ".mimocode" && lowercasedPath.contains("/@mimo-ai/cli/"))
+            || lowercasedPath.contains("/@mimo-ai/mimocode-")
+    }
+
+    /// Lowercased bundle markers of the Xiaomi MiMo desktop app: the mainland
+    /// edition (`Xiaomi MiMo.app`, com.xiaomi.mimo.desktop) and the overseas
+    /// one (`Xiaomi MiMo AI.app`, com.xiaomi.mimo.desktop-ai). Read from the
+    /// 26.929 builds' Info.plist and product table.
+    public static let mimoDesktopBundlePathMarkers = [
+        "/xiaomi mimo.app/contents/",
+        "/xiaomi mimo ai.app/contents/",
+    ]
+
+    public static func isMimoDesktopBundlePath(_ path: String) -> Bool {
+        let lowercasedPath = path.lowercased()
+        return mimoDesktopBundlePathMarkers.contains { lowercasedPath.contains($0) }
     }
 
     public static func sourceMatchesExecutablePath(_ path: String, source: String?) -> Bool {
@@ -54,7 +78,10 @@ public enum CLIProcessResolver {
         case "codex":
             return lowercasedPath.hasSuffix("/codex") || lowercasedPath.contains("/codex ")
         case "claude":
+            // The native installer (Claude Code's default) runs the binary
+            // named by its version: ~/.local/share/claude/versions/2.1.294.
             return lowercasedPath.hasSuffix("/claude") || lowercasedPath.contains("/claude ")
+                || lowercasedPath.contains("/.local/share/claude/versions/")
         case "dsh":
             // DeepSeek Harness CLI ships a `dsh` binary. It has no shell hooks —
             // the dsh-island plugin forwards events over the socket directly.
@@ -97,6 +124,18 @@ public enum CLIProcessResolver {
             return lowercasedPath.hasSuffix("/agy")
                 || lowercasedPath.contains("/agy ")
                 || lowercasedPath.contains("/google-antigravity")
+        case "minimax":
+            // MiniMax Code CLI is `mcode` (npm @minimax-ai/code). The Node
+            // runtime renames the process title to `minimax-code`, so the
+            // renamed spelling shows up in argv where other CLIs carry their
+            // launch path; the npm layout covers launches that keep the
+            // original script path.
+            let basename = (lowercasedPath as NSString).lastPathComponent
+            return basename == "mcode"
+                || basename == "minimax-code"
+                || lowercasedPath.contains("/@minimax-ai/code/")
+        case "mimo":
+            return isMimoCLIPath(lowercasedPath)
         default:
             return lowercasedPath.contains("/\(normalizedSource)")
         }
@@ -127,6 +166,34 @@ public enum CLIProcessResolver {
             break
         }
         return nil
+    }
+
+    /// The source the bridge stamps on an event, and whether it came through
+    /// another agent's hook (`_via_plugin`).
+    ///
+    /// Declared = `--source`, or — for a direct plugin (OpenCode, MiMo Code,
+    /// Pi / OMP, OpenClaw) piping its own blocking request in without the flag
+    /// — the supported `_source` already in its payload. Only an undeclared
+    /// event is attributed by ancestry and marked as proxied. Treating a
+    /// plugin's own request as proxied let ancestry relabel it, and handed its
+    /// approval to Agent Sub-Sessions, whose "hide" mode answers `_via_plugin`
+    /// permission requests with an automatic allow.
+    ///
+    /// The one hook installed without `--source` is Claude Code's
+    /// (`codeisland-hook.sh`, so that another agent firing it — omo — is still
+    /// inferred). When the ancestry says Claude, it is Claude's own hook, not
+    /// a proxy: otherwise "hide" would auto-allow and hide every Claude Code
+    /// session whose binary ends in `/claude` (Homebrew cask, Claude Desktop).
+    public static func bridgeSource(
+        sourceTag: String?,
+        payloadSource: String?,
+        ancestry: [(pid: Int32, executablePath: String?)]
+    ) -> (source: String?, viaPlugin: Bool) {
+        let declared = sourceTag ?? SessionSnapshot.normalizedSupportedSource(payloadSource)
+        let inferred = declared ?? inferSource(ancestry: ancestry)
+        let effective = cliVariantOverride(declaredSource: inferred, ancestry: ancestry) ?? inferred
+        let viaPlugin = declared == nil && effective != nil && effective != "claude"
+        return (effective, viaPlugin)
     }
 
     public static func resolvedTrackedPID(
@@ -168,6 +235,78 @@ public enum CLIProcessResolver {
         }
 
         return immediateParentPID
+    }
+
+    /// `_term_bundle` for a Codex hook that reached the bridge without one.
+    /// ChatGPT starts Codex Desktop's app-server
+    /// (`ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`)
+    /// without `__CFBundleIdentifier`, so its hooks were keyed as a CLI
+    /// thread next to the `codexapp:` card discovery makes for the same thread.
+    ///
+    /// The binary cannot tell: it also runs Codex CLI from a terminal (ChatGPT's
+    /// `codex-cli/bin/codex` launcher) and the app-server Claude Code's Codex
+    /// plugin starts (#368), and its own outermost `.app` is ChatGPT.app every
+    /// time. So the nearest Codex process must run the `app-server` subcommand,
+    /// and its direct parent must be the app itself; `exec codex` in ChatGPT's
+    /// own terminal also leaves ChatGPT as the parent.
+    public static func codexDesktopTermBundle(ancestry: [ProcessAncestor]) -> String? {
+        guard let codexIndex = ancestry.firstIndex(where: {
+            sourceMatchesExecutablePath($0.executablePath ?? "", source: "codex")
+        }), isCodexAppServerInvocation(ancestry[codexIndex].arguments),
+              codexIndex + 1 < ancestry.count,
+              ancestry[codexIndex + 1].bundleIdentifier == "com.openai.codex" else {
+            return nil
+        }
+        return "com.openai.codex"
+    }
+
+    /// Desktop runs `codex [-c key=value]… app-server …`. Anything else ahead
+    /// of `app-server` (`exec`, `--`, another option) means it is a prompt or
+    /// an option value, not the subcommand. argv[0] must be `codex` too: an
+    /// empty one is dropped by ProcArgsParser and shifts the rest left.
+    static func isCodexAppServerInvocation(_ arguments: [String]) -> Bool {
+        codexSubcommand(arguments) == "app-server"
+    }
+
+    /// The first word after `codex [-c key=value]…`, or nil when argv[0] is
+    /// not `codex` or that word is an option. A bare prompt reads as one too,
+    /// so callers only compare it against known subcommand names.
+    static func codexSubcommand(_ arguments: [String]) -> String? {
+        guard let program = arguments.first, (program as NSString).lastPathComponent == "codex" else {
+            return nil
+        }
+        var index = 1
+        while index < arguments.count, arguments[index] == "-c" || arguments[index] == "--config" {
+            index += 2
+        }
+        guard index < arguments.count, !arguments[index].hasPrefix("-") else { return nil }
+        return arguments[index]
+    }
+
+    /// Subcommands that never write a rollout. ChatGPT keeps `exec-server`
+    /// (cloud environments) running next to Desktop's app-server, from its
+    /// Resources directory.
+    static let codexNonSessionSubcommands: Set<String> = [
+        "exec-server", "login", "logout", "completion", "sandbox", "debug",
+        "apply", "cloud", "features", "mcp", "responses-api-proxy", "stdio-to-uds",
+    ]
+
+    /// What a process running ChatGPT's bundled Codex binary is to session
+    /// discovery, from its argv and its parent (`ancestry[0]` is the Codex
+    /// process). The same file runs Desktop's app-server, which hosts every
+    /// Desktop thread; ChatGPT's helpers, which host none and must not claim
+    /// rollouts by cwd; and everything else (a terminal TUI, `exec`, the
+    /// app-server Claude Code's Codex plugin starts), which owns its own.
+    public static func codexBundledProcessRole(ancestry: [ProcessAncestor]) -> CodexProcessRole? {
+        guard let process = ancestry.first else { return nil }
+        if codexDesktopTermBundle(ancestry: ancestry) != nil {
+            return .desktopHost
+        }
+        if let subcommand = codexSubcommand(process.arguments),
+           codexNonSessionSubcommands.contains(subcommand) {
+            return nil
+        }
+        return .session
     }
 
     /// Walk the process ancestry and return the first known CLI source whose binary

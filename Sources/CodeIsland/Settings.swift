@@ -50,6 +50,7 @@ enum SettingsKey {
     // Display
     static let maxPanelHeight = "maxPanelHeight"
     static let maxVisibleSessions = "maxVisibleSessions"
+    static let sessionListDensity = "sessionListDensity"  // SessionListDensity raw value: "comfortable" | "compact"
     static let contentFontSize = "contentFontSize"
     static let aiMessageLines = "aiMessageLines"
     static let showAgentDetails = "showAgentDetails"
@@ -86,6 +87,7 @@ enum SettingsKey {
 
     // Claude plan limits (Anthropic usage endpoint via the Claude Code login)
     static let showClaudeQuota = "showClaudeQuota"
+    static let claudeQuotaChip = "claudeQuotaChip"              // ClaudeQuotaChipMode raw value
 
     // Completion notification: "expand" | "glance" | "off". Successor of the
     // boolean autoExpandOnCompletion — see AppState.completionStyle migration.
@@ -188,6 +190,7 @@ struct SettingsDefaults {
 
     static let maxPanelHeight = 560
     static let maxVisibleSessions = 5
+    static let sessionListDensity = SessionListDensity.comfortable.rawValue
     static let contentFontSize = 11
     static let aiMessageLines = 1
     static let showAgentDetails = false
@@ -212,6 +215,7 @@ struct SettingsDefaults {
     static let showModelLabel = false
     static let showUsageStats = true
     static let showClaudeQuota = false
+    static let claudeQuotaChip = "auto"
 
     static let rotationInterval = 5
 
@@ -291,6 +295,7 @@ class SettingsManager {
             SettingsKey.sessionTimeout: SettingsDefaults.sessionTimeout,
             SettingsKey.maxPanelHeight: SettingsDefaults.maxPanelHeight,
             SettingsKey.maxVisibleSessions: SettingsDefaults.maxVisibleSessions,
+            SettingsKey.sessionListDensity: SettingsDefaults.sessionListDensity,
             SettingsKey.contentFontSize: SettingsDefaults.contentFontSize,
             SettingsKey.aiMessageLines: SettingsDefaults.aiMessageLines,
             SettingsKey.showAgentDetails: SettingsDefaults.showAgentDetails,
@@ -314,6 +319,7 @@ class SettingsManager {
             SettingsKey.showModelLabel: SettingsDefaults.showModelLabel,
             SettingsKey.showUsageStats: SettingsDefaults.showUsageStats,
             SettingsKey.showClaudeQuota: SettingsDefaults.showClaudeQuota,
+            SettingsKey.claudeQuotaChip: SettingsDefaults.claudeQuotaChip,
             SettingsKey.rotationInterval: SettingsDefaults.rotationInterval,
             SettingsKey.maxToolHistory: SettingsDefaults.maxToolHistory,
             SettingsKey.showTaskProgress: SettingsDefaults.showTaskProgress,
@@ -421,6 +427,11 @@ class SettingsManager {
     var maxPanelHeight: Int {
         get { defaults.integer(forKey: SettingsKey.maxPanelHeight) }
         set { defaults.set(newValue, forKey: SettingsKey.maxPanelHeight) }
+    }
+
+    var sessionListDensity: SessionListDensity {
+        get { SessionListDensity(storedValue: defaults.string(forKey: SettingsKey.sessionListDensity)) }
+        set { defaults.set(newValue.rawValue, forKey: SettingsKey.sessionListDensity) }
     }
 
     var contentFontSize: Int {

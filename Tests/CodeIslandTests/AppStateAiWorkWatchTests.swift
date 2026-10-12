@@ -316,6 +316,24 @@ final class AppStateAiWorkWatchTests: XCTestCase {
         XCTAssertNotNil(appState.sessions["claude-other"])
     }
 
+    /// A dropped AiWork session takes its completion card with it. Removed
+    /// behind the card's back, the card stayed up empty, and the session list
+    /// under it once fell back to drawing every session as a completion card
+    /// (#357).
+    func testRemovingAiWorkSessionFoldsItsCompletionCard() {
+        let appState = makeAppState()
+        appState.sessions["aiwork:acp:coder:1"] = {
+            var s = SessionSnapshot(); s.source = "aiwork"; s.providerSessionId = "acp:coder:1"; return s
+        }()
+        appState.sessions["claude-other"] = SessionSnapshot()
+        appState.surface = .completionCard(sessionId: "aiwork:acp:coder:1")
+
+        appState.removeAiWorkSessions(agentId: "coder")
+
+        XCTAssertNil(appState.sessions["aiwork:acp:coder:1"])
+        XCTAssertEqual(appState.surface, .collapsed)
+    }
+
     func testApplyListEntryBackfillFilterHelpers() {
         var snapshot = SessionSnapshot()
         let entry: [String: AnyCodableLike] = [

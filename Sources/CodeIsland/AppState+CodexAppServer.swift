@@ -17,6 +17,9 @@ extension AppState {
     // handlers on background queues can read them without Swift 6
     // Sendable warnings.
     nonisolated static let codexAppBundleId = "com.openai.codex"
+    /// Where newer ChatGPT releases keep the Codex binary, relative to the
+    /// app bundle; older ones shipped it as `Contents/Resources/codex`.
+    nonisolated static let bundledCodexCLIRelativePath = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 
     /// Resolve hook identity on receipt as well as in the bridge. Environment
     /// metadata may be missing on a later hook; a live desktop PID or an already
@@ -239,13 +242,16 @@ extension AppState {
         },
         fallbackPaths: [String] = [
             CodexAppServerClient.defaultExecutablePath,
-            NSHomeDirectory() + "/Applications/Codex.app/Contents/Resources/codex"
+            NSHomeDirectory() + "/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/" + AppState.bundledCodexCLIRelativePath,
+            NSHomeDirectory() + "/Applications/ChatGPT.app/" + AppState.bundledCodexCLIRelativePath,
         ],
         fileManager: FileManager = .default
     ) -> URL? {
         var candidates: [URL] = []
         for bundleURL in runningBundleURLs {
             candidates.append(bundleURL.appendingPathComponent("Contents/Resources/codex"))
+            candidates.append(bundleURL.appendingPathComponent(bundledCodexCLIRelativePath))
         }
         candidates.append(contentsOf: fallbackPaths.map { URL(fileURLWithPath: $0) })
 
@@ -397,7 +403,8 @@ extension AppState {
         questionQueue.append(request)
         pushQuestionQueued(request, sessionId: sessionId, smartSuppressed: false)
 
-        if questionQueue.count == 1 {
+        // First of a burst, as in `handleQuestion`.
+        if nextVisibleQuestion?.id == request.id {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion() {
                 withAnimation(NotchAnimation.open) {

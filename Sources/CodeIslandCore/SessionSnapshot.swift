@@ -27,6 +27,9 @@ public struct SessionSnapshot: Sendable {
         "codybuddycn",
         "stepfun",
         "opencode",
+        // MiMo Code (Xiaomi's OpenCode 1.x fork) and the Xiaomi MiMo desktop
+        // app, which runs MiMo Code as its engine — one plugin feeds both.
+        "mimo",
         "antigravity",
         "google-antigravity",
         "workbuddy",
@@ -42,6 +45,7 @@ public struct SessionSnapshot: Sendable {
         "zcode",
         "aiwork",
         "aiwork-cli",
+        "minimax",
     ]
 
     /// Sources whose tool/description text arrives as a rapid delta stream
@@ -156,6 +160,10 @@ public struct SessionSnapshot: Sendable {
     /// Claude Agent Teams sessions), which is what used to send click-to-jump
     /// to a blank Terminal.app window.
     public var orcaWorktreeId: String?
+    /// Claude Desktop's own id for a Code-tab session (`local_…`, from
+    /// CLAUDE_CODE_HOST_SESSION_ID) — what its `claude://code/continue` link
+    /// takes to open that exact session instead of just raising the app.
+    public var claudeDesktopSessionId: String?
     public var cliPid: pid_t?            // CLI process PID (from bridge _ppid)
     public var cliStartTime: Date?       // Start time of the tracked CLI PID (guards PID reuse)
     /// UI harness (T3 Code, …) that spawned the CLI, found by walking the
@@ -164,6 +172,10 @@ public struct SessionSnapshot: Sendable {
     public var hostHarness: HostHarness?
     public var source: String = "claude" // "claude" or "codex"
     public var interrupted: Bool = false
+    /// The last turn ended on an error (Claude Code / Grok `StopFailure`, a
+    /// failed AiWork stream or Cowork turn); the card's status reads ERROR
+    /// until the next prompt. Set by AppState.enqueueCompletion. Transient.
+    public var lastTurnFailed: Bool = false
     /// Cline-specific: true after TaskComplete/TaskCancel until the next TaskStart/TaskResume.
     /// Cline runs hooks asynchronously (background bridge), so events from prior tools can
     /// arrive after a TaskCancel and revive the session. This flag drops those stale events.
@@ -199,6 +211,19 @@ public struct SessionSnapshot: Sendable {
     /// until one is seen. Transcript lines carry only the bare API id, so this
     /// is the one place a switch *to or from* the `[1m]` variant shows up.
     public var configuredLongContext: Bool?
+    /// Hermes hooks reported this card's prompts (`pre_llm_call`) / replies
+    /// (`post_llm_call`) themselves. Hooks are on time where Hermes's own store
+    /// lags behind, so once they do, the store only supplies the title; see
+    /// ``applyHermesStore(_:)``. Transient, never persisted.
+    public var hermesHooksReportPrompts = false
+    public var hermesHooksReportReplies = false
+    /// The latest Hermes turn hook came from a conversation held away from
+    /// this Mac (a gateway chat, the API server; see
+    /// ``HermesHookPayload/isQuiet(_:)``). The process behind such a card is
+    /// the gateway daemon, which outlives every chat it serves, so the idle
+    /// card is swept like a hook-only one. Persisted: a restored card is
+    /// bound to the daemon again.
+    public var hermesChatElsewhere = false
 
     public init(startTime: Date = Date()) {
         self.startTime = startTime
@@ -345,6 +370,30 @@ public struct SessionSnapshot: Sendable {
             "oh my pi": "pi",
             "z-code": "zcode",
             "z code": "zcode",
+            // MiniMax Code CLI — the executable is `mcode` (npm @minimax-ai/code)
+            // and the Node runtime renames the process title to `minimax-code`,
+            // so both spellings (and the product name) normalize onto `minimax`.
+            "mcode": "minimax",
+            "minimax-code": "minimax",
+            "minimaxcode": "minimax",
+            "minimax-cli": "minimax",
+            "minimaxcli": "minimax",
+            "minimax-code-cli": "minimax",
+            // MiMo Code (`mimo` CLI, npm @mimo-ai/cli) and the Xiaomi MiMo
+            // desktop app share one source: the app's engine is MiMo Code.
+            // No prefix rule — "mimo…" is too short a stem to claim.
+            "mimocode": "mimo",
+            "mimo-code": "mimo",
+            "mimo_code": "mimo",
+            "mimo code": "mimo",
+            "mimo-cli": "mimo",
+            "mimocli": "mimo",
+            "mimo-desktop": "mimo",
+            "mimodesktop": "mimo",
+            "xiaomi-mimo": "mimo",
+            "xiaomimimo": "mimo",
+            "xiaomi mimo": "mimo",
+            "xiaomi-mimo-ai": "mimo",
         ]
         let canonical = aliases[normalized] ?? normalized
         let dynamicSupportedSources = supportedSources.union(loadCustomSources())
@@ -362,6 +411,7 @@ public struct SessionSnapshot: Sendable {
         if canonical.hasPrefix("qwen") { return "qwen" }
         if canonical.hasPrefix("kiro") { return "kiro" }
         if canonical.hasPrefix("kimi") { return "kimi" }
+        if canonical.hasPrefix("minimax") { return "minimax" }
         if canonical.hasPrefix("codybuddycn") || canonical.hasPrefix("codebuddycn") { return "codybuddycn" }
         if canonical.hasPrefix("stepfun") { return "stepfun" }
         if canonical.hasPrefix("traecn") { return "traecn" }
@@ -662,7 +712,7 @@ public struct SessionSnapshot: Sendable {
         case "trae": return "Trae"
         case "traecn": return "Trae CN"
         case "traecli": return "Traecli"
-        case "qoder": return "Qoder"
+        case "qoder": return termBundleId == "com.qoder.ide" ? "Qoder IDE" : "Qoder"
         case "qoder-cli": return "Qoder CLI"
         case "qoderwork": return "QoderWork"
         case "droid": return "Factory"
@@ -670,6 +720,7 @@ public struct SessionSnapshot: Sendable {
         case "codybuddycn": return "CodyBuddyCN"
         case "stepfun": return "StepFun"
         case "opencode": return "OpenCode"
+        case "mimo": return "MiMo"
         case "antigravity": return "AntiGravity"
         case "google-antigravity": return "Google Antigravity"
         case "workbuddy": return "WorkBuddy"
@@ -684,6 +735,7 @@ public struct SessionSnapshot: Sendable {
         case "zcode": return "ZCode"
         case "aiwork": return "AiWork"
         case "aiwork-cli": return "AiWork CLI"
+        case "minimax": return "MiniMax Code CLI"
         default:
             if let customName = Self.loadCustomSourceNames()[source] {
                 return customName
@@ -742,7 +794,8 @@ public struct SessionSnapshot: Sendable {
         "com.todesktop.230313mzl4w4u92": "Cursor",
         "com.trae.app": "Trae",
         "cn.trae.app": "Trae CN",
-        "com.qoder.ide": "Qoder",
+        "com.qoder.ide": "Qoder IDE",
+        "com.qoder.app": "Qoder",
         "com.factory.app": "Factory",
         "com.tencent.codebuddy": "CodeBuddy",
         "com.tencent.codebuddy.cn": "CodyBuddyCN",
@@ -754,6 +807,10 @@ public struct SessionSnapshot: Sendable {
         // and fire the same ~/.claude/settings.json hooks as the CLI.
         "com.anthropic.claudefordesktop": "Claude",
         "com.alipay.dtcoder.ide": "AiWork",
+        // Xiaomi MiMo desktop — mainland and overseas ("AI") editions are
+        // separate installs with their own bundle ids.
+        "com.xiaomi.mimo.desktop": "Xiaomi MiMo",
+        "com.xiaomi.mimo.desktop-ai": "Xiaomi MiMo AI",
     ]
 
     /// Maps native app bundle IDs to their expected source identifier.
@@ -764,6 +821,8 @@ public struct SessionSnapshot: Sendable {
         // Trae CN ships as its own app (`Trae CN.app`), not inside Trae.app.
         "cn.trae.app": "traecn",
         "com.qoder.ide": "qoder",
+        // Qoder App is separate from the IDE, but shares its ~/.qoder hooks.
+        "com.qoder.app": "qoder",
         "com.factory.app": "droid",
         "com.tencent.codebuddy": "codebuddy",
         "com.tencent.codebuddy.cn": "codybuddycn",
@@ -777,6 +836,10 @@ public struct SessionSnapshot: Sendable {
         // __CFBundleIdentifier, so desktop Code sessions arrive tagged with it.
         "com.anthropic.claudefordesktop": "claude",
         "com.alipay.dtcoder.ide": "aiwork",
+        // Xiaomi MiMo desktop runs MiMo Code in its own main process, so the
+        // plugin's events carry the app's __CFBundleIdentifier.
+        "com.xiaomi.mimo.desktop": "mimo",
+        "com.xiaomi.mimo.desktop-ai": "mimo",
     ]
 
     /// Source id for the native app that owns `bundleId`, if any.
@@ -1133,6 +1196,7 @@ public func reduceEvent(
     switch eventName {
     case "UserPromptSubmit":
         sessions[sessionId]?.interrupted = false
+        sessions[sessionId]?.lastTurnFailed = false
         sessions[sessionId]?.taskRoundEnded = false
         sessions[sessionId]?.clearRecapIfSuperseded(byPromptAt: Date())
         if sessions[sessionId]?.source == "codex" {
@@ -1146,18 +1210,21 @@ public func reduceEvent(
            source == "cursor" || source == "cursor-cli" {
             sessions[sessionId]?.clearClosedSubagentId(sessionId)
         }
-        // Probe a wider set of field names + nested containers. Qwen Code (#103),
-        // Hermes (#117), and most Claude forks put the prompt at "prompt" top-level,
-        // but some forks nest it inside `input` / `data` / `payload` / `params`,
-        // and Cursor's `beforeSubmitPrompt` uses a different shape. Empty strings
-        // are skipped so we don't insert blank chat rows when a hook fires with
-        // a placeholder.
+        // Probe a wider set of field names + nested containers. Qwen Code (#103)
+        // and most Claude forks put the prompt at "prompt" top-level, but some
+        // forks nest it inside `input` / `data` / `payload` / `params`, Hermes's
+        // pre_llm_call sends `extra.user_message`, and Cursor's
+        // `beforeSubmitPrompt` uses a different shape. Empty strings are skipped
+        // so we don't insert blank chat rows when a hook fires with a placeholder.
         let prompt = firstStringFromEvent(
             event,
-            keys: ["prompt", "user_prompt", "userPrompt", "message", "input", "content", "text"],
+            keys: ["prompt", "user_prompt", "userPrompt", "user_message", "message", "input", "content", "text"],
             includeNested: true
         )
         if let prompt {
+            if sessions[sessionId]?.source == "hermes" {
+                sessions[sessionId]?.hermesHooksReportPrompts = true
+            }
             sessions[sessionId]?.lastUserPrompt = prompt
             if sessions[sessionId]?.recentMessages.last?.isUser == true {
                 sessions[sessionId]?.recentMessages.removeLast()
@@ -1243,20 +1310,33 @@ public func reduceEvent(
             sessions[sessionId]?.status = .processing
         }
     case "AgentTurnSettled":
-        // A model response just completed. Drop the tool chrome and record the
-        // reply, but do NOT enqueue a completion — a mid-turn response is
-        // followed within a second or two by the next pre_tool_call, which puts
-        // the card straight back to running. What settles the card is the idle
-        // sweep's daemon-source timeout, which only fires when nothing follows.
+        // Hermes's post_llm_call: the turn's final reply, sent just before
+        // on_session_end (Stop) ends the turn. Drop the tool chrome and record
+        // the reply; the completion belongs to the Stop that follows.
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil
+        // It repeats the turn's prompt. Without an approved pre_llm_call hook
+        // this is the first the card hears of it, so it goes in ahead of the reply.
+        if let prompt = firstStringFromEvent(event, keys: ["user_message"], includeNested: true),
+           prompt != sessions[sessionId]?.lastUserPrompt {
+            sessions[sessionId]?.lastUserPrompt = prompt
+            if sessions[sessionId]?.recentMessages.last?.isUser == true {
+                sessions[sessionId]?.recentMessages.removeLast()
+            }
+            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: true, text: prompt))
+        }
         if let msg = firstStringFromEvent(
             event,
             keys: ["assistant_response", "last_assistant_message", "text", "message"],
             includeNested: true
         ), !msg.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
+            sessions[sessionId]?.hermesHooksReportReplies = true
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // A store read can land the same reply a moment before this hook.
+            let alreadyShown = sessions[sessionId]?.recentMessages.last.map { !$0.isUser && $0.text == msg } ?? false
+            if !alreadyShown {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         }
         if !isWaiting {
             sessions[sessionId]?.status = .processing
@@ -1286,9 +1366,17 @@ public func reduceEvent(
         }
         effects.append(.enqueueCompletion(sessionId: sessionId))
     case "Stop":
+        // Hermes fires on_session_end at the end of every turn. A delegate_task
+        // child or a scheduled job runs just one, so its turn ending is its
+        // card ending.
+        if HermesHookPayload.endsOneShotRun(event) {
+            effects.append(.removeSession(sessionId: sessionId))
+            return effects
+        }
         // Detect ESC/Ctrl+C interruption
         let stopReason = event.rawJSON["stop_reason"] as? String ?? ""
         let wasInterrupted = (stopReason == "user" || stopReason == "interrupted")
+            || HermesHookPayload.endsInterruptedTurn(event)
         let hasActiveSubagents = sessions[sessionId]?.subagents.values.contains {
             $0.status != .idle
         } == true
@@ -1318,7 +1406,18 @@ public func reduceEvent(
         )
         if let msg = assistantMsg {
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // Stop's last_assistant_message (Claude Code, Codex, mcode, …) is
+            // often the reply the transcript tailer already appended, and with
+            // maxCount 3 a duplicate crowds a real row off the card. Skip it
+            // only when that reply is the newest row: after a new prompt, the
+            // same text is a new answer and still lands.
+            let normalizedIncoming = JSONLTailer.normalizedCursorChatText(from: msg) ?? msg
+            let alreadyShown = sessions[sessionId]?.recentMessages.last.map {
+                !$0.isUser && (JSONLTailer.normalizedCursorChatText(from: $0.text) ?? $0.text) == normalizedIncoming
+            } ?? false
+            if !alreadyShown {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
             // No reply content from hook (e.g. CodeBuddy) -- add placeholder
@@ -1348,14 +1447,17 @@ public func reduceEvent(
             sessions[sessionId]?.status = .idle
             sessions[sessionId]?.currentTool = nil
             sessions[sessionId]?.toolDescription = nil
-            effects.append(.enqueueCompletion(sessionId: sessionId))
+            // A Hermes gateway chat's turn settles its card without a completion.
+            if !HermesHookPayload.isQuiet(event) {
+                effects.append(.enqueueCompletion(sessionId: sessionId))
+            }
         }
     case "SessionStart":
         effects.append(.stopMonitor(sessionId: sessionId))
         sessions[sessionId] = SessionSnapshot(startTime: Date())
         // Re-apply metadata from this event (common extraction above wrote to the old session)
         if let cwd = event.rawJSON["cwd"] as? String, !cwd.isEmpty { sessions[sessionId]?.cwd = cwd }
-        if let model = event.rawJSON["model"] as? String, !model.isEmpty {
+        if let model = hookReportedModel(event) {
             sessions[sessionId]?.model = model
             sessions[sessionId]?.modelReportedAt = Date()
         }
@@ -1411,6 +1513,9 @@ public func reduceEvent(
         }
         if let supersetPane = event.rawJSON["_superset_pane_id"] as? String, !supersetPane.isEmpty {
             sessions[sessionId]?.supersetPaneId = supersetPane
+        }
+        if let hostId = claudeDesktopSessionId(in: event) {
+            sessions[sessionId]?.claudeDesktopSessionId = hostId
         }
         if let env = event.rawJSON["_env"] as? [String: String] {
             applyEnvMetadata(into: &sessions, sessionId: sessionId, env: env)
@@ -1493,6 +1598,17 @@ public func reduceEvent(
         break
     }
 
+    // A remote Hermes hook reads the session's store on its own host (there
+    // is no file to read here) and attaches what it found. Applied after the
+    // event itself, so a prompt this very hook reported wins over the store.
+    if let store = HermesSessionStore.Snapshot(payload: event.rawJSON["_hermes_store"]) {
+        sessions[sessionId]?.applyHermesStore(store)
+    }
+    // After the switch: SessionStart rebuilt the snapshot.
+    if HermesHookPayload.platform(of: event) != nil {
+        sessions[sessionId]?.hermesChatElsewhere = HermesHookPayload.isQuiet(event)
+    }
+
     // SessionStart rebuilt the snapshot, but a resumed or compacted
     // conversation is still working through the same checklist. /clear
     // starts the conversation over — even when it keeps the session id — so
@@ -1511,7 +1627,9 @@ public func reduceEvent(
 
     // Trigger sound for this event. A single failed tool stays silent; only a
     // turn that died (StopFailure) rings the error sound. See EventSoundRouting.
-    if let sound = EventSoundRouting.soundEvent(rawEventName: event.eventName, normalizedEventName: eventName) {
+    // A Hermes gateway chat's start, prompt and turn end stay silent.
+    if let sound = EventSoundRouting.soundEvent(rawEventName: event.eventName, normalizedEventName: eventName),
+       !HermesHookPayload.isQuiet(event) {
         effects.append(.playSound(sound))
     }
 
@@ -1594,6 +1712,11 @@ private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], se
        let worktree = env["ORCA_WORKTREE_ID"], !worktree.isEmpty {
         sessions[sessionId]?.orcaWorktreeId = worktree
     }
+    if sessions[sessionId]?.claudeDesktopSessionId == nil,
+       let host = env[ClaudeDesktopCodeSession.hostSessionEnvKey],
+       ClaudeDesktopCodeSession.isValidHostSessionId(host) {
+        sessions[sessionId]?.claudeDesktopSessionId = host
+    }
 }
 
 /// Fill identity fields on a parent card from a merged Task/subagent hook.
@@ -1665,6 +1788,20 @@ public func fillMissingParentMetadataFromSubagentEvent(
        let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty {
         sessions[sessionId]?.herdrBinaryPath = binary
     }
+    // A subagent runs inside the parent's CLI, so it carries the same id.
+    if sessions[sessionId]?.claudeDesktopSessionId == nil,
+       let hostId = claudeDesktopSessionId(in: event) {
+        sessions[sessionId]?.claudeDesktopSessionId = hostId
+    }
+}
+
+/// The Claude Desktop Code-tab id the bridge forwarded from
+/// CLAUDE_CODE_HOST_SESSION_ID. Only a well-formed id is kept: it ends up in
+/// a URL on click.
+private func claudeDesktopSessionId(in event: HookEvent) -> String? {
+    guard let hostId = event.rawJSON["_claude_desktop_session"] as? String,
+          ClaudeDesktopCodeSession.isValidHostSessionId(hostId) else { return nil }
+    return hostId
 }
 
 private func shouldReopenCursorSubagentOnPrompt(event: HookEvent, session: SessionSnapshot?) -> Bool {
@@ -1729,7 +1866,7 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     // Git branch resolution is NOT done here: this reducer runs on the main
     // actor and .git probing can block on network mounts. AppState refreshes
     // it asynchronously after reduce (maybeRefreshGitBranch).
-    if let model = event.rawJSON["model"] as? String, !model.isEmpty {
+    if let model = hookReportedModel(event) {
         sessions[sessionId]?.model = model
         sessions[sessionId]?.modelReportedAt = Date()
     }
@@ -1833,6 +1970,11 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let orcaWorktree = event.rawJSON["_orca_worktree_id"] as? String, !orcaWorktree.isEmpty {
         sessions[sessionId]?.orcaWorktreeId = orcaWorktree
     }
+    // Claude Desktop Code-tab session id (injected by bridge from
+    // CLAUDE_CODE_HOST_SESSION_ID).
+    if let hostId = claudeDesktopSessionId(in: event) {
+        sessions[sessionId]?.claudeDesktopSessionId = hostId
+    }
     if let remoteHostId = event.rawJSON["_remote_host_id"] as? String, !remoteHostId.isEmpty {
         sessions[sessionId]?.remoteHostId = remoteHostId
     }
@@ -1894,6 +2036,12 @@ private func stringFromHookJSONValue(_ value: Any?) -> String? {
     }
     let joined = texts.joined()
     return joined.isEmpty ? nil : joined
+}
+
+/// The model a hook names: top-level `model`, or Hermes's `extra.model`.
+private func hookReportedModel(_ event: HookEvent) -> String? {
+    if let model = event.rawJSON["model"] as? String, !model.isEmpty { return model }
+    return HermesHookPayload.model(in: event.rawJSON)
 }
 
 private func firstStringFromDict(_ dict: [String: Any], keys: [String]) -> String? {

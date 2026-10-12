@@ -8,6 +8,45 @@
     <description>Most recent CodeIsland updates</description>
     <language>en</language>
     <item>
+      <title>Version 1.0.38</title>
+      <link>https://github.com/wxtsky/CodeIsland/releases/tag/v1.0.38</link>
+      <sparkle:version>1.0.38</sparkle:version>
+      <sparkle:shortVersionString>1.0.38</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 11 Oct 2026 01:37:11 +0000</pubDate>
+      <enclosure
+        url="https://github.com/wxtsky/CodeIsland/releases/download/v1.0.38/CodeIsland.dmg"
+        sparkle:edSignature="nc5tfHYdzeZ0y4b5X/ovifDXUydXXuVOQ/Md5rzsWPPnvWrstpHKqNZJcKxn6pZTtILeyFLT7D8s8WZX79MkCw=="
+        length="14115835"
+        type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 1.0.37</title>
+      <link>https://github.com/wxtsky/CodeIsland/releases/tag/v1.0.37</link>
+      <sparkle:version>1.0.37</sparkle:version>
+      <sparkle:shortVersionString>1.0.37</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 11 Oct 2026 01:16:05 +0000</pubDate>
+      <enclosure
+        url="https://github.com/wxtsky/CodeIsland/releases/download/v1.0.37/CodeIsland.dmg"
+        sparkle:edSignature="0ZVBP7zmigPKdBCHC+sRAWmJGpThKkaIXIt0o9JgMDMmqhLW/C05+RymHW/eY4FzpYR75D8b9Ob7GZrLA57VBw=="
+        length="14115842"
+        type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 1.0.36</title>
+      <link>https://github.com/wxtsky/CodeIsland/releases/tag/v1.0.36</link>
+      <sparkle:version>1.0.36</sparkle:version>
+      <sparkle:shortVersionString>1.0.36</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Sat, 10 Oct 2026 00:33:21 +0000</pubDate>
+      <enclosure
+        url="https://github.com/wxtsky/CodeIsland/releases/download/v1.0.36/CodeIsland.dmg"
+        sparkle:edSignature="FJPLrJpK4lUpgYeqWecKeVyg9s3anxKjjhSu/dTpDvo7Vm5pC75nQGNJfk390VCr0NUPV5TUnmfZT1cI9LtiBQ=="
+        length="14115832"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.0.35</title>
       <link>https://github.com/wxtsky/CodeIsland/releases/tag/v1.0.35</link>
       <sparkle:version>1.0.35</sparkle:version>

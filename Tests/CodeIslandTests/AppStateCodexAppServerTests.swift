@@ -30,6 +30,21 @@ final class AppStateCodexAppServerTests: XCTestCase {
         ))
     }
 
+    /// Newer ChatGPT releases moved the binary into `codex-cli/CodexCLI.app`.
+    /// It also runs Codex CLI, so its path says Codex but not Desktop.
+    func testBundledCodexCLIPathIsCodexButNotDesktopByPath() {
+        let bundled = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        XCTAssertTrue(AppState.isBundledCodexCLIPath(bundled))
+        XCTAssertFalse(AppState.isCodexExecutablePath(bundled))
+        XCTAssertFalse(AppState.isBundledCodexCLIPath(
+            "/Applications/OtherAgent.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        ))
+        XCTAssertFalse(AppState.isBundledCodexCLIPath("/Applications/ChatGPT.app/Contents/Resources/codex"))
+        XCTAssertFalse(AppState.isBundledCodexCLIPath(
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+        ))
+    }
+
     func testCodexDiscoveryUsesTranscriptCwdForDesktopProcess() {
         XCTAssertTrue(AppState.codexDiscoveryUsesTranscriptCwd(processCwd: nil))
         XCTAssertTrue(AppState.codexDiscoveryUsesTranscriptCwd(processCwd: "/"))
@@ -260,6 +275,26 @@ final class AppStateCodexAppServerTests: XCTestCase {
         let bundledExecutable = resourcesURL.appendingPathComponent("codex")
         try makeExecutable(at: bundledExecutable)
 
+        let fallbackExecutable = tempDir.appendingPathComponent("fallback-codex")
+        try makeExecutable(at: fallbackExecutable)
+
+        let resolved = AppState.codexAppServerExecutableURL(
+            runningBundleURLs: [bundleURL],
+            fallbackPaths: [fallbackExecutable.path],
+            fileManager: fm
+        )
+
+        XCTAssertEqual(resolved?.path, bundledExecutable.path)
+    }
+
+    func testCodexAppServerExecutableFindsBinaryNewerChatGPTBundles() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("codeisland-codex-app-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let bundleURL = tempDir.appendingPathComponent("ChatGPT.app", isDirectory: true)
+        let bundledExecutable = bundleURL.appendingPathComponent(AppState.bundledCodexCLIRelativePath)
+        try makeExecutable(at: bundledExecutable)
         let fallbackExecutable = tempDir.appendingPathComponent("fallback-codex")
         try makeExecutable(at: fallbackExecutable)
 

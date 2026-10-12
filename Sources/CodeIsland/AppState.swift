@@ -127,6 +127,14 @@ final class AppState {
     }
     var questionQueue: [QuestionRequest] = [] {
         didSet {
+            // A close lasts as long as its request: once answered, skipped or
+            // drained, its id is forgotten.
+            if !dismissedQuestionIds.isEmpty {
+                let queued = Set(questionQueue.map(\.id))
+                if !dismissedQuestionIds.isSubset(of: queued) {
+                    dismissedQuestionIds.formIntersection(queued)
+                }
+            }
             followUps.waitingChanged()
             PushNotifier.shared.requestsChanged()
         }
@@ -416,6 +424,9 @@ final class AppState {
     var subagentModelObservations: [String: [String: ModelObservation]] = [:]
     @ObservationIgnored
     var subagentModelReads: [String: [String: SubagentModelRead]] = [:]
+    /// Per local Hermes session: the read of Hermes's own store in progress.
+    @ObservationIgnored
+    var hermesStoreReads: [String: HermesStoreRead] = [:]
 
     private var dismissedPermissionSessionIds: Set<String> = [] {
         didSet { followUps.waitingChanged() }
@@ -447,12 +458,39 @@ final class AppState {
         return ids
     }
 
-    /// Question counterpart of `visiblePermissionRequestIds`.
+    /// Question requests the user closed without answering. Unlike approvals
+    /// these are keyed by request, not session: a new question from the same
+    /// session is a new thing to see. Hidden, never resolved — the agent keeps
+    /// waiting, and the collapsed bar's question badge reopens the card.
+    private(set) var dismissedQuestionIds: Set<UUID> = [] {
+        didSet { followUps.waitingChanged() }
+    }
+
+    /// The question each session's card shows — its first queued one — in
+    /// queue order, for the sessions whose card the user has not closed. That
+    /// first question decides: a later one from the same session (a
+    /// subagent's) waits behind a closed card instead of reopening it on the
+    /// question the user just put away.
+    private var visibleQuestionCards: [QuestionRequest] {
+        var seen = Set<String>()
+        return questionQueue.filter { request in
+            seen.insert(request.event.sessionId ?? "default").inserted
+                && !dismissedQuestionIds.contains(request.id)
+        }
+    }
+
+    /// The first question whose card the user has not closed — what may open
+    /// by itself, and what a question shortcut acts on.
+    var nextVisibleQuestion: QuestionRequest? {
+        visibleQuestionCards.first
+    }
+
+    /// Question counterpart of `visiblePermissionRequestIds`: closed cards are
+    /// left out, so follow-up reminders stop for a card the user put away.
     var pendingQuestionRequestIds: [String: String] {
         var ids: [String: String] = [:]
-        for request in questionQueue {
-            let sid = request.event.sessionId ?? "default"
-            if ids[sid] == nil { ids[sid] = request.id.uuidString }
+        for request in visibleQuestionCards {
+            ids[request.event.sessionId ?? "default"] = request.id.uuidString
         }
         return ids
     }
@@ -482,16 +520,38 @@ final class AppState {
     }
 
     /// Agents whose tracked process is a long-lived daemon rather than a
-    /// per-turn CLI. For these, neither process exit nor SessionEnd marks the
-    /// end of a reply, so a card that has gone quiet with no tool in flight is
-    /// the only evidence the turn is over. (#303)
+    /// per-turn CLI. Process exit never marks the end of a reply, so when the
+    /// turn-end hook is missing (not approved on the agent's side, or the turn
+    /// died before it fired) a card that has gone quiet with no tool in flight
+    /// is the only evidence the turn is over. (#303)
     nonisolated static let daemonBackedSources: Set<String> = ["hermes"]
 
     /// How long a daemon-backed session may sit on bare "thinking" with no tool
-    /// and no new events before it settles. Long enough that a mid-turn
-    /// `post_llm_call` (followed within a second or two by the next
-    /// `pre_tool_call`) never flickers the card to idle.
-    nonisolated static let daemonTurnSettleTimeout: TimeInterval = 20
+    /// and no new events before it settles. Only a safety net: Hermes's
+    /// on_session_end ends every turn, interrupted ones included (#364). The
+    /// card is on "thinking" from the prompt on (pre_llm_call), and a
+    /// reasoning model easily thinks for longer than 20 s before its first or
+    /// next tool call — the card must not read idle while it does.
+    nonisolated static let daemonTurnSettleTimeout: TimeInterval = 120
+
+    /// Minutes an idle card with no process to outlive waits before it goes.
+    nonisolated static let defaultStaleIdleMinutes = 10
+
+    /// Whether the idle sweep removes an idle card. The user's timeout applies
+    /// to every card. Otherwise a card whose process is monitored lives as
+    /// long as that process; one without (hook-only) goes after
+    /// `defaultStaleIdleMinutes`. So does a Hermes gateway chat's card: its
+    /// monitored process is the gateway daemon, which never exits (#364).
+    nonisolated static func isStaleIdleSession(
+        idleMinutes: Int,
+        userTimeoutMinutes: Int,
+        hasMonitor: Bool,
+        hermesChatElsewhere: Bool
+    ) -> Bool {
+        if userTimeoutMinutes > 0 && idleMinutes >= userTimeoutMinutes { return true }
+        let livesWithItsProcess = hasMonitor && !hermesChatElsewhere
+        return !livesWithItsProcess && idleMinutes >= defaultStaleIdleMinutes
+    }
 
     nonisolated static func isDaemonBackedSource(_ source: String?) -> Bool {
         guard let normalized = SessionSnapshot.normalizedSupportedSource(source) else { return false }
@@ -581,7 +641,7 @@ final class AppState {
             && session.currentTool == nil
             && session.toolDescription == nil {
             let elapsed = -session.lastActivity.timeIntervalSinceNow
-            // Daemon-backed agents settle on a short timeout whether or not we
+            // Daemon-backed agents settle on their own timeout whether or not we
             // hold a process monitor: their backend never exits, so a live PID
             // says nothing about whether the turn is over (#303).
             if Self.isDaemonBackedSource(session.source) {
@@ -652,15 +712,14 @@ final class AppState {
         }
         // 4. Remove idle sessions past timeout (user setting, or 10 min default for no-monitor sessions)
         let userTimeout = SettingsManager.shared.sessionTimeout
-        let defaultStaleMinutes = 10  // for sessions without process monitor
         for (key, session) in sessions where session.status == .idle {
             let idleMinutes = Int(-session.lastActivity.timeIntervalSinceNow / 60)
-            let hasMonitor = processMonitors[key] != nil
-            if userTimeout > 0 && idleMinutes >= userTimeout {
-                // User-configured timeout applies to all sessions
-                removeSession(key)
-            } else if !hasMonitor && idleMinutes >= defaultStaleMinutes {
-                // No process monitor (hook-only sessions): clean up after 10 min idle
+            if Self.isStaleIdleSession(
+                idleMinutes: idleMinutes,
+                userTimeoutMinutes: userTimeout,
+                hasMonitor: processMonitors[key] != nil,
+                hermesChatElsewhere: session.hermesChatElsewhere
+            ) {
                 removeSession(key)
             }
         }
@@ -805,7 +864,9 @@ final class AppState {
     /// activation and badge labels were never affected — only the
     /// process-ancestry matching that runs off executable paths.
     ///
-    /// Neither prefix collides with QoderWork's `/qoderwork.app/`.
+    /// Qoder App (`com.qoder.app`) also uses `Qoder.app` and the `qoder` hook
+    /// source, so it shares this process-path protection. Session bundle IDs
+    /// distinguish it from the IDE. Neither prefix matches QoderWork.
     nonisolated static let qoderIDEBundlePrefixes = [
         "/qoder.app/contents/",
         "/qoder ide.app/contents/",
@@ -844,6 +905,8 @@ final class AppState {
         case "stepfun":    return path.contains("/stepfun.app/contents/")
         case "codex":      return isCodexExecutablePath(executable)
         case "opencode":   return path.contains("/opencode.app/contents/")
+        // Xiaomi MiMo desktop runs MiMo Code inside its own main process.
+        case "mimo":       return CLIProcessResolver.isMimoDesktopBundlePath(path)
         case "antigravity": return path.contains("/antigravity.app/contents/")
         // Google Antigravity IDE — host app is Antigravity.app. Same .app path as
         // the fork, but the check is per-source so a "google-antigravity" session
@@ -1001,6 +1064,7 @@ final class AppState {
         modelReadRetryAt.removeValue(forKey: sessionId)
         subagentModelObservations.removeValue(forKey: sessionId)
         subagentModelReads.removeValue(forKey: sessionId)
+        hermesStoreReads.removeValue(forKey: sessionId)
         hostHarnessProbes.removeValue(forKey: sessionId)
         hostHarnessProbeRetryAt.removeValue(forKey: sessionId)
         if activeSessionId == sessionId {
@@ -1187,6 +1251,7 @@ final class AppState {
         case "codybuddycn": return findCodyBuddyCNPids(candidatePids: candidatePids)
         case "stepfun":    return findStepFunPids(candidatePids: candidatePids)
         case "opencode":   return findOpenCodePids(candidatePids: candidatePids)
+        case "mimo":       return findMimoPids(candidatePids: candidatePids)
         case "antigravity": return findAntiGravityPids(candidatePids: candidatePids)
         case "google-antigravity": return findGoogleAntigravityPids(candidatePids: candidatePids)
         case "workbuddy":  return findWorkBuddyPids(candidatePids: candidatePids)
@@ -1197,6 +1262,7 @@ final class AppState {
         case "pi":         return findPiPids(candidatePids: candidatePids)
         case "cline":      return findClinePids(candidatePids: candidatePids)
         case "zcode":      return findZcodePids(candidatePids: candidatePids)
+        case "minimax":    return findMinimaxPids(candidatePids: candidatePids)
         default:           return []
         }
     }
@@ -1223,6 +1289,8 @@ final class AppState {
     /// `turnFailed`: the turn ended on an error (StopFailure, a failed AiWork
     /// stream or Cowork turn) — its follow-up says so.
     func enqueueCompletion(_ sessionId: String, turnFailed: Bool = false) {
+        // The session card reads ERROR until the next prompt.
+        sessions[sessionId]?.lastTurnFailed = turnFailed
         let style = Self.completionStyle()
         // Follow-ups only chase completions the user asked to hear about.
         if style != .off {
@@ -1396,7 +1464,8 @@ final class AppState {
     /// Session of a queued question the island is not showing — what the
     /// collapsed bar's question badge advertises and a click opens.
     var hiddenPendingQuestionSessionId: String? {
-        guard let head = questionQueue.first else { return nil }
+        // A question still waiting to be seen comes before one the user closed.
+        guard let head = nextVisibleQuestion ?? questionQueue.first else { return nil }
         if case .questionCard = surface { return nil }
         return head.event.sessionId ?? "default"
     }
@@ -1406,7 +1475,10 @@ final class AppState {
     /// auto-expand or Smart Suppress: those only decide what opens *by itself*.
     func openPendingQuestionCard(sessionId: String? = nil) {
         guard let sid = sessionId ?? hiddenPendingQuestionSessionId,
-              pendingQuestion(forSession: sid) != nil else { return }
+              let request = pendingQuestion(forSession: sid) else { return }
+        // Opening it again takes back a close: it is on screen, so it may
+        // stay up and remind like any other waiting question.
+        dismissedQuestionIds.remove(request.id)
         activeSessionId = sid
         withAnimation(NotchAnimation.open) {
             surface = .questionCard(sessionId: sid)
@@ -1718,6 +1790,7 @@ final class AppState {
             if let agentId = event.agentId {
                 maybeBackfillSubagentModel(sessionId: sessionId, agentId: agentId, event: event)
             }
+            requestHermesStoreRead(for: sessionId, event: event)
         }
 
         // Session was waiting and got an activity event. Historically we'd
@@ -2459,7 +2532,10 @@ final class AppState {
         questionQueue.append(request)
         pushQuestionQueued(request, sessionId: sessionId, smartSuppressed: !shouldAutoOpenPendingSurface(for: sessionId))
 
-        if questionQueue.count == 1 {
+        // First of a burst: nothing else visibly waiting. Not `count == 1` —
+        // a closed question stays queued, and must not swallow every later
+        // question's card and sound (the trap #309 fixed for approvals).
+        if nextVisibleQuestion?.id == request.id {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion(), shouldAutoOpenPendingSurface(for: sessionId) {
                 withAnimation(NotchAnimation.open) {
@@ -2595,7 +2671,8 @@ final class AppState {
             )
         )
 
-        if questionQueue.count == 1 {
+        // First of a burst, as in `handleQuestion`.
+        if nextVisibleQuestion?.id == request.id {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion(), shouldAutoOpenQuestionSurface(for: event) {
                 withAnimation(NotchAnimation.open) {
@@ -2826,13 +2903,38 @@ final class AppState {
         // Structured picks for plugins that answer with label arrays: OMP/Pi,
         // and OpenCode, whose multi-select answers are `string[]` (v1) or a
         // multiselect form field (v2) — a ", "-joined display string can't be
-        // split back when a label itself contains ", " (#332).
+        // split back when a label itself contains ", " (#332). MiMo Code runs
+        // the same plugin against OpenCode 1.x's question API.
         let detailsSource = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
         if !answerDetails.isEmpty,
-           (detailsSource == "pi" && event.toolUseId != nil) || detailsSource == "opencode" {
+           (detailsSource == "pi" && event.toolUseId != nil)
+            || detailsSource == "opencode" || detailsSource == "mimo" {
             updatedInput["_codeislandAnswerDetails"] = answerDetails
         }
         return updatedInput
+    }
+
+    /// Close a question card without answering it. The request stays queued
+    /// and the agent keeps waiting: answer it in the terminal, or reopen the
+    /// card from the collapsed bar's question badge. Skip, by contrast,
+    /// answers — for AskUserQuestion it denies the tool call.
+    func dismissQuestion(expectedSessionId: String? = nil) {
+        guard let index = questionIndex(expecting: expectedSessionId) else {
+            if let expectedSessionId {
+                discardStalePanelAction(expected: expectedSessionId, kind: "dismiss")
+            }
+            return
+        }
+        dismissedQuestionIds.insert(questionQueue[index].id)
+
+        if case .questionCard = surface {
+            withAnimation(NotchAnimation.close) {
+                surface = .collapsed
+            }
+        }
+        // Hand the panel to whatever is still visibly waiting, if it may open.
+        showNextPending()
+        refreshDerivedState()
     }
 
     func skipQuestion(expectedSessionId: String? = nil) {
@@ -2997,7 +3099,7 @@ final class AppState {
             }
             // The approval stays hidden; a card already up stays with it.
             if surface.approvalSessionId != nil || surface.questionSessionId != nil { return true }
-        } else if let next = questionQueue.first {
+        } else if let next = nextVisibleQuestion {
             hasPending = true
             // A question card still showing the question it was opened for
             // stays, even when it is not the head (the user clicked "Answer"
@@ -3144,6 +3246,15 @@ final class AppState {
             return readModelFromCopilotStore(cwd: session.cwd, processStart: processStart)
         case "opencode":
             return readModelFromOpenCodeStore(cwd: session.cwd, processStart: processStart)
+        case "mimo":
+            // The plugin keys cards `mimo-<store session id>`. Read that row:
+            // the desktop holds several conversations per folder, and a
+            // subagent's card is a child row the cwd match skips.
+            return readModelFromOpenCodeStore(
+                cwd: session.cwd, processStart: processStart,
+                dbPath: mimoDatabasePath(), rootSessionsOnly: true,
+                storeSessionId: sessionId.hasPrefix("mimo-") ? String(sessionId.dropFirst("mimo-".count)) : nil
+            )
         case "grok":
             return readModelFromGrokStore(cwd: session.cwd, processStart: processStart)
         default:
@@ -3345,12 +3456,23 @@ final class AppState {
         return readRecentFromCopilotTranscript(path: best.path).0
     }
 
-    private nonisolated static func readModelFromOpenCodeStore(cwd: String?, processStart: Date?) -> String? {
-        guard let cwd else { return nil }
-        let dbPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/share/opencode/opencode.db").path
+    /// `storeSessionId`, when the card's key names the store row, is read
+    /// first; the cwd match is the fallback.
+    nonisolated static func readModelFromOpenCodeStore(
+        cwd: String?,
+        processStart: Date?,
+        dbPath: String = openCodeDatabasePath(),
+        rootSessionsOnly: Bool = false,
+        storeSessionId: String? = nil
+    ) -> String? {
         return withSQLiteDatabase(at: dbPath) { db in
-            guard let session = findRecentOpenCodeSession(in: db, cwd: cwd, after: processStart) else {
+            if let storeSessionId,
+               let model = readRecentFromOpenCodeSession(db: db, sessionId: storeSessionId).0 {
+                return model
+            }
+            guard let cwd, let session = findRecentOpenCodeSession(
+                in: db, cwd: cwd, after: processStart, rootSessionsOnly: rootSessionsOnly
+            ) else {
                 return nil
             }
             return readRecentFromOpenCodeSession(db: db, sessionId: session.sessionId).0
@@ -3378,7 +3500,7 @@ final class AppState {
         SessionPersistence.save(sessions)
     }
 
-    private func restoreSessions() {
+    func restoreSessions() {
         let persisted = SessionPersistence.load()
         let cutoff = Date().addingTimeInterval(-30 * 60) // 30 minutes
         for p in persisted where p.lastActivity > cutoff {
@@ -3426,6 +3548,8 @@ final class AppState {
             snapshot.herdrPaneId = p.herdrPaneId
             snapshot.herdrSocketPath = p.herdrSocketPath
             snapshot.herdrBinaryPath = p.herdrBinaryPath
+            snapshot.claudeDesktopSessionId = p.claudeDesktopSessionId
+            snapshot.hermesChatElsewhere = p.hermesChatElsewhere ?? false
             snapshot.lastActivity = p.lastActivity
             snapshot.transcriptPath = p.transcriptPath
             snapshot.recap = p.recap
@@ -3535,6 +3659,9 @@ final class AppState {
         if ConfigInstaller.isEnabled(source: "opencode") {
             discovered.append(contentsOf: findActiveOpenCodeSessions(candidatePids: candidatePids))
         }
+        if ConfigInstaller.isEnabled(source: "mimo") {
+            discovered.append(contentsOf: findActiveMimoSessions(candidatePids: candidatePids))
+        }
         if ConfigInstaller.isEnabled(source: "kimi") {
             discovered.append(contentsOf: findActiveKimiSessions(candidatePids: candidatePids))
         }
@@ -3562,6 +3689,7 @@ final class AppState {
             ("cursor", "\(home)/.cursor/projects"),
             ("copilot", "\(home)/.copilot/session-state"),
             ("opencode", "\(home)/.local/share/opencode"),
+            ("mimo", "\(home)/.local/share/mimocode"),
             ("kimi", "\(home)/.kimi-code/sessions"),
             ("kimi", "\(home)/.kimi/sessions"),
             ("grok", "\(ConfigInstaller.grokHome())/sessions"),
@@ -4666,6 +4794,7 @@ final class AppState {
                 child.herdrPaneId = child.herdrPaneId ?? parent.session.herdrPaneId
                 child.herdrSocketPath = child.herdrSocketPath ?? parent.session.herdrSocketPath
                 child.herdrBinaryPath = child.herdrBinaryPath ?? parent.session.herdrBinaryPath
+                child.claudeDesktopSessionId = child.claudeDesktopSessionId ?? parent.session.claudeDesktopSessionId
                 child.remoteHostId = child.remoteHostId ?? parent.session.remoteHostId
                 child.remoteHostName = child.remoteHostName ?? parent.session.remoteHostName
                 // Keep the child's own process identity only — the parent Cursor chat
@@ -5355,6 +5484,28 @@ final class AppState {
         (candidatePids ?? allProcessIds()).filter { pid in
             guard let path = executablePath(for: pid) else { return false }
             return CLIProcessResolver.sourceMatchesExecutablePath(path, source: "grok")
+        }
+    }
+
+    private nonisolated static func findMinimaxPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
+        // mcode is a Node script, so proc_pidpath is the node binary; the
+        // Node runtime renames its process title to `minimax-code`, which is
+        // what argv carries. Match whole arguments, not substrings: helpers
+        // mcode spawns in the session's cwd live under the same package
+        // (bundled ripgrep in .../@minimax-ai/code/node_modules/, the
+        // `mcode-tools` bin), and binding the card to one of those would end
+        // it when the helper exits.
+        (candidatePids ?? allProcessIds()).filter { pid in
+            getProcessArgs(pid).map(isMinimaxProcessArgs) ?? false
+        }
+    }
+
+    nonisolated static func isMinimaxProcessArgs(_ args: [String]) -> Bool {
+        args.contains { arg in
+            let lowered = arg.lowercased()
+            return lowered == "minimax-code"
+                || lowered.hasSuffix("/bin/mcode")
+                || lowered.hasSuffix("/@minimax-ai/code/cli.js")
         }
     }
 
@@ -6094,6 +6245,17 @@ final class AppState {
         }
     }
 
+    /// The `mimo` CLI (MiMo Code). The Xiaomi MiMo desktop app is left out on
+    /// purpose: its engine shares the app's main process, whose cwd is `/`, so
+    /// a cwd match could never pick one of its sessions — its plugin reports
+    /// the process instead.
+    private nonisolated static func findMimoPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
+        (candidatePids ?? allProcessIds()).filter { pid in
+            guard let path = executablePath(for: pid) else { return false }
+            return CLIProcessResolver.isMimoCLIPath(path)
+        }
+    }
+
     /// `opencode serve --service` — OpenCode 2's per-user shared server.
     nonisolated static func isOpenCodeSharedService(arguments: [String]) -> Bool {
         arguments.contains("serve") && arguments.contains("--service")
@@ -6605,35 +6767,74 @@ final class AppState {
         return false
     }
 
-    private nonisolated static func findActiveOpenCodeSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let openCodePids = findOpenCodePids(candidatePids: candidatePids)
-        guard !openCodePids.isEmpty else { return [] }
-
-        let dbPath = FileManager.default.homeDirectoryForCurrentUser
+    nonisolated static func openCodeDatabasePath() -> String {
+        FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/share/opencode/opencode.db").path
+    }
+
+    /// MiMo Code keeps OpenCode's SQLite layout under its own name; release
+    /// builds (channels latest / beta / prod) write `mimocode.db`.
+    nonisolated static func mimoDatabasePath() -> String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/share/mimocode/mimocode.db").path
+    }
+
+    private nonisolated static func findActiveOpenCodeSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
+        findActiveOpenCodeStoreSessions(
+            pids: findOpenCodePids(candidatePids: candidatePids),
+            dbPath: openCodeDatabasePath(),
+            source: "opencode",
+            sessionIdPrefix: "",
+            rootSessionsOnly: false
+        )
+    }
+
+    /// Running `mimo` CLIs, matched to their session in MiMo Code's store.
+    /// Keyed `mimo-<id>`, the id the plugin reports, so a session found here
+    /// and the plugin's events for it land on one card.
+    private nonisolated static func findActiveMimoSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
+        findActiveOpenCodeStoreSessions(
+            pids: findMimoPids(candidatePids: candidatePids),
+            dbPath: mimoDatabasePath(),
+            source: "mimo",
+            sessionIdPrefix: "mimo-",
+            rootSessionsOnly: true
+        )
+    }
+
+    private nonisolated static func findActiveOpenCodeStoreSessions(
+        pids: [pid_t],
+        dbPath: String,
+        source: String,
+        sessionIdPrefix: String,
+        rootSessionsOnly: Bool
+    ) -> [DiscoveredSession] {
+        guard !pids.isEmpty else { return [] }
         guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
 
         return withSQLiteDatabase(at: dbPath) { db in
             var results: [DiscoveredSession] = []
             var seenSessionIds: Set<String> = []
 
-            for pid in openCodePids {
+            for pid in pids {
                 guard let cwd = getCwd(for: pid), !cwd.isEmpty, !isSubagentWorktree(cwd) else { continue }
                 let processStart = getProcessStartTime(pid)
-                guard let session = findRecentOpenCodeSession(in: db, cwd: cwd, after: processStart) else { continue }
+                guard let session = findRecentOpenCodeSession(
+                    in: db, cwd: cwd, after: processStart, rootSessionsOnly: rootSessionsOnly
+                ) else { continue }
                 guard !seenSessionIds.contains(session.sessionId) else { continue }
                 seenSessionIds.insert(session.sessionId)
 
                 let (model, messages) = readRecentFromOpenCodeSession(db: db, sessionId: session.sessionId)
                 results.append(DiscoveredSession(
-                    sessionId: session.sessionId,
+                    sessionId: sessionIdPrefix + session.sessionId,
                     cwd: cwd,
                     tty: nil,
                     model: model,
                     pid: pid,
                     modifiedAt: session.modifiedAt,
                     recentMessages: messages,
-                    source: "opencode"
+                    source: source
                 ))
             }
 
@@ -6641,7 +6842,7 @@ final class AppState {
         } ?? []
     }
 
-    private nonisolated static func withSQLiteDatabase<T>(
+    nonisolated static func withSQLiteDatabase<T>(
         at path: String,
         body: (OpaquePointer) -> T?
     ) -> T? {
@@ -6699,15 +6900,21 @@ final class AppState {
         return String(cString: UnsafeRawPointer(value).assumingMemoryBound(to: CChar.self))
     }
 
-    private nonisolated static func findRecentOpenCodeSession(
+    /// `rootSessionsOnly` skips child sessions (`parent_id` set): MiMo Code
+    /// spawns subagent sessions in the same directory, and while one runs it
+    /// is the most recently updated row — but it is never the CLI's own.
+    nonisolated static func findRecentOpenCodeSession(
         in db: OpaquePointer,
         cwd: String,
-        after processStart: Date?
+        after processStart: Date?,
+        rootSessionsOnly: Bool = false
     ) -> (sessionId: String, modifiedAt: Date)? {
+        let rootFilter = rootSessionsOnly ? "AND parent_id IS NULL" : ""
         let sql = """
             SELECT id, time_updated
             FROM session
             WHERE time_archived IS NULL
+              \(rootFilter)
               AND (
                 directory = ?
                 OR EXISTS (
@@ -6810,7 +7017,45 @@ final class AppState {
     /// Find running Codex processes.
     /// Checks both executable path (Desktop app) and command-line args (npm/Homebrew: node script).
     nonisolated static func isCodexExecutablePath(_ path: String) -> Bool {
-        CLIProcessResolver.isCodexDesktopExecutablePath(path)
+        let executableURL = URL(fileURLWithPath: path).standardizedFileURL
+        let lowerPath = executableURL.path.lowercased()
+        let resourceSuffix = "/contents/resources/codex"
+        guard lowerPath.hasSuffix(resourceSuffix) else { return false }
+
+        let appURL = executableURL
+            .deletingLastPathComponent() // Resources
+            .deletingLastPathComponent() // Contents
+            .deletingLastPathComponent() // *.app
+        return isCodexHostAppBundle(appURL)
+    }
+
+    /// The Codex binary newer ChatGPT releases bundle in place of
+    /// `Contents/Resources/codex`. Desktop's app-server, ChatGPT's terminal
+    /// launcher (`codex-cli/bin/codex`) and its cloud `exec-server` all run
+    /// this one file, so the path says Codex, not Desktop.
+    nonisolated static func isBundledCodexCLIPath(_ path: String) -> Bool {
+        let executableURL = URL(fileURLWithPath: path).standardizedFileURL
+        let suffix = "/" + bundledCodexCLIRelativePath.lowercased()
+        guard executableURL.path.lowercased().hasSuffix(suffix) else { return false }
+        var appURL = executableURL
+        for _ in bundledCodexCLIRelativePath.split(separator: "/") {
+            appURL.deleteLastPathComponent()
+        }
+        return isCodexHostAppBundle(appURL)
+    }
+
+    private nonisolated static func isCodexHostAppBundle(_ appURL: URL) -> Bool {
+        // Since Codex was folded into ChatGPT Desktop, the same com.openai.codex
+        // bundle can now be installed as ChatGPT.app instead of Codex.app. Read
+        // the bundle identifier first so future app renames continue to work.
+        if Bundle(url: appURL)?.bundleIdentifier == AppState.codexAppBundleId {
+            return true
+        }
+
+        // Keep the legacy path check for synthetic/test bundles without an
+        // Info.plist and for older installations whose bundle cannot be read.
+        let appName = appURL.deletingPathExtension().lastPathComponent.lowercased()
+        return appName == "codex" || appName == "chatgpt"
     }
 
     /// Codex Desktop's shared app-server is launched with `/` as its cwd. Its
@@ -6889,7 +7134,21 @@ final class AppState {
 
         let originator = (payload["originator"] as? String)?.lowercased() ?? ""
         let source = (payload["source"] as? String)?.lowercased() ?? ""
-        if originator.contains("desktop") || source == "vscode" || source == "appserver" {
+        if originator.contains("desktop") {
+            return .desktop
+        }
+        // Codex records every app-server client under `vscode`/`appServer`,
+        // and a spawned thread keeps its parent's originator under an object
+        // source. A client that names itself something other than Desktop
+        // (Claude Code's Codex plugin sends "Claude Code") runs its own
+        // `codex app-server`, so the rollout belongs to that process like a
+        // CLI one.
+        let isAppServerSource = source == "vscode" || source == "appserver"
+        let isSubagentSource = payload["source"] is [String: Any]
+        if !originator.isEmpty, isAppServerSource || isSubagentSource {
+            return .cli
+        }
+        if isAppServerSource {
             return .desktop
         }
         if originator.contains("cli") || source == "cli" || source == "exec" {
@@ -6899,7 +7158,13 @@ final class AppState {
     }
 
     private nonisolated static func findCodexPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
-        var codexPids: [pid_t] = []
+        findCodexProcesses(candidatePids: candidatePids).map(\.pid)
+    }
+
+    /// Running Codex processes discovery maps rollouts to, and whether each
+    /// is Codex Desktop's shared app-server.
+    nonisolated static func findCodexProcesses(candidatePids: [pid_t]? = nil) -> [(pid: pid_t, isDesktop: Bool)] {
+        var processes: [(pid: pid_t, isDesktop: Bool)] = []
 
         for pid in candidatePids ?? allProcessIds() {
             guard let path = executablePath(for: pid) else { continue }
@@ -6908,20 +7173,47 @@ final class AppState {
             // Match 1: Codex Desktop app (native binary). The executable may
             // live under Codex.app or ChatGPT.app depending on the release.
             if isCodexExecutablePath(path) {
-                codexPids.append(pid)
+                processes.append((pid, true))
                 continue
             }
 
-            // Match 2: npm/Homebrew install — node running @openai/codex script.
+            // Match 2: the binary newer ChatGPT releases bundle, shared by
+            // Desktop's app-server and Codex CLI; argv and parent tell them apart.
+            if isBundledCodexCLIPath(path) {
+                if let role = bundledCodexProcessRole(pid: pid, executablePath: path) {
+                    processes.append((pid, role == .desktopHost))
+                }
+                continue
+            }
+
+            // Match 3: npm/Homebrew install — node running @openai/codex script.
             // proc_pidpath returns the node binary, so check command-line args instead.
             if pathLower.hasSuffix("/node") {
                 if let args = getProcessArgs(pid),
                    args.contains(where: { $0.contains("@openai/codex") || $0.contains("openai-codex") }) {
-                    codexPids.append(pid)
+                    processes.append((pid, false))
                 }
             }
         }
-        return codexPids
+        return processes
+    }
+
+    private nonisolated static func bundledCodexProcessRole(pid: pid_t, executablePath path: String) -> CodexProcessRole? {
+        let parent = parentPid(of: pid)
+        // CodeIsland's own app-server client runs this binary too, from `/`;
+        // as a session process it would claim every CLI rollout.
+        if parent == getpid() { return nil }
+
+        var ancestry = [ProcessAncestor(pid: pid, executablePath: path, arguments: getProcessArgs(pid) ?? [])]
+        if let parent, let parentPath = executablePath(for: parent) {
+            ancestry.append(ProcessAncestor(
+                pid: parent,
+                executablePath: parentPath,
+                bundleIdentifier: HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath)
+                    .flatMap { Bundle(path: $0)?.bundleIdentifier }
+            ))
+        }
+        return CLIProcessResolver.codexBundledProcessRole(ancestry: ancestry)
     }
 
     /// Get command-line arguments for a process via sysctl KERN_PROCARGS2.
@@ -7150,15 +7442,15 @@ final class AppState {
 
     /// Find active Codex sessions by matching running processes to session files
     private nonisolated static func findActiveCodexSessions(candidatePids: [pid_t]? = nil) -> [DiscoveredSession] {
-        let codexPids = findCodexPids(candidatePids: candidatePids)
-        guard !codexPids.isEmpty else { return [] }
+        let codexProcesses = findCodexProcesses(candidatePids: candidatePids)
+        guard !codexProcesses.isEmpty else { return [] }
 
-        let processes = codexPids.map { pid in
+        let processes = codexProcesses.map { process in
             CodexProcessDiscoveryCandidate(
-                pid: pid,
-                cwd: getCwd(for: pid),
-                startTime: getProcessStartTime(pid),
-                isDesktop: executablePath(for: pid).map(isCodexExecutablePath) ?? false
+                pid: process.pid,
+                cwd: getCwd(for: process.pid),
+                startTime: getProcessStartTime(process.pid),
+                isDesktop: process.isDesktop
             )
         }
 
@@ -7384,15 +7676,33 @@ final class AppState {
             return .unavailable
         }
 
-        guard let source = payload["source"] as? [String: Any],
-              let subagent = source["subagent"] as? [String: Any],
+        guard let source = payload["source"] as? [String: Any] else {
+            return .root
+        }
+        let payloadParent = (payload["parent_thread_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        // Unit variants (`review`, `compact`, `memory_consolidation`) serialize as
+        // a bare string and only record their parent on the payload. Without
+        // one there is no spawn edge to fall back to either.
+        if let label = source["subagent"] as? String, !label.isEmpty {
+            guard let payloadParent else { return .root }
+            return .subagent(CodexSubagentMetadata(
+                parentThreadId: payloadParent,
+                agentType: label,
+                agentNickname: nil
+            ))
+        }
+        guard let subagent = source["subagent"] as? [String: Any],
               !subagent.isEmpty else {
             return .root
         }
+        // Spawned workers nest the parent under `source.subagent.thread_spawn`;
+        // auto-review (guardian) threads record it on the payload itself.
         let parent = firstStringRecursively(in: subagent, key: "parent_thread_id")
+            ?? payloadParent
         guard let parent, !parent.isEmpty else { return .unavailable }
 
         let agentType = firstStringRecursively(in: subagent, key: "agent_role")
+            ?? subagent["other"] as? String
             ?? subagent.keys.sorted().first
         let nickname = firstStringRecursively(in: subagent, key: "agent_nickname")
         return .subagent(CodexSubagentMetadata(
@@ -7999,6 +8309,21 @@ final class AppState {
     }
 
     /// Read model and last 3 user/assistant messages from a transcript file's tail
+    /// First text block of a transcript row worth showing, cleaned the way the
+    /// live tail cleans it (`JSONLTailer.extractText`): mcode's reasoning blobs
+    /// are skipped and leading injected wrappers removed, so a card rebuilt on
+    /// attach reads the same as one fed by the tailer.
+    nonisolated static func firstDisplayText(in blocks: [[String: Any]]) -> String? {
+        for block in blocks {
+            guard block["type"] as? String == "text",
+                  let raw = block["text"] as? String,
+                  !JSONLTailer.isThinkingBlob(raw) else { continue }
+            let text = JSONLTailer.stripDisplayWrappers(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return text }
+        }
+        return nil
+    }
+
     nonisolated static func readRecentFromTranscript(path: String) -> (String?, [ChatMessage]) {
         guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
         defer { handle.closeFile() }
@@ -8036,32 +8361,18 @@ final class AppState {
             var textContent: String?
             if normalizedRole == "user" || normalizedRole == "user_input" {
                 if let content = message["content"] as? String {
-                    var text = content
-                    if let startRange = text.range(of: "<USER_REQUEST>"),
-                       let endRange = text.range(of: "</USER_REQUEST>", range: startRange.upperBound..<text.endIndex) {
-                        text = String(text[startRange.upperBound..<endRange.lowerBound])
-                    }
-                    textContent = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    textContent = JSONLTailer.stripDisplayWrappers(content)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let contentArray = message["content"] as? [[String: Any]] {
-                    for item in contentArray {
-                        if item["type"] as? String == "text",
-                           let t = item["text"] as? String, !t.isEmpty {
-                            textContent = t
-                            break
-                        }
-                    }
+                    textContent = firstDisplayText(in: contentArray)
                 }
             } else if normalizedRole == "assistant" || normalizedRole == "planner_response" {
                 if let content = message["content"] as? String {
-                    textContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    textContent = JSONLTailer.isThinkingBlob(content)
+                        ? nil
+                        : content.trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let contentArray = message["content"] as? [[String: Any]] {
-                    for item in contentArray {
-                        if item["type"] as? String == "text",
-                           let t = item["text"] as? String, !t.isEmpty {
-                            textContent = t
-                            break
-                        }
-                    }
+                    textContent = firstDisplayText(in: contentArray)
                 } else if let thinking = message["thinking"] as? String {
                     textContent = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
                 }

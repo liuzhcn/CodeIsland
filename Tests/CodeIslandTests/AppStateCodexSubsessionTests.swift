@@ -300,6 +300,59 @@ final class AppStateCodexSubsessionTests: XCTestCase {
         ]), "parent-thread")
     }
 
+    /// Every Desktop thread runs in Codex's one shared app-server. After a
+    /// Desktop child hook folds into the parent card, the parent's own next
+    /// hook must not take that card for "an active same-PID parent" and fold
+    /// into itself.
+    func testDesktopParentHookAfterAChildHookStaysTheParentsOwn() throws {
+        let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
+        UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
+        defer {
+            if let previousMode {
+                UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
+            } else {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.pluginSessionMode)
+            }
+        }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-desktop-parent-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let parentTranscript = dir.appendingPathComponent("parent.jsonl")
+        try (#"{"type":"session_meta","payload":{"id":"parent-thread","cwd":"/repo","originator":"Codex Desktop","source":"vscode"}}"# + "\n")
+            .write(to: parentTranscript, atomically: true, encoding: .utf8)
+        let childTranscript = dir.appendingPathComponent("child.jsonl")
+        try (#"{"type":"session_meta","payload":{"id":"child-thread","cwd":"/repo","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-thread"}}}}}"# + "\n")
+            .write(to: childTranscript, atomically: true, encoding: .utf8)
+
+        let appState = AppState()
+        let server = HookServer(appState: appState)
+        func deliver(_ event: String, thread: String, transcript: URL) throws -> [String: Any] {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "hook_event_name": event,
+                "session_id": thread,
+                "_source": "codex",
+                "_term_bundle": AppState.codexAppBundleId,
+                "_ppid": Int(getpid()),
+                "cwd": "/repo",
+                "transcript_path": transcript.path,
+            ] as [String: Any])
+            let routed = server.routeSubsessionPayloadIfNeededForTesting(data: data)
+            appState.handleEvent(try XCTUnwrap(HookEvent(from: routed.processedData)))
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: routed.processedData) as? [String: Any])
+        }
+
+        _ = try deliver("UserPromptSubmit", thread: "parent-thread", transcript: parentTranscript)
+        let child = try deliver("PreToolUse", thread: "child-thread", transcript: childTranscript)
+        XCTAssertEqual(child["session_id"] as? String, "codexapp:parent-thread")
+        let stop = try deliver("Stop", thread: "parent-thread", transcript: parentTranscript)
+
+        XCTAssertEqual(stop["session_id"] as? String, "parent-thread")
+        XCTAssertNil(stop["_codex_subagent"])
+        XCTAssertNil(appState.sessions["codexapp:parent-thread"]?.subagents["parent-thread"])
+    }
+
     func testCodexDesktopDoesNotRetainSharedHelperPidButOtherSessionsDo() {
         let appState = AppState()
         let now = Date()
@@ -430,6 +483,105 @@ final class AppStateCodexSubsessionTests: XCTestCase {
         XCTAssertEqual(metadata.parentThreadId, "parent")
         XCTAssertEqual(metadata.agentType, "worker")
         XCTAssertEqual(metadata.agentNickname, "Galileo")
+    }
+
+    func testCodexGuardianReviewMetadataReadsTopLevelParentThread() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-guardian-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("rollout.jsonl")
+        // Auto-review (guardian) threads carry no thread_spawn edge; Codex records
+        // the parent beside `source` instead of inside it.
+        let line = """
+        {"timestamp":"2026-09-23T07:13:36Z","type":"session_meta","payload":{"id":"guardian-thread","parent_thread_id":"parent-thread","cwd":"/repo","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}}
+        """
+        try (line + "\n").write(to: file, atomically: true, encoding: .utf8)
+
+        let metadata = try XCTUnwrap(AppState.codexSubagentMetadata(inTranscriptPath: file.path))
+
+        XCTAssertEqual(metadata.parentThreadId, "parent-thread")
+        XCTAssertEqual(metadata.agentType, "guardian")
+        XCTAssertNil(metadata.agentNickname)
+    }
+
+    func testCodexUnitSubagentSourceReadsTopLevelParentThread() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-review-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // `/review` threads serialize SubAgentSource::Review as a bare string.
+        let review = dir.appendingPathComponent("review.jsonl")
+        try """
+        {"type":"session_meta","payload":{"id":"review-thread","parent_thread_id":"parent-thread","cwd":"/repo","source":{"subagent":"review"},"thread_source":"subagent"}}
+
+        """.write(to: review, atomically: true, encoding: .utf8)
+        let orphan = dir.appendingPathComponent("orphan.jsonl")
+        try """
+        {"type":"session_meta","payload":{"id":"review-thread","cwd":"/repo","source":{"subagent":"review"}}}
+
+        """.write(to: orphan, atomically: true, encoding: .utf8)
+
+        let metadata = try XCTUnwrap(AppState.codexSubagentMetadata(inTranscriptPath: review.path))
+        XCTAssertEqual(metadata.parentThreadId, "parent-thread")
+        XCTAssertEqual(metadata.agentType, "review")
+        XCTAssertNil(metadata.agentNickname)
+        // No parent and no spawn edge: stays a root card, as before.
+        XCTAssertNil(AppState.codexSubagentMetadata(
+            threadId: "review-thread",
+            transcriptPath: orphan.path,
+            statePath: dir.appendingPathComponent("missing.sqlite").path
+        ))
+    }
+
+    func testKnownCodexGuardianSessionFollowsPluginSessionMode() throws {
+        let previousMode = UserDefaults.standard.object(forKey: SettingsKey.pluginSessionMode)
+        defer {
+            if let previousMode {
+                UserDefaults.standard.set(previousMode, forKey: SettingsKey.pluginSessionMode)
+            } else {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.pluginSessionMode)
+            }
+        }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codeisland-codex-guardian-mode-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let statePath = dir.appendingPathComponent("state_5.sqlite").path
+        let transcript = dir.appendingPathComponent("guardian.jsonl")
+        try """
+        {"type":"session_meta","payload":{"id":"guardian-thread","parent_thread_id":"parent-thread","cwd":"/repo","originator":"Codex Desktop","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review"}}
+
+        """.write(to: transcript, atomically: true, encoding: .utf8)
+
+        func makeState() -> AppState {
+            let appState = AppState()
+            var parent = SessionSnapshot()
+            parent.source = "codex"
+            parent.providerSessionId = "parent-thread"
+            parent.status = .running
+            var guardian = SessionSnapshot()
+            guardian.source = "codex"
+            guardian.providerSessionId = "guardian-thread"
+            guardian.status = .processing
+            guardian.transcriptPath = transcript.path
+            guardian.lastActivity = Date()
+            appState.sessions["parent"] = parent
+            appState.sessions["guardian"] = guardian
+            return appState
+        }
+
+        UserDefaults.standard.set("merge", forKey: SettingsKey.pluginSessionMode)
+        let merged = makeState()
+        XCTAssertTrue(merged.applyCodexSubsessionModeToKnownSessions(statePath: statePath))
+        XCTAssertNil(merged.sessions["guardian"])
+        XCTAssertEqual(merged.sessions["parent"]?.subagents["guardian-thread"]?.agentType, "guardian")
+
+        UserDefaults.standard.set("hide", forKey: SettingsKey.pluginSessionMode)
+        let hidden = makeState()
+        XCTAssertTrue(hidden.applyCodexSubsessionModeToKnownSessions(statePath: statePath))
+        XCTAssertNil(hidden.sessions["guardian"])
+        XCTAssertTrue(hidden.sessions["parent"]?.subagents.isEmpty == true)
     }
 
     func testCodexSubagentMetadataFallsBackToThreadSpawnEdgesDatabase() throws {

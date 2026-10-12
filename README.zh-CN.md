@@ -131,19 +131,23 @@
 <td align="center"><img src="docs/images/mascots/kiro.gif" width="48" alt=""><br><sub><b>Kiro CLI</b></sub></td>
 <td align="center"><img src="docs/images/mascots/stepfun.gif" width="48" alt=""><br><sub><b>StepFun</b></sub></td>
 <td align="center"><img src="docs/images/mascots/workbuddy.gif" width="48" alt=""><br><sub><b>WorkBuddy</b></sub></td>
+<td align="center"><img src="Sources/CodeIsland/Resources/cli-icons/minimax.png" width="40" alt=""><br><sub><b>MiniMax Code CLI</b></sub></td>
 <td align="center"><img src="Sources/CodeIsland/Resources/cli-icons/dsh.png" width="40" alt=""><br><sub><b>DeepSeek Harness</b></sub></td>
 <td align="center"><img src="docs/images/mascots/aiwork.gif" width="48" alt=""><br><sub><b>AiWork</b></sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/mascots/mimo.gif" width="48" alt=""><br><sub><b>MiMo Code /<br>Xiaomi MiMo</b></sub></td>
 <td align="center"><sub><b>+ 更多</b><br>见下方 ↓</sub></td>
 </tr>
 </table>
 
-**同样支持：** Trae CN、Trae CLI / Trae CLI Next、Qoder CN、QoderWork 与 Qoder CLI、Cursor CLI、CodeBuddy CN、Claude Desktop（Code 标签页与 [Cowork](#cowork)）、ZCode。其他使用 Claude 风格 hook 的工具，可以在 设置 → Hooks 里添加为**自定义 CLI**。
+**同样支持：** Trae CN、Trae CLI / Trae CLI Next、Qoder CN、Qoder App、QoderWork 与 Qoder CLI、Cursor CLI、CodeBuddy CN、Claude Desktop（Code 标签页与 [Cowork](#cowork)）、ZCode。其他使用 Claude 风格 hook 的工具，可以在 设置 → Hooks 里添加为**自定义 CLI**。
 
 **多个账号？** 在 **设置 → Hooks** 里登记额外的 Claude Code、Codex、Grok 配置目录（比如第二个 `CLAUDE_CONFIG_DIR`），每个目录单独安装 hook、单独显示状态，会话、transcript 和用量统计都会覆盖到。
 
 **知道它跑在哪：** 运行在 **tmux**、**zellij**、**Herdr** 或 **T3 Code** 里的会话，终端徽标旁会多一个标签，点击跳转会直达对应的面板或线程。
 
-**审批与提问：** hook 会等待决定的工具，都能直接在刘海上批准或回答——Claude Code、Codex、Gemini CLI、Qoder、Qwen Code、Trae CLI Next、ZCode、OpenCode、Pi / Oh My Pi、DeepSeek Harness 等。hook 无法回传决定的工具（Google Antigravity、AiWork）以只读方式显示，审批仍在它们自己的界面里完成。
+**审批与提问：** hook 会等待决定的工具，都能直接在刘海上批准或回答——Claude Code、Codex、Gemini CLI、Qoder、Qwen Code、Trae CLI Next、ZCode、OpenCode、MiMo Code / Xiaomi MiMo、Pi / Oh My Pi、DeepSeek Harness 等；MiniMax Code CLI 限 mcode 允许 hook 等待的 10 秒内。hook 无法回传决定的工具（Google Antigravity、AiWork）以只读方式显示，审批仍在它们自己的界面里完成。
 
 <details>
 <summary><b>各集成安装在哪里</b></summary>
@@ -160,17 +164,19 @@ CodeIsland 启动时会自动写入以下配置，配置被改动时会自动修
 | Google Antigravity | `~/.gemini/config/hooks.json` |
 | Cursor / Cursor CLI | `~/.cursor/hooks.json` |
 | Grok CLI | `~/.grok/hooks/codeisland.json` |
-| Qoder / Qoder CN / QoderWork | `~/.qoder/`、`~/.qoder-cn/`、`~/.qoderwork/` 下的 `settings.json` |
+| Qoder（IDE 与 Qoder App）/ Qoder CN / QoderWork | `~/.qoder/`、`~/.qoder-cn/`、`~/.qoderwork/` 下的 `settings.json` |
 | Trae / Trae CN | `~/.trae/hooks.json`、`~/.trae-cn/hooks.json`（需在 Trae 里打开全局 Hook） |
 | Trae CLI / Trae CLI Next | `~/.trae/traecli.yaml`、`~/.trae/cli/hooks.json` |
 | Factory、CodeBuddy、StepFun、WorkBuddy、Qwen Code | `~/.<工具>/settings.json` |
 | Copilot CLI | `~/.copilot/hooks/codeisland.json` |
 | Kimi Code CLI | `~/.kimi-code/config.toml`（旧版为 `~/.kimi/`） |
 | Kiro CLI | `~/.kiro/agents/codeisland.json`，需用 `kiro --agent codeisland` 启动 |
-| Hermes | `~/.hermes/config.yaml` |
+| Hermes | `~/.hermes/config.yaml`，[需要批准一次](#hermes) |
 | ZCode | `~/.zcode/cli/config.json` |
+| MiniMax Code CLI | 插件 `~/.minimax/plugins/codeisland/`（支持 `$MINIMAX_DATA_DIR`） |
 | Cline | `~/Documents/Cline/Hooks` |
 | OpenCode | 插件 `~/.config/opencode/plugins/codeisland.js` |
+| MiMo Code / Xiaomi MiMo | 插件 `~/.config/mimocode/plugins/codeisland.js`，见[下文](#mimo) |
 | Pi / Oh My Pi | 扩展 `~/.pi/agent/extensions/codeisland.ts` / `~/.omp/agent/extensions/codeisland.ts` |
 | OpenClaw | 插件 `~/.openclaw/codeisland-plugin/` |
 | DeepSeek Harness | [dsh-island](https://github.com/cdxiaodong/dsh-island) 插件，见[下文](#deepseek-harness) |
@@ -219,6 +225,8 @@ companion 源码就在本仓库的 `ios/CodeIslandCompanion` 和 `apple-companio
 
 Codex 不会执行没审核过的 hook。安装后启动 Codex，它会提示 `1 hook needs review before it can run.`，运行 `/hooks`，审核并信任 CodeIsland 的条目即可。审核之前 Codex 会静默忽略这些 hook，不报任何错，看起来就像 CodeIsland 不支持 Codex。Codex 会在 `~/.codex/config.toml` 的 `[hooks.state]` 里为每个已信任的 hook 记录内容哈希，所以 CodeIsland 更新后如果改写了 `~/.codex/hooks.json`，需要再审核一次。
 
+Codex 自动审查（Auto Review）仍由 Codex 处理。某一轮使用自动审查时，CodeIsland 会把它的权限请求交还给 Codex，不代替它批准或拒绝。审查方取自本地 rollout 中该轮的 `turn_context`，因此在 Codex 桌面端权限菜单里的选择同样生效；读不到时再看 `config.toml` 里的 `approvals_reviewer`。设为人工审批的轮次和提问仍在刘海里处理。
+
 Codex 回合进行中、且没有工具在运行时，收起状态的刘海会显示 Agent 最新的公开输出。隐藏推理、加密内容、工具结果和内部子 Agent 消息永远不会显示。
 
 </details>
@@ -229,6 +237,28 @@ Codex 回合进行中、且没有工具在运行时，收起状态的刘海会�
 <br>
 
 OpenCode 通过一个 JS 插件直连 socket，不需要 bridge 程序。同一个插件文件同时支持 OpenCode 1.x（`server()`）和 OpenCode 2（`setup()`），OpenCode 2 会从 `~/.config/opencode/plugins/` 自动加载它。在 OpenCode 2 的共享后台服务模式下，点击跳转只能定位到终端 App、到不了具体标签页；提问通过该服务的本机 HTTP 接口回答。
+
+</details>
+
+<a name="mimo"></a>
+<details>
+<summary><b>MiMo Code 与 Xiaomi MiMo 桌面端</b></summary>
+
+<br>
+
+MiMo Code 是 OpenCode 1.x 的分支，Xiaomi MiMo 桌面端又以 MiMo Code 作为内核，所以两者都会从 `~/.config/mimocode/plugins/` 加载 OpenCode 插件。CodeIsland 把插件以 MiMo 的身份写到这里，不改动 `mimocode.json`。MiMo 只在内核启动时读取插件，插件装好后需要重启一次 App（或 `mimo`）。审批和提问可以在刘海上处理，也可以在 MiMo 里处理，以先操作的一方为准。点击桌面端会话会把 Xiaomi MiMo 切到前台；它的 `xiaomi-mimo://` 链接只用于加入分享的会话，没办法直接打开某个对话。
+
+</details>
+
+<a name="hermes"></a>
+<details>
+<summary><b>Hermes：首次需要批准 hook</b></summary>
+
+<br>
+
+Hermes 遇到没见过的 hook 会先询问，每个 hook 问一次。下次在终端启动 `hermes` 时，对 CodeIsland 的条目（`codeisland-bridge --source hermes`；SSH 远程主机上是 `codeisland-remote-hook.py` 那些）逐个回答 `y` 即可。没有终端的 Hermes（gateway 服务、桌面 App）无法询问，会直接跳过没批准的 hook，看起来就像 CodeIsland 看不到这些会话。在终端里批准一次即可（批准记录按 Hermes 主目录保存，gateway 和桌面 App 同样生效），或者在 `~/.hermes/config.yaml` 里设置 `hooks_auto_accept: true`。CodeIsland 更新后如果新增了 hook，Hermes 会就新的 hook 再问一次。
+
+Gateway 聊天（Telegram、Discord、Slack、WhatsApp、邮件等，以及 API Server）也会显示卡片，但不弹完成卡片、不响提示音，空闲 10 分钟后移除。会话结束时卡片随之移除：`/new`、退出 `hermes`、关闭桌面端对话，或 gateway 停止。会话标题只读地取自 Hermes 自己的 `state.db`。
 
 </details>
 

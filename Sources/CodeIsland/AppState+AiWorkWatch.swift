@@ -109,9 +109,8 @@ extension AppState {
                 ?? id.dropPrefix(AppState.aiworkSessionPrefix) {
                 forgetAiWorkHydrateState(daemonId)
             }
-            sessions.removeValue(forKey: id)
+            removeSession(id)
         }
-        refreshDerivedState()
     }
 
     /// Drop every local session for one Hooks surface (`aiwork` or `aiwork-cli`).
@@ -130,10 +129,7 @@ extension AppState {
                 ?? id.dropPrefix(AppState.aiworkSessionPrefix) {
                 forgetAiWorkHydrateState(daemonId)
             }
-            sessions.removeValue(forKey: id)
-        }
-        if !stale.isEmpty {
-            refreshDerivedState()
+            removeSession(id)
         }
     }
 
@@ -305,13 +301,10 @@ extension AppState {
             stale = sessions.keys.filter { $0.hasPrefix(AppState.aiworkSessionPrefix) }
         }
         for id in stale {
-            sessions.removeValue(forKey: id)
+            removeSession(id)
             if let daemonId = id.dropPrefix(AppState.aiworkSessionPrefix) {
                 forgetAiWorkHydrateState(daemonId)
             }
-        }
-        if !stale.isEmpty {
-            refreshDerivedState()
         }
     }
 
@@ -373,9 +366,8 @@ extension AppState {
             }
             // Surface toggled off — drop any leftover card for this session.
             if sessions[sessionId] != nil {
-                sessions.removeValue(forKey: sessionId)
+                removeSession(sessionId)
                 forgetAiWorkHydrateState(daemonSessionId)
-                refreshDerivedState()
             }
             return
         }
@@ -760,9 +752,8 @@ extension AppState {
             preserveLiveStatus: true
         )
         guard ConfigInstaller.isEnabled(source: snapshot.source) else {
-            sessions.removeValue(forKey: key)
+            if sessions[key] != nil { removeSession(key) }
             forgetAiWorkHydrateState(daemonSessionId)
-            refreshDerivedState()
             return
         }
         let waitBefore = displayOnlyWaitKind(forSession: key)
