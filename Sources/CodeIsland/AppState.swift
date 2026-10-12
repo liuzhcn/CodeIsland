@@ -208,6 +208,9 @@ final class AppState {
     /// Codex Desktop isn't running. See AppState+CodexAppServer.
     @ObservationIgnored
     var codexAppServerClient: CodexAppServerClient?
+    var codexAppServerConnectionError: String?
+    @ObservationIgnored
+    var codexAppServerHandshakeId: CodexRequestID?
     /// NSWorkspace launch/terminate observers tracking Codex Desktop.
     @ObservationIgnored
     var codexAppServerObservers: [NSObjectProtocol]?
@@ -215,8 +218,7 @@ final class AppState {
     /// host remains open.
     @ObservationIgnored
     nonisolated(unsafe) var codexAppServerReconnectTask: Task<Void, Never>?
-    /// Prevent an in-flight/stale state-DB scan from recreating a thread after
-    /// app-server delivered `thread/closed`.
+    /// Prevent trailing hook events from recreating a thread after `thread/closed`.
     @ObservationIgnored
     var closedCodexAppThreads: [String: Date] = [:]
     /// Grok sessions retired because their pager process started another
@@ -3635,6 +3637,7 @@ final class AppState {
     private nonisolated static func findDiscoveredSessions() -> [DiscoveredSession] {
         let candidatePids = allProcessIds()
         var discovered: [DiscoveredSession] = []
+        // Codex Desktop uses app-server notifications and hooks, never rollout/state-DB discovery.
         if ConfigInstaller.isEnabled(source: "claude") {
             discovered.append(contentsOf: findActiveClaudeSessions(candidatePids: candidatePids))
         }
@@ -3745,21 +3748,6 @@ final class AppState {
                 }
             }
         }
-    }
-
-    /// FSEvents is not guaranteed to report every append below
-    /// `~/.codex/sessions` on all macOS/filesystem combinations. Reuse the
-    /// cleanup tick as a low-frequency fallback, but only while Codex Desktop
-    /// is running and only after the polling interval has elapsed.
-    nonisolated static func shouldPollCodexDesktopDiscovery(
-        runningBundleIdentifiers: Set<String>,
-        lastPollAt: Date?,
-        now: Date,
-        interval: TimeInterval = 6
-    ) -> Bool {
-        guard runningBundleIdentifiers.contains(codexAppBundleId) else { return false }
-        guard let lastPollAt else { return true }
-        return now.timeIntervalSince(lastPollAt) >= interval
     }
 
     func startSessionDiscovery() {
@@ -7490,16 +7478,10 @@ final class AppState {
     ) -> [DiscoveredSession] {
         var results: [DiscoveredSession] = []
         var seenDiscoveryIds: Set<String> = []
-        var seenDesktopSessionIds: Set<String> = []
         var claimedUnknownSessionIds: Set<String> = []
 
-        // Prefer the native host for unknown-origin root rollouts. Explicit CLI
-        // and Desktop metadata is filtered below, so concurrent modes remain
-        // distinct even when they share a project directory.
-        let orderedProcesses = processes.sorted {
-            $0.isDesktop && !$1.isDesktop
-        }
-        for process in orderedProcesses {
+        // Desktop task status is event driven; only Codex CLI is discovered from files.
+        for process in processes where !process.isDesktop {
             let processCwd = process.cwd
             let useTranscriptCwd = codexDiscoveryUsesTranscriptCwd(processCwd: processCwd)
             if !useTranscriptCwd,
@@ -7587,9 +7569,6 @@ final class AppState {
                 if transcriptOrigin == .unknown {
                     claimedUnknownSessionIds.insert(rawSessionId)
                 }
-                if process.isDesktop {
-                    seenDesktopSessionIds.insert(rawSessionId)
-                }
             }
         }
 
@@ -7611,18 +7590,6 @@ final class AppState {
             }
         }
 
-        // Native Codex Desktop / ChatGPT sessions cannot be mapped by process
-        // CWD because its app-server runs from `/`. Hydrate recent threads from
-        // state_5.sqlite and let transcript activity drive running/idle state.
-        if processes.contains(where: { $0.isDesktop }) {
-            results.append(contentsOf: findRecentCodexDesktopSessions(
-                excluding: seenDesktopSessionIds,
-                statePath: statePath,
-                now: now,
-                hostStartedAt: processes.filter(\.isDesktop).compactMap(\.startTime).min(),
-                fileManager: fm
-            ))
-        }
         return results
     }
 

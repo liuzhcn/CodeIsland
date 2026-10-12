@@ -158,11 +158,12 @@ struct NotchPanelView: View {
     /// First launch / no-session state should still render a visible marker so the app
     /// doesn't disappear completely behind the physical notch.
     private var showIdleIndicator: Bool {
-        !isActive && !hideWhenNoSession
+        !isActive && (!hideWhenNoSession || appState.codexAppServerConnectionError != nil)
     }
     /// Whether the bar content should be visible (respects hideWhenNoSession)
     private var showBar: Bool {
-        isActive && !(hideWhenNoSession && appState.activeSessionCount == 0)
+        isActive && !(hideWhenNoSession && appState.activeSessionCount == 0
+            && appState.codexAppServerConnectionError == nil)
     }
     private var shouldShowExpanded: Bool {
         showBar && appState.surface.isExpanded
@@ -203,6 +204,9 @@ struct NotchPanelView: View {
     /// Total panel width — adapts based on state and screen geometry
     private var panelWidth: CGFloat {
         let nw = effectiveNotchW
+        if showIdleIndicator && appState.codexAppServerConnectionError != nil {
+            return hasNotch ? nw + (idleHovered ? 290 : 190) : max(idleHovered ? 250 : 160, ceil(idleContentWidth))
+        }
         if !hasNotch {
             if showIdleIndicator && idleHovered { return max(64, ceil(idleContentWidth)) }
             if !isActive && !showIdleIndicator { return nw }
@@ -328,7 +332,8 @@ struct NotchPanelView: View {
                         notchW: effectiveNotchW,
                         notchHeight: barHeight,
                         hasNotch: hasNotch,
-                        hovered: idleHovered
+                        hovered: idleHovered,
+                        connectionError: appState.codexAppServerConnectionError
                     )
                     .fixedSize(horizontal: !hasNotch, vertical: false)
                     .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
@@ -847,6 +852,12 @@ private struct CompactRightWing: View {
 
     var body: some View {
         HStack(spacing: 6) {
+            if let error = appState.codexAppServerConnectionError {
+                Label("Codex 直连失败", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.orange)
+                    .help(error)
+            }
             if expanded {
                 ExpandedHeaderControls(soundEnabled: $soundEnabled)
             } else {
@@ -1321,6 +1332,7 @@ private struct IdleIndicatorBar: View {
     let notchHeight: CGFloat
     let hasNotch: Bool
     let hovered: Bool
+    let connectionError: String?
     @ObservedObject private var l10n = L10n.shared
     @AppStorage(SettingsKey.soundEnabled) private var soundEnabled = SettingsDefaults.soundEnabled
     @AppStorage(SettingsKey.defaultSource) private var defaultSource = SettingsDefaults.defaultSource
@@ -1340,9 +1352,16 @@ private struct IdleIndicatorBar: View {
 
             // Keep the zero count visible; reveal actions only on hover.
             HStack(spacing: 8) {
-                Text("0")
-                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.4))
+                if let connectionError {
+                    Label("Codex 直连失败", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.orange)
+                        .help(connectionError)
+                } else {
+                    Text("0")
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
 
                 if hovered {
                     HStack(spacing: 4) {

@@ -557,7 +557,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         ))
     }
 
-    func testRootCwdDesktopRolloutSurvivesMissingStateDatabase() throws {
+    func testDesktopRolloutIsNotDiscoveredWithoutDirectEvents() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory
             .appendingPathComponent("codeisland-codex-root-fallback-\(UUID().uuidString)")
@@ -587,13 +587,10 @@ final class AppStateCodexTranscriptTests: XCTestCase {
             fileManager: fm
         )
 
-        XCTAssertEqual(discovered.map(\.sessionId), ["codexapp:\(rawSessionId)"])
-        XCTAssertEqual(discovered.first?.providerSessionId, rawSessionId)
-        XCTAssertEqual(discovered.first?.termBundleId, AppState.codexAppBundleId)
-        XCTAssertEqual(discovered.first?.cwd, "/fallback/repo")
+        XCTAssertTrue(discovered.isEmpty)
     }
 
-    func testSameRawThreadOpenInDesktopAndCLIRemainsTwoDiscoveries() throws {
+    func testDesktopRolloutDoesNotHideCLIResult() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory
             .appendingPathComponent("codeisland-codex-dual-mode-\(UUID().uuidString)")
@@ -643,21 +640,14 @@ final class AppStateCodexTranscriptTests: XCTestCase {
             fileManager: fm
         )
 
-        XCTAssertEqual(Set(discovered.map(\.sessionId)), [
-            rawSessionId,
-            "codexapp:\(rawSessionId)",
-        ])
+        XCTAssertEqual(discovered.map(\.sessionId), [rawSessionId])
         XCTAssertEqual(
             discovered.first(where: { $0.sessionId == rawSessionId })?.termBundleId,
             nil
         )
-        XCTAssertEqual(
-            discovered.first(where: { $0.sessionId.hasPrefix("codexapp:") })?.termBundleId,
-            AppState.codexAppBundleId
-        )
     }
 
-    func testUnknownOriginRolloutIsClaimedOnlyByPreferredDesktopProcess() throws {
+    func testUnknownOriginRolloutCanBeDiscoveredByCLI() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory
             .appendingPathComponent("codeisland-codex-unknown-mode-\(UUID().uuidString)")
@@ -697,7 +687,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
             fileManager: fm
         )
 
-        XCTAssertEqual(discovered.map(\.sessionId), ["codexapp:\(rawSessionId)"])
+        XCTAssertEqual(discovered.map(\.sessionId), [rawSessionId])
     }
 
     func testOtherAppServerClientRolloutStaysWithItsOwnProcess() throws {
@@ -812,7 +802,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
         XCTAssertNil(discovered.first?.termBundleId)
     }
 
-    func testRejectedRootRolloutDoesNotExcludeValidDatabaseRecord() throws {
+    func testDesktopDatabaseRecordIsNotDiscovered() throws {
         let fm = FileManager.default
         let tempDir = fm.temporaryDirectory
             .appendingPathComponent("codeisland-codex-rejected-fallback-\(UUID().uuidString)")
@@ -863,9 +853,7 @@ final class AppStateCodexTranscriptTests: XCTestCase {
             fileManager: fm
         )
 
-        XCTAssertEqual(discovered.map(\.sessionId), ["codexapp:\(rawSessionId)"])
-        XCTAssertEqual(discovered.first?.cwd, "/database/repo")
-        XCTAssertEqual(discovered.first?.status, .processing)
+        XCTAssertTrue(discovered.isEmpty)
     }
 
     func testCodexLatestTerminalTurnTimestampPrefersNewestTerminalEvent() throws {

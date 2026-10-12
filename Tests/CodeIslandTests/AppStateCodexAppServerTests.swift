@@ -329,6 +329,23 @@ final class AppStateCodexAppServerTests: XCTestCase {
         XCTAssertEqual(resolved?.path, fallbackExecutable.path)
     }
 
+    func testCodexAppServerExecutableFindsChatGPTBundlePath() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("codeisland-codex-app-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let bundleURL = tempDir.appendingPathComponent("ChatGPT.app", isDirectory: true)
+        let executable = bundleURL.appendingPathComponent("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+        try fm.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try makeExecutable(at: executable)
+
+        let resolved = AppState.codexAppServerExecutableURL(
+            runningBundleURLs: [bundleURL], fallbackPaths: [], fileManager: fm
+        )
+
+        XCTAssertEqual(resolved?.path, executable.path)
+    }
+
     func testCodexAppServerExitReconnectsOnlyWhileHostAndWatcherRemainActive() {
         XCTAssertEqual(
             AppState.codexAppServerExitStrategy(hostRunning: true, watcherActive: true),
@@ -342,6 +359,24 @@ final class AppStateCodexAppServerTests: XCTestCase {
             AppState.codexAppServerExitStrategy(hostRunning: true, watcherActive: false),
             .stopAndRemoveSessions
         )
+    }
+
+    func testCodexHandshakeClearsAndReportsConnectionErrors() throws {
+        let appState = AppState()
+        appState.codexAppServerHandshakeId = .int(1)
+        appState.codexAppServerConnectionError = "连接失败"
+        let success = try XCTUnwrap(CodexAppServerClient.parseMessage(Data(#"{"id":1,"result":{}}"#.utf8)))
+        appState.handleCodexAppServerMessage(success)
+        XCTAssertNil(appState.codexAppServerHandshakeId)
+        XCTAssertNil(appState.codexAppServerConnectionError)
+
+        appState.codexAppServerHandshakeId = .int(2)
+        let failure = try XCTUnwrap(CodexAppServerClient.parseMessage(Data(
+            #"{"id":2,"error":{"code":-32603,"message":"failed"}}"#.utf8
+        )))
+        appState.handleCodexAppServerMessage(failure)
+        XCTAssertNil(appState.codexAppServerHandshakeId)
+        XCTAssertEqual(appState.codexAppServerConnectionError, "Codex 初始化失败（-32603），正在重试")
     }
 
     func testAppServerDisconnectDropsDeadChannelQuestionAndResumesCard() throws {

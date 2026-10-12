@@ -548,6 +548,28 @@ def _codex_title(session_id, codex_home=None):
         return None
 
 
+def _codex_approvals_reviewer(path):
+    """Read the effective reviewer from the latest turn, not the Mac's config."""
+    if not isinstance(path, str) or not path.strip():
+        return None
+    reviewer = None
+    try:
+        # ponytail: scan once per approval; reverse-read if large rollouts get slow.
+        # The turn context may precede more than TRANSCRIPT_TAIL_BYTES of output.
+        with open(os.path.expanduser(path), encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("type") == "turn_context":
+                    context = record.get("payload")
+                    reviewer = context.get("approvals_reviewer") if isinstance(context, dict) else None
+    except (OSError, UnicodeError):
+        return None
+    return reviewer.strip() if isinstance(reviewer, str) and reviewer.strip() else None
+
+
 def main():
     if "--version" in sys.argv:
         print(VERSION)
@@ -578,6 +600,13 @@ def main():
         title = _codex_title(session_id)
         if title:
             payload["session_title"] = title
+        if normalized_event == "PermissionRequest" and not any(
+            isinstance(payload.get(key), str) and payload[key].strip()
+            for key in ("approvals_reviewer", "approvalsReviewer", "_approvals_reviewer")
+        ):
+            reviewer = _codex_approvals_reviewer(payload.get("transcript_path"))
+            if reviewer:
+                payload["_approvals_reviewer"] = reviewer
 
     if SOURCE == "claude":
         extras = _scan_claude_jsonl(session_id, cwd)

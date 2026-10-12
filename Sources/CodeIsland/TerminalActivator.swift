@@ -104,6 +104,7 @@ struct TerminalActivator {
         sessionId: String? = nil,
         allowHerdr: Bool = true
     ) {
+        NSLog("CI_ACTIVATE source=%@ target=%@", session.source, session.codexDesktopURL?.absoluteString ?? "none")
         guard session.canActivateSession else { return }
         // Every caller is a user action (click, shortcut, Buddy button): the
         // user is now dealing with this session, so its follow-ups stop.

@@ -43,30 +43,6 @@ final class AppStateCodexSubsessionTests: XCTestCase {
         ))
     }
 
-    func testCodexDesktopDiscoveryPollingRequiresRunningAppAndElapsedInterval() {
-        let now = Date(timeIntervalSince1970: 1_000)
-        XCTAssertFalse(AppState.shouldPollCodexDesktopDiscovery(
-            runningBundleIdentifiers: [],
-            lastPollAt: nil,
-            now: now
-        ))
-        XCTAssertTrue(AppState.shouldPollCodexDesktopDiscovery(
-            runningBundleIdentifiers: [AppState.codexAppBundleId],
-            lastPollAt: nil,
-            now: now
-        ))
-        XCTAssertFalse(AppState.shouldPollCodexDesktopDiscovery(
-            runningBundleIdentifiers: [AppState.codexAppBundleId],
-            lastPollAt: now.addingTimeInterval(-5),
-            now: now
-        ))
-        XCTAssertTrue(AppState.shouldPollCodexDesktopDiscovery(
-            runningBundleIdentifiers: [AppState.codexAppBundleId],
-            lastPollAt: now.addingTimeInterval(-6),
-            now: now
-        ))
-    }
-
     func testCodexDesktopDiscoveryChannelsShareOneIdentityWhileCLIStaysRaw() {
         let rawId = "desktop-thread"
         let desktop = AppState.codexDiscoveryIdentity(rawSessionId: rawId, isDesktop: true)

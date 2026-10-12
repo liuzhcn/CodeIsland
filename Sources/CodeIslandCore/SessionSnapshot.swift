@@ -745,10 +745,28 @@ public struct SessionSnapshot: Sendable {
     }
 
     public var codexDesktopURL: URL? {
+        var state: [String: Any] = [:]
+        if source == "codex", let remoteHostId,
+           !remoteHostId.hasPrefix("remote-ssh-codex-managed:"),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.codex/.codex-global-state.json")),
+           let stored = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            state = stored
+        }
+        return codexDesktopURL(state: state)
+    }
+
+    public func codexDesktopURL(state: [String: Any]) -> URL? {
+        let memberships = state["thread-project-membership-host-ids"] as? [String: String]
+        let hostId = remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true
+            ? remoteHostId : (isRemote ? providerSessionId.flatMap { memberships?[$0] } : nil)
         guard source == "codex",
-              termBundleId == "com.openai.codex" || remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true,
+              termBundleId == "com.openai.codex" || hostId?.hasPrefix("remote-ssh-codex-managed:") == true,
               let id = providerSessionId, UUID(uuidString: id) != nil else { return nil }
-        return URL(string: "codex://threads/" + id)
+        var url = URLComponents(string: "codex://threads/" + id)
+        if let hostId, hostId.hasPrefix("remote-ssh-codex-managed:") {
+            url?.queryItems = [URLQueryItem(name: "hostId", value: hostId)]
+        }
+        return url?.url
     }
     public var canActivateSession: Bool { !isRemote || codexDesktopURL != nil }
 

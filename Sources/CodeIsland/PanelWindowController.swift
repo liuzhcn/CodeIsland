@@ -566,6 +566,7 @@ class PanelWindowController: NSObject, NSWindowDelegate {
         let dragThreshold: CGFloat = 5
 
         localDragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            NSLog("CI_CLICK event=%ld point=%@", event.type.rawValue, NSStringFromPoint(event.locationInWindow))
             guard let self, let panel = self.panel,
                   SettingsManager.shared.allowHorizontalDrag else { return event }
 

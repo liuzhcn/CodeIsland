@@ -44,7 +44,9 @@ final class CodexDeepLinkTests: XCTestCase {
         XCTAssertEqual(local.codexDesktopURL?.absoluteString, "codex://threads/" + id)
         local.termBundleId = nil
         local.remoteHostId = "remote-ssh-codex-managed:test"
-        XCTAssertEqual(local.codexDesktopURL?.absoluteString, "codex://threads/" + id)
+        let remoteURL = try XCTUnwrap(local.codexDesktopURL)
+        XCTAssertEqual(URLComponents(url: remoteURL, resolvingAgainstBaseURL: false)?.queryItems,
+                       [URLQueryItem(name: "hostId", value: local.remoteHostId)])
         XCTAssertTrue(local.canActivateSession)
         local.remoteHostId = "unrelated-ssh-server"
         XCTAssertNil(local.codexDesktopURL)
@@ -55,6 +57,25 @@ final class CodexDeepLinkTests: XCTestCase {
         XCTAssertFalse(local.canJumpFromNotch)
         local.source = "claude"
         XCTAssertNil(local.codexDesktopURL)
+    }
+
+    func testRemoteSSHCardResolvesCodexHostFromThreadMembership() throws {
+        let id = "00000000-0000-4000-8000-000000000001"
+        let host = "remote-ssh-codex-managed:test"
+        var remote = SessionSnapshot()
+        remote.source = "codex"
+        remote.providerSessionId = id
+        remote.remoteHostId = "codeisland-ssh-host"
+        let state: [String: Any] = ["thread-project-membership-host-ids": [id: host]]
+        let url = try XCTUnwrap(remote.codexDesktopURL(state: state))
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(components.host, "threads")
+        XCTAssertEqual(components.path, "/" + id)
+        XCTAssertEqual(components.queryItems, [URLQueryItem(name: "hostId", value: host)])
+        XCTAssertNil(remote.codexDesktopURL(state: [:]))
+        XCTAssertNil(remote.codexDesktopURL(state: ["thread-project-membership-host-ids": [id: "local"]]))
+        remote.source = "claude"
+        XCTAssertNil(remote.codexDesktopURL(state: state))
     }
 
 }

@@ -128,6 +128,7 @@ extension AppState {
     private func startCodexAppServerClientIfPossible() {
         guard codexAppServerClient == nil else { return }
         guard let executable = Self.codexAppServerExecutableURL() else {
+            codexAppServerConnectionError = "找不到 Codex 通信程序，正在重试"
             scheduleCodexAppServerReconnect()
             return
         }
@@ -147,13 +148,25 @@ extension AppState {
         do {
             try client.start()
             let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-            try client.initializeHandshake(clientName: "CodeIsland", clientVersion: version)
+            codexAppServerHandshakeId = try client.initializeHandshake(clientName: "CodeIsland", clientVersion: version)
         } catch {
+            codexAppServerConnectionError = "Codex 连接失败：\(error)"
             client.stop()
             scheduleCodexAppServerReconnect()
             return
         }
         codexAppServerClient = client
+        Task { @MainActor [weak self, weak client] in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard let self, let client,
+                  self.codexAppServerClient === client,
+                  self.codexAppServerHandshakeId != nil else { return }
+            self.codexAppServerConnectionError = "Codex 连接超时，正在重试"
+            client.stop()
+            self.codexAppServerClient = nil
+            self.codexAppServerHandshakeId = nil
+            self.scheduleCodexAppServerReconnect()
+        }
     }
 
     nonisolated static func codexAppServerExitStrategy(
@@ -167,6 +180,7 @@ extension AppState {
 
     private func handleCodexAppServerExit() {
         codexAppServerClient = nil
+        codexAppServerHandshakeId = nil
         let hostRunning = NSWorkspace.shared.runningApplications.contains {
             $0.bundleIdentifier == AppState.codexAppBundleId
         }
@@ -175,11 +189,12 @@ extension AppState {
             watcherActive: codexAppServerObservers != nil
         ) {
         case .reconnectPreservingSessions:
-            // Preserve state-backed cards, refresh immediately, and restore the
-            // live JSON-RPC channel with capped exponential backoff.
+            codexAppServerConnectionError = "Codex 连接断开，正在重连"
+            // Preserve event-backed cards while restoring the live JSON-RPC channel.
             invalidateCodexAppServerQuestionsAfterDisconnect()
             scheduleCodexAppServerReconnect()
         case .stopAndRemoveSessions:
+            codexAppServerConnectionError = nil
             codexAppServerReconnectTask?.cancel()
             codexAppServerReconnectTask = nil
             removeCodexAppServerSessions()
@@ -271,6 +286,8 @@ extension AppState {
         codexAppServerReconnectTask = nil
         let client = codexAppServerClient
         codexAppServerClient = nil
+        codexAppServerHandshakeId = nil
+        codexAppServerConnectionError = nil
         client?.stop()
         removeCodexAppServerSessions()
     }
@@ -311,6 +328,15 @@ extension AppState {
             default:
                 break
             }
+        case .response(let id) where id == codexAppServerHandshakeId:
+            codexAppServerHandshakeId = nil
+            codexAppServerConnectionError = nil
+        case .error(let id, let code, _) where codexAppServerHandshakeId != nil && id == codexAppServerHandshakeId:
+            codexAppServerHandshakeId = nil
+            codexAppServerConnectionError = "Codex 初始化失败（\(code)），正在重试"
+            codexAppServerClient?.stop()
+            codexAppServerClient = nil
+            scheduleCodexAppServerReconnect()
         case .response, .error:
             break
         }
