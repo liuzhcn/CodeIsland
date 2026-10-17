@@ -96,6 +96,8 @@ public struct SessionSnapshot: Sendable {
     public var currentTool: String?
     public var toolDescription: String?
     public var lastActivity: Date = Date()
+    /// Transport loss is not a successful completion; keep recent cards visibly offline.
+    public var connectionLost = false
     public var cwd: String?
     public var model: String?
     public var permissionMode: String?

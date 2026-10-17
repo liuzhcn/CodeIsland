@@ -536,23 +536,19 @@ final class AppState {
     /// next tool call — the card must not read idle while it does.
     nonisolated static let daemonTurnSettleTimeout: TimeInterval = 120
 
-    /// Minutes an idle card with no process to outlive waits before it goes.
+    /// Legacy threshold retained for compatibility tests; explicit settings now govern cleanup.
     nonisolated static let defaultStaleIdleMinutes = 10
 
-    /// Whether the idle sweep removes an idle card. The user's timeout applies
-    /// to every card. Otherwise a card whose process is monitored lives as
-    /// long as that process; one without (hook-only) goes after
-    /// `defaultStaleIdleMinutes`. So does a Hermes gateway chat's card: its
-    /// monitored process is the gateway daemon, which never exits (#364).
+    /// Retain idle cards for the configured duration regardless of process ownership.
+    /// A remote card has no local monitor; that must not shorten its retention.
     nonisolated static func isStaleIdleSession(
         idleMinutes: Int,
         userTimeoutMinutes: Int,
         hasMonitor: Bool,
         hermesChatElsewhere: Bool
     ) -> Bool {
-        if userTimeoutMinutes > 0 && idleMinutes >= userTimeoutMinutes { return true }
-        let livesWithItsProcess = hasMonitor && !hermesChatElsewhere
-        return !livesWithItsProcess && idleMinutes >= defaultStaleIdleMinutes
+        // The explicit setting is authoritative, including 0 = never clean up.
+        userTimeoutMinutes > 0 && idleMinutes >= userTimeoutMinutes
     }
 
     nonisolated static func isDaemonBackedSource(_ source: String?) -> Bool {
@@ -679,7 +675,8 @@ final class AppState {
             if !Self.isLiveProcess(process) {
                 if exitingSessions[key] == process { continue }
                 if session.status == .idle {
-                    removeSession(key)
+                    if session.source == "codex" && session.isNativeAppMode { retainEndedSession(key) }
+                    else { removeSession(key) }
                 } else {
                     handleProcessExit(sessionId: key, exitedProcess: process)
                 }
@@ -709,10 +706,12 @@ final class AppState {
                 guard session.isNativeAppMode,
                       let bundleId = session.termBundleId,
                       !running.contains(bundleId) else { continue }
-                removeSession(key)
+                if session.source == "codex" {
+                    if !session.connectionLost { retainEndedSession(key, disconnected: true) }
+                } else { removeSession(key) }
             }
         }
-        // 4. Remove idle sessions past timeout (user setting, or 10 min default for no-monitor sessions)
+        // 4. Remove idle sessions only after the configured retention duration.
         let userTimeout = SettingsManager.shared.sessionTimeout
         for (key, session) in sessions where session.status == .idle {
             let idleMinutes = Int(-session.lastActivity.timeIntervalSinceNow / 60)
@@ -1015,7 +1014,9 @@ final class AppState {
             // This prevents a race where an in-flight hook event (e.g. "Stop") updates
             // lastActivity after exitTime, causing the session to linger for 10+ minutes.
             if !Self.isLiveProcess(exitedProcess) {
-                self.removeSession(sessionId)
+                if self.sessions[sessionId]?.source == "codex", self.sessions[sessionId]?.isNativeAppMode == true {
+                    self.retainEndedSession(sessionId)
+                } else { self.removeSession(sessionId) }
                 return
             }
 
@@ -1746,6 +1747,7 @@ final class AppState {
             sessions[sessionId] = SessionSnapshot()
         }
 
+        sessions[sessionId]?.connectionLost = false
         let prevStatus = sessions[sessionId]?.status
         let wasWaiting = prevStatus == .waitingApproval || prevStatus == .waitingQuestion
         let displayOnlyWaitBefore = displayOnlyWaitKind(forSession: sessionId)
@@ -1967,6 +1969,36 @@ final class AppState {
         return false
     }
 
+    func retainEndedSession(_ sessionId: String, disconnected: Bool = false) {
+        guard var session = sessions[sessionId] else { return }
+        let waitBefore = displayOnlyWaitKind(forSession: sessionId)
+        if session.status != .idle { session.lastActivity = Date() }
+        session.status = .idle
+        session.currentTool = nil
+        session.toolDescription = nil
+        session.cliPid = nil
+        session.cliStartTime = nil
+        session.connectionLost = disconnected
+        for id in session.subagents.keys { session.subagents[id]?.status = .idle }
+        sessions[sessionId] = session
+        stopMonitor(sessionId)
+        exitingSessions.removeValue(forKey: sessionId)
+        detachTranscriptTailer(sessionId: sessionId)
+        drainPermissions(forSession: sessionId, reason: "session-no-longer-running")
+        drainQuestions(forSession: sessionId, reason: "session-no-longer-running")
+        noteDisplayOnlyWait(sessionId: sessionId, was: waitBefore)
+        if activeSessionId == sessionId { activeSessionId = mostActiveSessionId() }
+        startRotationIfNeeded()
+        refreshDerivedState()
+        scheduleSave()
+    }
+
+    func markRemoteSessionsDisconnected(hostId: String) {
+        for id in sessions.keys.filter({ sessions[$0]?.remoteHostId == hostId }) {
+            retainEndedSession(id, disconnected: true)
+        }
+    }
+
     func removeRemoteSessions(hostId: String) {
         remoteDiscoveredCodexIds[hostId] = nil
         let ids = sessions.compactMap { key, session in
@@ -1993,7 +2025,7 @@ final class AppState {
         // remote CLI Codex cards are hook-driven and absent from this DB query.
         for id in discoveredIds.union(knownIds).subtracting(activeIds)
             where sessions[id]?.remoteHostId == hostId {
-            removeSession(id)
+            retainEndedSession(id)
         }
         discoveredIds.formIntersection(activeIds)
         for record in active {
@@ -2013,6 +2045,7 @@ final class AppState {
             session.providerSessionId = record.id
             session.remoteHostId = hostId
             session.remoteHostName = hostName
+            session.connectionLost = false
             if let title = record.title, !title.isEmpty {
                 session.sessionTitle = title
             }
@@ -2040,7 +2073,10 @@ final class AppState {
         case .stopMonitor(let sid):
             stopMonitor(sid)
         case .removeSession(let sid):
-            removeSession(sid)
+            if let session = sessions[sid], session.source == "codex",
+               session.isRemote || session.isNativeAppMode {
+                retainEndedSession(sid)
+            } else { removeSession(sid) }
         case .enqueueCompletion(let sid):
             enqueueCompletion(sid, turnFailed: turnFailed)
         case .setActiveSession(let sid):
@@ -3504,10 +3540,11 @@ final class AppState {
 
     func restoreSessions() {
         let persisted = SessionPersistence.load()
-        let cutoff = Date().addingTimeInterval(-30 * 60) // 30 minutes
+        let timeout = SettingsManager.shared.sessionTimeout
+        let cutoff = timeout > 0 ? Date().addingTimeInterval(-Double(timeout) * 60) : .distantPast
         for p in persisted where p.lastActivity > cutoff {
             guard let source = SessionSnapshot.normalizedSupportedSource(p.source) else { continue }
-            let restoredSessionId = Self.canonicalRestoredCodexSessionId(
+            let restoredSessionId = p.remoteHostId != nil ? p.sessionId : Self.canonicalRestoredCodexSessionId(
                 sessionId: p.sessionId,
                 source: source,
                 providerSessionId: p.providerSessionId,
@@ -3556,6 +3593,15 @@ final class AppState {
             snapshot.transcriptPath = p.transcriptPath
             snapshot.recap = p.recap
             snapshot.reasoningEffort = p.reasoningEffort
+            snapshot.remoteHostId = p.remoteHostId
+            snapshot.remoteHostName = p.remoteHostName
+            if snapshot.isRemote {
+                // Never probe remote transcripts/PIDs on this Mac. Live events
+                // will reactivate the card once transport reconnects.
+                snapshot.connectionLost = true
+                sessions[restoredSessionId] = snapshot
+                continue
+            }
             // A prompt typed while CodeIsland wasn't running supersedes the
             // saved recap; the transcript tail is the judge. Restored cards
             // don't always get a tailer, so check now rather than on attach.
@@ -3582,6 +3628,7 @@ final class AppState {
             // Keep Cursor Task tombstones / foldable orphans so applyCursor… can still
             // honor closedSubagentIds after relaunch (otherwise merge can revive them).
             if snapshot.cliPid == nil && snapshot.status == .idle && snapshot.lastUserPrompt == nil,
+               !(source == "codex" && (snapshot.sessionTitle != nil || snapshot.lastAssistantMessage != nil)),
                !Self.shouldKeepRestoredIdleCursorSession(
                 source: source,
                 sessionId: restoredSessionId,

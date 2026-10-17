@@ -13,6 +13,8 @@ final class RemoteManager: ObservableObject {
     @Published private(set) var lastMessage: [String: String] = [:]
 
     var onDisconnect: ((String) -> Void)?
+    var onRemoveHost: ((String) -> Void)?
+    var onCodexArchived: ((String, String) -> Void)?
     var onCodexSessions: ((String, String, String, [RemoteCodexSession]) -> Void)?
 
     private var forwarders: [String: SSHForwarder] = [:]
@@ -112,6 +114,7 @@ final class RemoteManager: ObservableObject {
 
     func removeHost(id: String) {
         disconnect(id: id)
+        onRemoveHost?(id)
         hosts.removeAll { $0.id == id }
         connectionStatus[id] = .disconnected
         installRunning[id] = false
@@ -209,7 +212,7 @@ final class RemoteManager: ObservableObject {
                 guard let self, let client, self.codexClients[host.id] === client else { return }
                 self.codexClients[host.id] = nil
                 self.lastMessage[host.id] = "Codex event stream disconnected; reconnecting"
-                self.onCodexSessions?(host.id, host.name, host.cwdFilter, [])
+                self.onDisconnect?(host.id)
                 self.codexReconnectTasks[host.id] = Task { [weak self] in
                     try? await Task.sleep(for: .seconds(3))
                     guard !Task.isCancelled, let self, self.connectionStatus[host.id] == .connected else { return }
@@ -251,6 +254,7 @@ final class RemoteManager: ObservableObject {
                 if method == "thread/status/changed" {
                     try client.sendRequest(method: "thread/read", params: ["threadId": id, "includeTurns": false])
                 } else {
+                    if method == "thread/archived" { onCodexArchived?(host.id, id) }
                     codexRecords[host.id]?[id] = nil
                     onCodexSessions?(host.id, host.name, host.cwdFilter, Array((codexRecords[host.id] ?? [:]).values))
                 }

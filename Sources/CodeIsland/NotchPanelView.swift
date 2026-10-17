@@ -5183,7 +5183,8 @@ private struct TerminalBadge: View {
         Group {
             if session.isRemote {
                 HStack(spacing: 4) {
-                    Image(systemName: "network")
+                    Image(systemName: session.connectionLost ? "wifi.slash" : "network")
+                        .help(session.connectionLost ? L10n.shared["remote_disconnected"] : "")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(remoteColor)
                     if let term = session.terminalName {

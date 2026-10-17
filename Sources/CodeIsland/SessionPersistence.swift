@@ -56,6 +56,8 @@ struct PersistedSession: Codable {
     /// restored card is bound to the gateway daemon again and must still be
     /// swept like a hook-only one. nil = false, as in older files.
     var hermesChatElsewhere: Bool? = nil
+    var remoteHostId: String? = nil
+    var remoteHostName: String? = nil
 }
 
 enum SessionPersistence {
@@ -86,13 +88,10 @@ enum SessionPersistence {
         return home + "/.codeisland"
     }
 
-    /// Whether a card is written out for the next launch. Not a remote one,
-    /// and not a Claude Desktop Cowork card: those are rebuilt from Claude
-    /// Desktop's own store and vouched for by it at launch, and a CodeIsland
-    /// that cannot read the store (an older build after a downgrade) would
-    /// bring one back as a ghost Claude Code session.
+    /// Remote Codex cards retain host/thread identity across launches. Cowork
+    /// cards are still reconstructed exclusively from the provider's own store.
     static func isPersisted(sessionId: String, session: SessionSnapshot) -> Bool {
-        !session.isRemote && !sessionId.hasPrefix(AppState.coworkSessionPrefix)
+        (!session.isRemote || session.source == "codex") && !sessionId.hasPrefix(AppState.coworkSessionPrefix)
     }
 
     static func save(_ sessions: [String: SessionSnapshot]) {
@@ -134,7 +133,9 @@ enum SessionPersistence {
                 recap: s.recap,
                 reasoningEffort: s.reasoningEffort,
                 claudeDesktopSessionId: s.claudeDesktopSessionId,
-                hermesChatElsewhere: s.hermesChatElsewhere ? true : nil
+                hermesChatElsewhere: s.hermesChatElsewhere ? true : nil,
+                remoteHostId: s.remoteHostId,
+                remoteHostName: s.remoteHostName
             )
         }
         do {

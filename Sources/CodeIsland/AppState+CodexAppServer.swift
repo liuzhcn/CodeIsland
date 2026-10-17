@@ -295,7 +295,7 @@ extension AppState {
     private func removeCodexAppServerSessions() {
         let stale = sessions.keys.filter { $0.hasPrefix(AppState.codexAppSessionPrefix) }
         for id in stale {
-            removeSession(id)
+            retainEndedSession(id, disconnected: true)
         }
     }
 
@@ -313,6 +313,11 @@ extension AppState {
                 applyCodexThreadStatusNotification(params: params)
             case "thread/closed":
                 applyCodexThreadClosedNotification(params: params)
+            case "thread/archived":
+                if let id = params["threadId"]?.asString {
+                    closedCodexAppThreads[id] = Date()
+                    removeSession(Self.codexAppSessionPrefix + id)
+                }
             case "serverRequest/resolved":
                 applyCodexServerRequestResolvedNotification(params: params)
             default:
@@ -536,8 +541,10 @@ extension AppState {
         guard var snapshot = sessions[sessionId] else { return }
 
         let waitBefore = displayOnlyWaitKind(forSession: sessionId)
+        let previousStatus = snapshot.status
         applyCodexThreadStatus(&snapshot, status: params["status"]?.asObject)
-        snapshot.lastActivity = Date()
+        if previousStatus != .idle || snapshot.status != .idle { snapshot.lastActivity = Date() }
+        snapshot.connectionLost = false
         sessions[sessionId] = snapshot
         noteDisplayOnlyWait(sessionId: sessionId, was: waitBefore)
         refreshDerivedState()
@@ -548,7 +555,7 @@ extension AppState {
         let sessionId = AppState.codexAppSessionPrefix + threadId
         adoptLegacyCodexDesktopSession(threadID: threadId)
         closedCodexAppThreads[threadId] = Date()
-        removeSession(sessionId)
+        retainEndedSession(sessionId)
     }
 
     /// Map a ThreadStatus union onto our flat AgentStatus enum. Shared between the

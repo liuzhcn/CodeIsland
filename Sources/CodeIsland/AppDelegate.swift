@@ -33,7 +33,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         hookServer = HookServer(appState: appState)
         hookServer?.start()
         RemoteManager.shared.onDisconnect = { [weak appState] hostId in
+            appState?.markRemoteSessionsDisconnected(hostId: hostId)
+        }
+        RemoteManager.shared.onRemoveHost = { [weak appState] hostId in
             appState?.removeRemoteSessions(hostId: hostId)
+        }
+        RemoteManager.shared.onCodexArchived = { [weak appState] hostId, threadId in
+            appState?.removeSession("remote:\(hostId):\(threadId)")
         }
         RemoteManager.shared.onCodexSessions = { [weak appState] hostId, hostName, cwdFilter, sessions in
             appState?.reconcileRemoteCodexSessions(sessions, hostId: hostId, hostName: hostName, cwdFilter: cwdFilter)

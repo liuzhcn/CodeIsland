@@ -424,7 +424,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
         )))
         appState.handleCodexAppServerMessage(closed)
 
-        XCTAssertNil(appState.sessions[sessionId])
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .idle)
         XCTAssertTrue(appState.questionQueue.isEmpty)
         XCTAssertNil(appState.attachedTranscriptPaths[sessionId])
 
@@ -444,7 +444,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
             termBundleId: AppState.codexAppBundleId,
             providerSessionId: threadId
         )])
-        XCTAssertNil(appState.sessions[sessionId])
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .idle)
 
         // A final terminal DB/file flush can be newer than the close callback;
         // idle is not evidence of a resumed generation.
@@ -462,7 +462,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
             termBundleId: AppState.codexAppBundleId,
             providerSessionId: threadId
         )])
-        XCTAssertNil(appState.sessions[sessionId])
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .idle)
 
         let lateHookPayload: [String: Any] = [
             "hook_event_name": "PostToolUse",
@@ -476,7 +476,7 @@ final class AppStateCodexAppServerTests: XCTestCase {
             from: JSONSerialization.data(withJSONObject: lateHookPayload)
         ))
         appState.handleEvent(lateHook)
-        XCTAssertNil(appState.sessions[sessionId])
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .idle)
 
         // A real app-server start is a new generation and clears the tombstone.
         let restarted = try XCTUnwrap(CodexAppServerClient.parseMessage(Data(
@@ -486,6 +486,11 @@ final class AppStateCodexAppServerTests: XCTestCase {
         )))
         appState.handleCodexAppServerMessage(restarted)
         XCTAssertNotNil(appState.sessions[sessionId])
+        let archived = try XCTUnwrap(CodexAppServerClient.parseMessage(Data(
+            #"{"jsonrpc":"2.0","method":"thread/archived","params":{"threadId":"closed-thread"}}"#.utf8
+        )))
+        appState.handleCodexAppServerMessage(archived)
+        XCTAssertNil(appState.sessions[sessionId], "Explicit archive still removes the recent card")
     }
 
     func testActiveWithApprovalFlagMapsToWaitingApproval() {

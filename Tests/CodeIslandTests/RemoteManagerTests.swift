@@ -4,7 +4,7 @@ import CodeIslandCore
 
 @MainActor
 final class RemoteManagerTests: XCTestCase {
-    func testRemoteCodexScanAddsAndRemovesActiveSession() {
+    func testRemoteCodexScanAddsAndRetainsEndedSession() {
         let state = AppState()
         let session = RemoteCodexSession(
             id: "remote-codex-test", cwd: "/home/leo/projects/hr", model: "gpt-6-astra",
@@ -16,7 +16,8 @@ final class RemoteManagerTests: XCTestCase {
         XCTAssertEqual(state.sessions["remote:remote-test:\(session.id)"]?.remoteHostId, "remote-test")
 
         state.reconcileRemoteCodexSessions([], hostId: "remote-test", hostName: "server", cwdFilter: "")
-        XCTAssertNil(state.sessions["remote:remote-test:\(session.id)"])
+        XCTAssertEqual(state.sessions["remote:remote-test:\(session.id)"]?.status, .idle)
+        XCTAssertEqual(state.totalSessionCount, 1)
         XCTAssertEqual(state.activeSessionCount, 0)
     }
 
@@ -88,7 +89,7 @@ final class RemoteManagerTests: XCTestCase {
         }
     }
 
-    func testRemoteScanRemovesHookOnlyCardWithoutStop() throws {
+    func testRemoteScanSettlesHookOnlyCardWithoutStop() throws {
         let state = AppState()
         let data = try JSONSerialization.data(withJSONObject: [
             "hook_event_name": "UserPromptSubmit", "session_id": "ended-thread",
@@ -111,7 +112,7 @@ final class RemoteManagerTests: XCTestCase {
                                        startedAt: 0, isActive: false)
         state.reconcileRemoteCodexSessions([ended], hostId: "remote-test", hostName: "server", cwdFilter: "")
         XCTAssertEqual(state.activeSessionCount, 1)
-        XCTAssertNil(state.sessions["remote:remote-test:ended-thread"])
+        XCTAssertEqual(state.sessions["remote:remote-test:ended-thread"]?.status, .idle)
         XCTAssertNotNil(state.sessions["remote:remote-test:cli-thread"])
     }
 
