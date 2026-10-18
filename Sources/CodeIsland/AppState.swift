@@ -568,6 +568,40 @@ final class AppState {
         return now.timeIntervalSince(session.lastActivity) > threshold
     }
 
+    nonisolated static let minimumRecentSessionCount = 5
+
+    /// Count the same cards as the compact badge, but only idle cards may expire.
+    /// Stable tie-breaking makes cleanup independent of dictionary insertion order.
+    nonisolated static func expiredRecentSessionIDs(
+        sessions: [String: SessionSnapshot], timeoutMinutes: Int, now: Date
+    ) -> [String] {
+        let excess = sessions.count - minimumRecentSessionCount
+        guard excess > 0, timeoutMinutes > 0 else { return [] }
+        let cutoff = now.addingTimeInterval(-Double(timeoutMinutes) * 60)
+        return sessions.filter { $0.value.status == .idle && $0.value.lastActivity <= cutoff }
+            .sorted {
+                if $0.value.lastActivity != $1.value.lastActivity {
+                    return $0.value.lastActivity < $1.value.lastActivity
+                }
+                return $0.key < $1.key
+            }
+            .prefix(excess).map(\.key)
+    }
+
+    func pruneExpiredRecentSessions(now: Date = Date()) {
+        let candidates = Self.expiredRecentSessionIDs(
+            sessions: sessions, timeoutMinutes: SettingsManager.shared.sessionTimeout, now: now
+        )
+        for id in candidates {
+            guard sessions.count > Self.minimumRecentSessionCount else { break }
+            guard let session = sessions[id], session.status == .idle else { continue }
+            if id.hasPrefix(Self.aiworkSessionPrefix), let daemonId = session.providerSessionId {
+                forgetAiWorkHydrateState(daemonId)
+            }
+            removeSession(id)
+        }
+    }
+
     private func cleanupIdleSessions() {
         // 1. Verify monitored PIDs are still alive (DispatchSource can silently miss exits)
         //    Also kill orphaned processes (ppid <= 1, terminal closed but process survived).
@@ -711,40 +745,8 @@ final class AppState {
                 } else { removeSession(key) }
             }
         }
-        // 4. Remove idle sessions only after the configured retention duration.
-        let userTimeout = SettingsManager.shared.sessionTimeout
-        for (key, session) in sessions where session.status == .idle {
-            let idleMinutes = Int(-session.lastActivity.timeIntervalSinceNow / 60)
-            if Self.isStaleIdleSession(
-                idleMinutes: idleMinutes,
-                userTimeoutMinutes: userTimeout,
-                hasMonitor: processMonitors[key] != nil,
-                hermesChatElsewhere: session.hermesChatElsewhere
-            ) {
-                removeSession(key)
-            }
-        }
-
-        // 4b. AiWork sessions come from the Agentix daemon's persistent session
-        //     store, which keeps every conversation as status:"active" forever and
-        //     never emits a close/delete event. A finished turn or an exited TUI/GUI
-        //     conversation just goes idle, so without this it would sit here for the
-        //     full 10-min no-monitor timeout (Section 4) — completed eval bursts pile
-        //     up in the notch. Backfill already treats idle AiWork entries as
-        //     historical and skips them, so mirror that: drop an idle AiWork session
-        //     shortly after its last activity. Live turns bump lastActivity on every
-        //     stream event, so an in-use conversation is never swept mid-thought and
-        //     re-appears the moment the next turn starts.
-        let aiworkIdleGrace: TimeInterval = 60
-        for (key, session) in sessions
-            where key.hasPrefix(AppState.aiworkSessionPrefix)
-            && session.status == .idle {
-            guard -session.lastActivity.timeIntervalSinceNow > aiworkIdleGrace else { continue }
-            if let daemonId = session.providerSessionId {
-                forgetAiWorkHydrateState(daemonId)
-            }
-            removeSession(key)
-        }
+        // All providers share the same count floor and retention duration.
+        pruneExpiredRecentSessions()
 
         // 5. Reclaim memory for abandoned tool_use_id cache entries.
         prunePendingToolUses()
@@ -3540,9 +3542,8 @@ final class AppState {
 
     func restoreSessions() {
         let persisted = SessionPersistence.load()
-        let timeout = SettingsManager.shared.sessionTimeout
-        let cutoff = timeout > 0 ? Date().addingTimeInterval(-Double(timeout) * 60) : .distantPast
-        for p in persisted where p.lastActivity > cutoff {
+        // Restore valid cards before applying the global count/time policy.
+        for p in persisted {
             guard let source = SessionSnapshot.normalizedSupportedSource(p.source) else { continue }
             let restoredSessionId = p.remoteHostId != nil ? p.sessionId : Self.canonicalRestoredCodexSessionId(
                 sessionId: p.sessionId,
@@ -3659,6 +3660,8 @@ final class AppState {
         SessionPersistence.clear()
         _ = applyCodexSubsessionModeToKnownSessions()
         _ = applyCursorSubsessionModeToKnownSessions()
+        pruneExpiredRecentSessions()
+        scheduleSave()
         if activeSessionId == nil {
             activeSessionId = sessions.first(where: { $0.value.status != .idle })?.key
                 ?? sessions.keys.sorted().first

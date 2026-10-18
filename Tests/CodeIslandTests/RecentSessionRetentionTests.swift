@@ -91,7 +91,7 @@ final class RecentSessionRetentionTests: XCTestCase {
         SessionPersistence.save(["remote:host:expired": card])
         let expired = AppState()
         expired.restoreSessions()
-        XCTAssertEqual(expired.totalSessionCount, 0)
+        XCTAssertEqual(expired.totalSessionCount, 1, "Five or fewer recent cards survive even after timeout")
     }
 
 }
