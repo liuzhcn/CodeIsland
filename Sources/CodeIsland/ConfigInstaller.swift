@@ -3432,13 +3432,13 @@ struct ConfigInstaller {
     // MARK: - pi Extension
 
     /// Current pi extension version — bump when codeisland-pi.ts changes.
-    private static let piExtensionVersion = "v4"
+    private static let piExtensionVersion = "v5"
 
     /// Current omp extension version — bump when codeisland-omp.ts changes.
     /// Kept independent of pi (OMP reuses the "CodeIsland pi extension" banner
     /// but ships its own resource file), so a pi-only bump does not false-flag
     /// healthy OMP installs as needing repair.
-    private static let ompExtensionVersion = "v8"
+    private static let ompExtensionVersion = "v9"
 
     private static func piExtensionSource() -> String? {
         if let url = Bundle.appModule.url(forResource: "codeisland-pi", withExtension: "ts", subdirectory: "Resources"),

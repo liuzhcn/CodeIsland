@@ -184,12 +184,21 @@ public enum CLIProcessResolver {
     /// inferred). When the ancestry says Claude, it is Claude's own hook, not
     /// a proxy: otherwise "hide" would auto-allow and hide every Claude Code
     /// session whose binary ends in `/claude` (Homebrew cask, Claude Desktop).
+    ///
+    /// Cursor runs that hook too, as one of the Claude Code hooks it imports,
+    /// and hands it its own payload (`cursorPayload`, see ``CursorHookPayload``).
+    /// That is Cursor's event, declared the way its `--source cursor` hooks
+    /// are: its processes are never inferred (#220), so it used to fall to the
+    /// app's default and show as Claude (#377).
     public static func bridgeSource(
         sourceTag: String?,
         payloadSource: String?,
+        cursorPayload: Bool = false,
         ancestry: [(pid: Int32, executablePath: String?)]
     ) -> (source: String?, viaPlugin: Bool) {
-        let declared = sourceTag ?? SessionSnapshot.normalizedSupportedSource(payloadSource)
+        let declared = sourceTag
+            ?? SessionSnapshot.normalizedSupportedSource(payloadSource)
+            ?? (cursorPayload ? CursorHookPayload.source : nil)
         let inferred = declared ?? inferSource(ancestry: ancestry)
         let effective = cliVariantOverride(declaredSource: inferred, ancestry: ancestry) ?? inferred
         let viaPlugin = declared == nil && effective != nil && effective != "claude"
@@ -249,12 +258,18 @@ public enum CLIProcessResolver {
     /// time. So the nearest Codex process must run the `app-server` subcommand,
     /// and its direct parent must be the app itself; `exec codex` in ChatGPT's
     /// own terminal also leaves ChatGPT as the parent.
+    /// Bundled tool hosts share that outer bundle ID, so the parent must also
+    /// be an executable in the host app's own `Contents/MacOS` directory.
     public static func codexDesktopTermBundle(ancestry: [ProcessAncestor]) -> String? {
         guard let codexIndex = ancestry.firstIndex(where: {
             sourceMatchesExecutablePath($0.executablePath ?? "", source: "codex")
         }), isCodexAppServerInvocation(ancestry[codexIndex].arguments),
               codexIndex + 1 < ancestry.count,
-              ancestry[codexIndex + 1].bundleIdentifier == "com.openai.codex" else {
+              ancestry[codexIndex + 1].bundleIdentifier == "com.openai.codex",
+              let parentPath = ancestry[codexIndex + 1].executablePath,
+              let appPath = HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath),
+              URL(fileURLWithPath: parentPath).standardizedFileURL.deletingLastPathComponent().path
+                == URL(fileURLWithPath: appPath).standardizedFileURL.appendingPathComponent("Contents/MacOS").path else {
             return nil
         }
         return "com.openai.codex"
@@ -375,23 +390,8 @@ public struct HookEvent {
             return nil
         }
         self.eventName = eventName
-        let rawSessionId = HookEvent.firstString(in: json, keys: ["session_id", "sessionId"])
-        if let rawSessionId,
-           let remoteHostId = json["_remote_host_id"] as? String,
-           !remoteHostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            self.sessionId = "remote:\(remoteHostId):\(rawSessionId)"
-        } else if let rawSessionId,
-                  (json["_source"] as? String)?.lowercased() == "codex",
-                  json["_term_bundle"] as? String == "com.openai.codex" {
-            // Codex Desktop hooks, app-server notifications, rollout discovery,
-            // and state-DB polling must all address one card. Keep the provider's
-            // raw id in rawJSON for title lookup and persisted providerSessionId.
-            self.sessionId = rawSessionId.hasPrefix("codexapp:")
-                ? rawSessionId
-                : "codexapp:\(rawSessionId)"
-        } else {
-            self.sessionId = rawSessionId
-        }
+        self.sessionId = HookEvent.firstString(in: json, keys: ["session_id", "sessionId"])
+            .map { HookEvent.cardSessionId(forRawSessionId: $0, in: json) }
         self.toolName = HookEvent.firstString(in: json, keys: ["tool_name", "toolName", "tool", "name"])
             ?? HookEvent.firstString(inNestedDictionary: json, containerKeys: ["tool", "payload", "data"], keys: ["name", "tool_name", "toolName"])
             ?? HookEvent.firstString(inNestedDictionary: json, containerKeys: ["toolCall"], keys: ["name"])
@@ -412,6 +412,25 @@ public struct HookEvent {
             ? json["agent_id"] as? String
             : nil
         self.rawJSON = json
+    }
+
+    /// The card a session id from a payload is filed under. Remote hosts get
+    /// a namespace of their own, and Codex Desktop hooks, app-server
+    /// notifications, rollout discovery and state-DB polling must all address
+    /// one `codexapp:` card. The provider's raw id stays in rawJSON for title
+    /// lookup and the persisted providerSessionId.
+    public static func cardSessionId(forRawSessionId rawSessionId: String, in json: [String: Any]) -> String {
+        if let remoteHostId = json["_remote_host_id"] as? String,
+           !remoteHostId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "remote:\(remoteHostId):\(rawSessionId)"
+        }
+        if (json["_source"] as? String)?.lowercased() == "codex",
+           json["_term_bundle"] as? String == "com.openai.codex" {
+            return rawSessionId.hasPrefix("codexapp:")
+                ? rawSessionId
+                : "codexapp:\(rawSessionId)"
+        }
+        return rawSessionId
     }
 
     /// Whether a payload's `agent_id` identifies a subagent working under the

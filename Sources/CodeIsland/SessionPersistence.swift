@@ -58,6 +58,9 @@ struct PersistedSession: Codable {
     var hermesChatElsewhere: Bool? = nil
     var remoteHostId: String? = nil
     var remoteHostName: String? = nil
+    /// The session a child card works for (`SessionSnapshot.parentSessionId`),
+    /// so a restored child still never rings for its own turns.
+    var parentSessionId: String? = nil
 }
 
 enum SessionPersistence {
@@ -135,7 +138,8 @@ enum SessionPersistence {
                 claudeDesktopSessionId: s.claudeDesktopSessionId,
                 hermesChatElsewhere: s.hermesChatElsewhere ? true : nil,
                 remoteHostId: s.remoteHostId,
-                remoteHostName: s.remoteHostName
+                remoteHostName: s.remoteHostName,
+                parentSessionId: s.parentSessionId
             )
         }
         do {

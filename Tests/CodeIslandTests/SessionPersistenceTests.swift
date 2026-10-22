@@ -71,7 +71,10 @@ final class SessionPersistenceTests: XCTestCase {
             startTime: startTime,
             lastActivity: startTime.addingTimeInterval(30),
             transcriptPath: nil,
-            closedSubagentIds: nil
+            closedSubagentIds: nil,
+            remoteHostId: "remote-host-1",
+            remoteHostName: "Development Mac",
+            parentSessionId: "parent-thread"
         )
 
         let encoder = JSONEncoder()
@@ -84,6 +87,9 @@ final class SessionPersistenceTests: XCTestCase {
 
         XCTAssertEqual(decoded.cliPid, 456)
         XCTAssertEqual(decoded.cliStartTime, cliStartTime)
+        XCTAssertEqual(decoded.remoteHostId, "remote-host-1")
+        XCTAssertEqual(decoded.remoteHostName, "Development Mac")
+        XCTAssertEqual(decoded.parentSessionId, "parent-thread")
     }
 
     func testPersistedSessionRoundTripPreservesClosedSubagentIds() throws {
