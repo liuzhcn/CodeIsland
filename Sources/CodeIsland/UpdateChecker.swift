@@ -61,12 +61,10 @@ final class UpdateChecker: NSObject, ObservableObject {
         }
         #endif
 
-        if isHomebrewInstall {
-            Self.log.info("Homebrew install detected — disabling Sparkle auto-checks")
-            updater.automaticallyChecksForUpdates = false
-        } else {
-            updater.automaticallyChecksForUpdates = true
-        }
+        // This build carries local Codex and remote-session behavior that an
+        // upstream binary would replace. Updates remain available from the
+        // explicit Check for Updates action after they have been integrated.
+        updater.automaticallyChecksForUpdates = false
         controller.startUpdater()
     }
 
