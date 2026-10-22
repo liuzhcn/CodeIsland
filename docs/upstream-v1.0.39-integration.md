@@ -24,5 +24,6 @@
 - Python 远程 hook 检查：标题、审批模式、诊断和事件传输均通过。
 - Bun 的 pi / Oh My Pi 插件测试：21 项通过，0 失败。
 - `SIGN_ID=- bash build.sh` 构建 arm64 发布应用成功；生成包为 1.0.39，深度严格签名校验通过。
+- 用原应用相同的签名身份重新构建后安装到 `/Applications/CodeIsland.app`；启动进程正常，版本为 1.0.39，签名验证通过，自动检查更新的偏好值为关闭。安装前的 1.0.38 应用保存在 `~/Library/Application Support/CodeIsland/backups/before-v1.0.39-20261022/`。
 
-正式安装与运行中的 SSH、Codex 和多显示器行为仍需在实际环境下观察；上述自动化测试不会连接用户的远程主机。
+运行中的 SSH、Codex 和多显示器行为仍需在实际使用中观察；上述自动化测试不会连接用户的远程主机。
