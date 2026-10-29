@@ -764,8 +764,19 @@ public struct SessionSnapshot: Sendable {
 
     public func codexDesktopURL(state: [String: Any]) -> URL? {
         let memberships = state["thread-project-membership-host-ids"] as? [String: String]
-        let hostId = remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true
+        var hostId = remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true
             ? remoteHostId : (isRemote ? providerSessionId.flatMap { memberships?[$0] } : nil)
+        // Codex migrates some threads out of the legacy membership map.
+        // Recover only an exact thread match on one unambiguous managed host.
+        if hostId == nil, isRemote, let id = providerSessionId,
+           let migrated = state["app-server-migrated-pinned-thread-ids-by-host"] as? [String: [String]] {
+            let hosts = Set(migrated.compactMap { key, ids -> String? in
+                guard ids.contains(id), key.hasPrefix("remote-ssh-codex-managed:"),
+                      let separator = key.range(of: ":/") else { return nil }
+                return String(key[..<separator.lowerBound])
+            })
+            if hosts.count == 1 { hostId = hosts.first }
+        }
         guard source == "codex",
               termBundleId == "com.openai.codex" || hostId?.hasPrefix("remote-ssh-codex-managed:") == true,
               let id = providerSessionId, UUID(uuidString: id) != nil else { return nil }
