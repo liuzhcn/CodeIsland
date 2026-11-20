@@ -1349,6 +1349,20 @@ print(" · ".join(parts))
 """
     }
 
+    /// Bounded, read-only check for cards whose CLI may have exited without a
+    /// teardown hook. Unsupported hosts or failed SSH reads return unknown.
+    static func probeCodexProcesses(host: RemoteHost, paths: [String]) async -> Set<String>? {
+        guard !paths.isEmpty,
+              let url = Bundle.appModule.url(forResource: "codex-process-probe", withExtension: "py", subdirectory: "Resources"),
+              let script = try? Data(contentsOf: url),
+              let payload = try? JSONEncoder().encode(paths) else { return nil }
+        let command = "python3 -c 'import base64;exec(base64.b64decode(\"\(script.base64EncodedString())\"))' \(payload.base64EncodedString())"
+        let result = await runSSH(host: host, command: command, timeout: 10)
+        guard result.ok, let data = result.stdout.data(using: .utf8),
+              let live = try? JSONDecoder().decode([String].self, from: data) else { return nil }
+        return Set(live)
+    }
+
     private static func runSSH(host: RemoteHost, command: String, timeout: TimeInterval) async -> RemoteCommandResult {
         guard !host.sshTarget.isEmpty else {
             return RemoteCommandResult(stdout: "", stderr: "invalid host", exitCode: -1)

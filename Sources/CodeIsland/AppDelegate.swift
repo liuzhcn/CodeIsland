@@ -44,6 +44,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         RemoteManager.shared.onCodexSessions = { [weak appState] hostId, hostName, cwdFilter, sessions in
             appState?.reconcileRemoteCodexSessions(sessions, hostId: hostId, hostName: hostName, cwdFilter: cwdFilter)
         }
+        RemoteManager.shared.codexProcessCandidates = { [weak appState] hostID in
+            appState?.remoteCodexProcessCandidates(hostID: hostID) ?? []
+        }
+        RemoteManager.shared.onCodexProcessEnded = { [weak appState] candidate in
+            appState?.settleExitedRemoteCodexProcess(candidate)
+        }
 
         // Prewarm the usage footer off the launch path — first panel expansion
         // then shows data immediately instead of popping in a beat later.

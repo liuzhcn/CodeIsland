@@ -28,6 +28,14 @@ final class RemoteManager: ObservableObject {
     var onRemoveHost: ((String) -> Void)?
     var onCodexArchived: ((String, String) -> Void)?
     var onCodexSessions: ((String, String, String, [RemoteCodexSession]) -> Void)?
+    var codexProcessCandidates: ((String) -> [RemoteCodexProcessWatcher.Candidate])?
+    var onCodexProcessEnded: ((RemoteCodexProcessWatcher.Candidate) -> Void)?
+    private lazy var codexProcessWatcher: RemoteCodexProcessWatcher = {
+        let watcher = RemoteCodexProcessWatcher(probe: RemoteInstaller.probeCodexProcesses)
+        watcher.candidates = { [weak self] in self?.codexProcessCandidates?($0) ?? [] }
+        watcher.onEnded = { [weak self] in self?.onCodexProcessEnded?($0) }
+        return watcher
+    }()
 
     private var forwarders: [String: any RemoteTunnel] = [:]
     private var codexReconnectTasks: [String: Task<Void, Never>] = [:]
@@ -53,11 +61,15 @@ final class RemoteManager: ObservableObject {
     // starts; a Disconnect or a newer connect in the meantime retires it.
     private var connectTokens: [String: UInt64] = [:]
     private var lastConnectToken: UInt64 = 0
+    // Installation can finish after a disconnect, tunnel failure or a newer
+    // connection. Only the current installation may publish its result.
+    private var installTokens: [String: UUID] = [:]
 
     private let now: () -> Date
     private let makeTunnel: @MainActor () -> any RemoteTunnel
     private let probeSocketPath: (RemoteHost) async -> String?
     private let installRemoteHooks: (RemoteHost, String) async -> RemoteInstallResult
+    private let codexEventsEnabled: Bool
 
     /// Everything after `reconnectPolicy` reaches ssh or the clock; tests pass
     /// stand-ins.
@@ -69,7 +81,8 @@ final class RemoteManager: ObservableObject {
         probeSocketPath: @escaping (RemoteHost) async -> String? = { await RemoteInstaller.prepareRemoteSocketPath(host: $0) },
         installRemoteHooks: @escaping (RemoteHost, String) async -> RemoteInstallResult = {
             await RemoteInstaller.installAll(host: $0, remoteSocketPath: $1)
-        }
+        },
+        codexEventsEnabled: Bool = true
     ) {
         self.defaults = defaults
         self.reconnectPolicy = reconnectPolicy
@@ -77,6 +90,7 @@ final class RemoteManager: ObservableObject {
         self.makeTunnel = makeTunnel
         self.probeSocketPath = probeSocketPath
         self.installRemoteHooks = installRemoteHooks
+        self.codexEventsEnabled = codexEventsEnabled
         load()
     }
 
@@ -170,18 +184,21 @@ final class RemoteManager: ObservableObject {
 
         let forwarder = forwarders[id] ?? makeTunnel()
         forwarders[id] = forwarder
+        lastConnectToken &+= 1
+        let token = lastConnectToken
+        connectTokens[id] = token
+        installTokens[id] = nil
+        installRunning[id] = false
         forwarder.onStatusChange = { [weak self, weak forwarder] status in
             Task { @MainActor in
                 // Late news from a tunnel that Disconnect already dropped (its
                 // own .disconnected included) must not overwrite what replaced it.
-                guard let self, let forwarder, self.forwarders[host.id] === forwarder else { return }
+                guard let self, let forwarder, self.forwarders[host.id] === forwarder,
+                      self.connectTokens[host.id] == token else { return }
                 self.handleStatusChange(status, for: host)
             }
         }
 
-        lastConnectToken &+= 1
-        let token = lastConnectToken
-        connectTokens[id] = token
         connectionStatus[id] = .connecting
         lastMessage[id] = host.displayAddress
 
@@ -203,6 +220,7 @@ final class RemoteManager: ObservableObject {
     }
 
     func disconnect(id: String) {
+        codexProcessWatcher.stop(hostID: id)
         stopCodexEvents(hostId: id)
         forwarders[id]?.onStatusChange = nil
         cancelScheduledReconnect(id: id)
@@ -210,6 +228,7 @@ final class RemoteManager: ObservableObject {
         // host back until the user connects again.
         reconnectPolicy.userDisconnected(id)
         connectTokens[id] = nil
+        installTokens[id] = nil
         forwarders[id]?.disconnect()
         forwarders[id] = nil
         remoteSocketPaths[id] = nil
@@ -228,6 +247,7 @@ final class RemoteManager: ObservableObject {
 
     private func startCodexEvents(host: RemoteHost) {
         stopCodexEvents(hostId: host.id)
+        guard codexEventsEnabled else { return }
         guard let url = Bundle.appModule.url(forResource: "codex-event-transport", withExtension: "py", subdirectory: "Resources"),
               let script = try? Data(contentsOf: url) else { return }
         let command = "python3 -u -c 'import base64;exec(base64.b64decode(\"\(script.base64EncodedString())\"))'"
@@ -316,9 +336,19 @@ final class RemoteManager: ObservableObject {
         case .connected:
             reconnectPolicy.tunnelConnected(host.id, now: now())
             cancelScheduledReconnect(id: host.id)
-            Task { await installHooks(for: host) }
+            let token = UUID()
+            installTokens[host.id] = token
+            Task { await installHooks(for: host, token: token) }
             startCodexEvents(host: host)
+            if codexEventsEnabled { codexProcessWatcher.start(host: host) }
         case .failed(let message):
+            codexProcessWatcher.stop(hostID: host.id)
+            // Also reached when installing hooks fails on an otherwise live
+            // tunnel. Retire it without clearing the user's desire to connect,
+            // then use the same backoff and wake/network recovery as SSH errors.
+            connectTokens[host.id] = nil
+            installTokens[host.id] = nil
+            forwarders[host.id]?.disconnect()
             stopCodexEvents(hostId: host.id)
             installRunning[host.id] = false
             lastMessage[host.id] = message
@@ -330,6 +360,8 @@ final class RemoteManager: ObservableObject {
             Self.log.notice("remote \(host.id, privacy: .public) failed (\(message)): \(String(describing: step), privacy: .public)")
             apply(step, to: host.id)
         case .disconnected:
+            codexProcessWatcher.stop(hostID: host.id)
+            installTokens[host.id] = nil
             stopCodexEvents(hostId: host.id)
             // User-initiated disconnects go through disconnect(id:), which
             // drops the tunnel before its report arrives; this is the tunnel
@@ -439,14 +471,18 @@ final class RemoteManager: ObservableObject {
         }
     }
 
-    private func installHooks(for host: RemoteHost) async {
+    private func installHooks(for host: RemoteHost, token: UUID) async {
+        guard installTokens[host.id] == token else { return }
         installRunning[host.id] = true
         let remoteSocketPath = remoteSocketPaths[host.id] ?? host.remoteSocketPath
         let result = await installRemoteHooks(host, remoteSocketPath)
+        guard installTokens[host.id] == token else { return }
+        installTokens[host.id] = nil
         installRunning[host.id] = false
-        lastMessage[host.id] = result.message
-        if !result.ok {
-            connectionStatus[host.id] = .failed(result.message)
+        if result.ok {
+            lastMessage[host.id] = result.message
+        } else {
+            handleStatusChange(.failed(result.message), for: host)
         }
     }
 

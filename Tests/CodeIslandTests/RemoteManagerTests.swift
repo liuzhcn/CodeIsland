@@ -191,8 +191,27 @@ final class RemoteManagerTests: XCTestCase {
         }
     }
 
+    @MainActor
+    private final class InstallGate {
+        private(set) var started = 0
+        private var held: [Int: CheckedContinuation<RemoteInstallResult, Never>] = [:]
+
+        func install() async -> RemoteInstallResult {
+            started += 1
+            let attempt = started
+            return await withCheckedContinuation { held[attempt] = $0 }
+        }
+
+        func finish(_ attempt: Int, ok: Bool, message: String) {
+            held.removeValue(forKey: attempt)?.resume(returning: RemoteInstallResult(ok: ok, message: message))
+        }
+    }
+
     private func makeManager(
-        _ configure: (inout RemoteReconnectPolicy.Config) -> Void = { _ in }
+        install: @escaping (RemoteHost, String) async -> RemoteInstallResult = { _, _ in
+            RemoteInstallResult(ok: true, message: "installed")
+        },
+        configure: (inout RemoteReconnectPolicy.Config) -> Void = { _ in }
     ) -> (RemoteManager, ProbeGate, Tunnels) {
         var config = RemoteReconnectPolicy.Config()
         config.wakeSettle = 0
@@ -205,7 +224,8 @@ final class RemoteManagerTests: XCTestCase {
             reconnectPolicy: RemoteReconnectPolicy(config: config),
             makeTunnel: { tunnels.make() },
             probeSocketPath: { _ in await gate.probe() },
-            installRemoteHooks: { _, _ in RemoteInstallResult(ok: true, message: "installed") }
+            installRemoteHooks: install,
+            codexEventsEnabled: false
         )
         return (manager, gate, tunnels)
     }
@@ -306,7 +326,7 @@ final class RemoteManagerTests: XCTestCase {
     /// Every fast retry failed while the lid was closed; waking brings the
     /// host back instead of leaving it on the slow schedule.
     func testWakeReconnectsAHostPastItsFastRetries() async {
-        let (manager, _, tunnels) = makeManager { $0.fastAttempts = 0 }
+        let (manager, _, tunnels) = makeManager(configure: { $0.fastAttempts = 0 })
         defer { manager.shutdown() }
         let host = addHost(to: manager)
         await connect(host, on: manager, tunnels: tunnels)
@@ -383,6 +403,220 @@ final class RemoteManagerTests: XCTestCase {
     }
 
     // MARK: - Stale reports
+
+    func testInstallFailureAutomaticallyRetriesAndClearsTheErrorOnSuccess() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() }, configure: {
+            $0.backoff = [0.05]
+        })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        installs.finish(1, ok: false, message: "Upload failed: Connection closed")
+
+        await waitUntil("upload failure never retried the connection") { tunnels.connects == 2 }
+        guard tunnels.connects == 2 else { return }
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 2 }
+        installs.finish(2, ok: true, message: "Claude ok · Codex ok")
+        await waitUntil { manager.lastMessage[host.id] == "Claude ok · Codex ok" }
+
+        XCTAssertEqual(manager.connectionStatus[host.id], .connected)
+        XCTAssertFalse(manager.installRunning[host.id] ?? true)
+        if case .connected = manager.reconnectPhase(id: host.id) {} else {
+            XCTFail("successful retry must restore the reconnect policy too")
+        }
+    }
+
+    func testRepeatedInstallFailuresReachTheSlowRetrySchedule() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() }, configure: {
+            $0.backoff = [0.05]
+            $0.fastAttempts = 1
+        })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        installs.finish(1, ok: false, message: "first upload failure")
+        await waitUntil { tunnels.connects == 2 }
+        guard tunnels.connects == 2 else { return }
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 2 }
+        installs.finish(2, ok: false, message: "second upload failure")
+        await waitUntil { manager.connectionStatus[host.id] == .failed("second upload failure") }
+
+        XCTAssertEqual(manager.reconnectPhase(id: host.id), .retryPending)
+        XCTAssertEqual(manager.lastMessage[host.id], String(format: L10n.shared["remote_retry_slow"], 2, 15))
+        await settle()
+        XCTAssertEqual(tunnels.connects, 2, "the slow retry must not immediately start another connection")
+    }
+
+    func testDisconnectDuringInstallIgnoresLateFailureAndStopsRecovery() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        manager.networkPathChanged(satisfied: true)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        manager.disconnect(id: host.id)
+        installs.finish(1, ok: false, message: "late upload failure")
+        manager.systemDidWake()
+        manager.networkPathChanged(satisfied: false)
+        manager.networkPathChanged(satisfied: true)
+        await settle()
+
+        XCTAssertEqual(manager.connectionStatus[host.id], .disconnected)
+        XCTAssertEqual(manager.reconnectPhase(id: host.id), .idle)
+        XCTAssertFalse(manager.wantsConnection(id: host.id))
+        XCTAssertNotEqual(manager.lastMessage[host.id], "late upload failure")
+        XCTAssertEqual(tunnels.connects, 1)
+    }
+
+    func testRemovedHostIsNotRestoredByALateInstallResult() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        manager.removeHost(id: host.id)
+        installs.finish(1, ok: true, message: "obsolete success")
+        await settle()
+
+        XCTAssertTrue(manager.hosts.isEmpty)
+        XCTAssertNil(manager.lastMessage[host.id])
+        XCTAssertEqual(manager.connectionStatus[host.id], .disconnected)
+        XCTAssertFalse(manager.installRunning[host.id] ?? true)
+    }
+
+    func testLateInstallCannotOverwriteANewerInstallInProgress() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        manager.reconnect(id: host.id)
+        await waitUntil { tunnels.connects == 2 }
+        tunnels.made[1].report(.connected)
+        await waitUntil { installs.started == 2 }
+        installs.finish(1, ok: false, message: "obsolete failure")
+        await settle()
+
+        XCTAssertEqual(manager.connectionStatus[host.id], .connected)
+        XCTAssertTrue(manager.installRunning[host.id] ?? false)
+        XCTAssertNotEqual(manager.lastMessage[host.id], "obsolete failure")
+
+        installs.finish(2, ok: true, message: "current success")
+        await waitUntil { manager.lastMessage[host.id] == "current success" }
+        XCTAssertEqual(manager.connectionStatus[host.id], .connected)
+    }
+
+    func testLateInstallSuccessCannotEraseATunnelFailure() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        tunnels.made[0].report(.failed("ssh exited (255)"))
+        await waitUntil { manager.reconnectPhase(id: host.id) == .retryPending }
+        let retryMessage = manager.lastMessage[host.id]
+        installs.finish(1, ok: true, message: "obsolete success")
+        await settle()
+
+        XCTAssertEqual(manager.connectionStatus[host.id], .failed("ssh exited (255)"))
+        XCTAssertEqual(manager.lastMessage[host.id], retryMessage)
+        XCTAssertFalse(manager.installRunning[host.id] ?? true)
+    }
+
+    func testLateInstallFailureCannotOverwriteANewerSuccessfulConnection() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        manager.reconnect(id: host.id)
+        await waitUntil { tunnels.connects == 2 }
+        tunnels.made[1].report(.connected)
+        await waitUntil { installs.started == 2 }
+        installs.finish(2, ok: true, message: "current success")
+        await waitUntil { manager.lastMessage[host.id] == "current success" }
+        installs.finish(1, ok: false, message: "obsolete failure")
+        await settle()
+
+        XCTAssertEqual(manager.connectionStatus[host.id], .connected)
+        XCTAssertEqual(manager.lastMessage[host.id], "current success")
+        XCTAssertFalse(manager.installRunning[host.id] ?? true)
+    }
+
+    func testDisconnectCancelsTheRetryScheduledByAnInstallFailure() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() }, configure: {
+            $0.backoff = [0.05]
+        })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        installs.finish(1, ok: false, message: "upload failed")
+        await waitUntil { manager.reconnectPhase(id: host.id) == .retryPending }
+        manager.disconnect(id: host.id)
+        await settle()
+
+        XCTAssertEqual(tunnels.connects, 1)
+        XCTAssertEqual(manager.connectionStatus[host.id], .disconnected)
+        XCTAssertFalse(manager.wantsConnection(id: host.id))
+    }
+
+    func testQueuedReportFromAnEarlierAttemptOnTheSameTunnelIsIgnored() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        // The callback is queued on the main actor; replace this connection
+        // before it runs, while keeping the same tunnel instance.
+        manager.connect(id: host.id)
+        await waitUntil { tunnels.connects == 2 }
+        await settle()
+
+        XCTAssertEqual(tunnels.made.count, 1)
+        XCTAssertEqual(installs.started, 0)
+        XCTAssertEqual(manager.connectionStatus[host.id], .connecting)
+    }
+
+    func testManualHostInstallFailureCanRecoverOnWakeWithoutTimerRetry() async {
+        let installs = InstallGate()
+        let (manager, _, tunnels) = makeManager(install: { _, _ in await installs.install() })
+        defer { manager.shutdown() }
+        let host = addHost(to: manager, autoConnect: false)
+        await connect(host, on: manager, tunnels: tunnels)
+        tunnels.made[0].report(.connected)
+        await waitUntil { installs.started == 1 }
+        installs.finish(1, ok: false, message: "upload failed")
+        await waitUntil { manager.connectionStatus[host.id] == .failed("upload failed") }
+
+        XCTAssertEqual(manager.reconnectPhase(id: host.id), .idle)
+        XCTAssertTrue(manager.wantsConnection(id: host.id))
+        await settle()
+        XCTAssertEqual(tunnels.connects, 1)
+        manager.systemDidWake()
+        await waitUntil { tunnels.connects == 2 }
+    }
 
     /// Reinstall swaps the tunnel; a late failure from the old one must not
     /// mark the host failed or schedule a retry.
