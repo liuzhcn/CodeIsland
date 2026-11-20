@@ -214,6 +214,7 @@ struct CodexPermissionRules {
 
     @discardableResult
     func persistAlwaysAllowRule(for event: HookEvent) -> Bool {
+        guard event.rawJSON["_remote_host_id"] == nil else { return false }
         let codexHome = Self.codexHome(for: event)
         if let mcpTool = Self.mcpToolApprovalTarget(for: event) {
             return persistMCPToolApproval(serverID: mcpTool.serverID, toolName: mcpTool.toolName, codexHome: codexHome)

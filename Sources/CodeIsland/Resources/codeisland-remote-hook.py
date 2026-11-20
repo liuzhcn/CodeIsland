@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-VERSION = "0.3.1"
+VERSION = "0.3.3"
 # Per-user socket path (#193): CodeIsland injects CODEISLAND_SOCKET_PATH via the hook
 # command, but fall back to a uid-scoped path so multiple users on a shared host never
 # collide on a single /tmp/codeisland.sock.
@@ -511,6 +511,32 @@ def _send_event(payload, expects_response):
             pass
 
 
+def _linked_codex_project(cwd):
+    """Ask about the directory only. Tool arguments stay remote until it matches."""
+    if not REMOTE_HOST_ID or not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return False
+    query = {"_codeisland_query": "linkedCodexRoot", "_remote_host_id": REMOTE_HOST_ID,
+             "cwd": cwd}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2)
+            sock.connect(SOCKET_PATH)
+            sock.sendall(json.dumps(query).encode("utf-8"))
+            sock.shutdown(socket.SHUT_WR)
+            with sock.makefile("rb") as stream:
+                reply = json.loads(stream.read(65536))
+        root = reply.get("root") if isinstance(reply, dict) else None
+        if not isinstance(root, str) or not os.path.isabs(root):
+            return False
+        # Resolve links on the remote filesystem. A symlink under a linked
+        # directory must not pull an unrelated project into Mac approvals.
+        root = Path(root).resolve(strict=True)
+        directory = Path(cwd).resolve(strict=True)
+        return directory == root or root in directory.parents
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def _get_tty():
     pid = os.getppid()
     for _ in range(20):
@@ -597,6 +623,10 @@ def main():
     is_cursor = _is_cursor_payload(data)
     source = "cursor" if is_cursor else SOURCE
 
+    if source == "codex" and normalized_event == "PermissionRequest":
+        if not _linked_codex_project(data.get("cwd")):
+            return 0  # No decision: the originating Codex handles approval.
+
     payload = dict(data)
     payload["hook_event_name"] = event_name
     payload["session_id"] = session_id
@@ -607,6 +637,9 @@ def main():
     payload["_tty"] = payload.get("_tty") or _get_tty()
 
     if source == "codex":
+        if normalized_event == "PermissionRequest":
+            payload["_codeisland_can_save_rule"] = True
+            payload["_codeisland_codex_home"] = str(Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex"))
         title = _codex_title(session_id)
         if title:
             payload["session_title"] = title
@@ -671,6 +704,25 @@ def main():
         or (normalized_event == "Notification" and payload.get("question"))
     )
     response = _send_event(payload, expects_response)
+    if source == "codex" and normalized_event == "PermissionRequest":
+        while response:
+            message = json.loads(response)
+            if not isinstance(message, dict) or "_codeisland_save_rule" not in message:
+                break
+            if not _linked_codex_project(data.get("cwd")):
+                return 0
+            rule = {"tool": data.get("tool_name"), "cwd": cwd, "prefix": message["_codeisland_save_rule"]}
+            try:
+                subprocess.run([sys.executable, str(Path(__file__).with_name("codex-approval.py"))],
+                               input=json.dumps(rule), text=True, timeout=15, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                payload["_codeisland_save_failed"] = True
+                response = _send_event(payload, True)
+                continue
+            response = json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                                          "decision": {"behavior": "allow"}}})
+            break
     if response:
         if SOURCE == "google-antigravity" or SOURCE == "gemini":
             try:

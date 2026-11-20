@@ -119,6 +119,7 @@ final class AppState {
     @ObservationIgnored
     private var remoteDiscoveredCodexIds: [String: Set<String>] = [:]
     var activeSessionId: String?
+    var failedRuleRequestID: UUID?
     var permissionQueue: [PermissionRequest] = [] {
         didSet {
             followUps.waitingChanged()
@@ -2295,14 +2296,33 @@ final class AppState {
             }
             return
         }
-        let pending = permissionQueue.remove(at: index)
+        let pending = permissionQueue[index]
         let sessionId = pending.event.sessionId ?? "default"
-        dismissedPermissionSessionIds.remove(sessionId)
         let responseData: Data
         if always, CodexPermissionRules.isCodexEvent(pending.event) {
-            _ = CodexPermissionRules().persistAlwaysAllowRule(for: pending.event)
-            let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
-            responseData = Data(response.utf8)
+            if pending.event.rawJSON["_remote_host_id"] != nil {
+                // The waiting hook belongs to the executing Codex and inherits its
+                // CODEX_HOME. Only that hook may persist this remote approval.
+                let event = pending.event
+                var prefix: [String] = []
+                if event.toolName == "Bash" {
+                    prefix = CodexPermissionRules.prefixPattern(for: event) ?? []
+                }
+                guard event.rawJSON["_codeisland_can_save_rule"] as? Bool == true,
+                      CodexPermissionRules.mcpToolApprovalTarget(for: event) != nil || !prefix.isEmpty,
+                      let directive = try? JSONEncoder().encode(["_codeisland_save_rule": prefix]) else {
+                    failedRuleRequestID = pending.id
+                    return
+                }
+                responseData = directive
+            } else {
+                guard CodexPermissionRules().persistAlwaysAllowRule(for: pending.event) else {
+                    failedRuleRequestID = pending.id
+                    return
+                }
+                let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+                responseData = Data(response.utf8)
+            }
         } else if always, Self.isZcodeEvent(pending.event) {
             responseData = Self.zcodeAlwaysAllowResponse(toolName: pending.event.toolName)
         } else if always {
@@ -2336,6 +2356,8 @@ final class AppState {
             let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
             responseData = Data(response.utf8)
         }
+        permissionQueue.remove(at: index)
+        dismissedPermissionSessionIds.remove(sessionId)
         pending.continuation.resume(returning: responseData)
         resolveMergedSubagentAfterUI(
             sessionId: sessionId,

@@ -317,6 +317,35 @@ final class AppStatePermissionFlowTests: XCTestCase {
         XCTAssertTrue(config.contains(#"approval_mode = "approve""#))
     }
 
+    func testRemoteAlwaysAllowPersistsAtOriginOnly() async throws {
+        let home = makeTemporaryCodexHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let config = "[mcp_servers.example]\ncommand = \"fixture\"\n"
+        try writeCodexConfig(config, in: home)
+        let state = AppState()
+        let data = Data(#"{"hook_event_name":"PermissionRequest","session_id":"remote-one","tool_name":"mcp__example__ping","_source":"codex","_remote_host_id":"host-a","_codeisland_can_save_rule":true}"#.utf8)
+        let event = try XCTUnwrap(HookEvent(from: data))
+        XCTAssertFalse(CodexPermissionRules().persistAlwaysAllowRule(for: event))
+        let task = await startHookRequest { state.handlePermissionRequest(event, continuation: $0) }
+        state.approvePermission(always: true)
+        let response = try await awaitValue(of: task)
+        XCTAssertEqual(try JSONDecoder().decode([String: [String]].self, from: response), ["_codeisland_save_rule": []])
+        XCTAssertEqual(try String(contentsOf: home.appendingPathComponent("config.toml"), encoding: .utf8), config)
+    }
+
+    func testUnsupportedRemoteSaveKeepsRequestActionable() async throws {
+        let state = AppState()
+        let data = Data(#"{"hook_event_name":"PermissionRequest","session_id":"old-hook","tool_name":"mcp__example__ping","_source":"codex","_remote_host_id":"host-a"}"#.utf8)
+        let event = try XCTUnwrap(HookEvent(from: data))
+        let task = await startHookRequest { state.handlePermissionRequest(event, continuation: $0) }
+        state.approvePermission(always: true)
+        XCTAssertEqual(state.failedRuleRequestID, state.pendingPermission?.id)
+        XCTAssertEqual(state.permissionQueue.count, 1)
+        state.approvePermission()
+        let response = try await awaitValue(of: task)
+        XCTAssertEqual(try extractPermissionBehavior(from: response), "allow")
+    }
+
     /// #224: "Always allow" for an MCP tool (`mcp__server__tool`) must emit a
     /// bare-tool-name rule with NO `ruleContent` specifier. Claude Code's MCP
     /// permission rules don't take a specifier; sending `ruleContent: "*"`

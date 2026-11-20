@@ -1702,9 +1702,18 @@ enum ApprovalCopy {
     }
 
     /// "Always allow Bash this session", or where Codex saves the rule.
-    static func alwaysLink(tool: String, scope: ApprovalAlwaysScope) -> String {
+    static func alwaysLink(tool: String, scope: ApprovalAlwaysScope, event: HookEvent? = nil) -> String {
         if let path = scope.savedPath {
-            return String(format: L10n.shared["card_always_saved"], path)
+            var destination = path
+            if let event, let hostID = event.rawJSON["_remote_host_id"] as? String {
+                let host = event.rawJSON["_remote_host_name"] as? String ?? hostID
+                let home = event.rawJSON["_codeisland_codex_home"] as? String ?? "~/.codex"
+                destination = host + ":" + home + String(path.dropFirst("~/.codex".count))
+            } else if let event {
+                destination = (CodexPermissionRules.codexHome(for: event) as NSString).abbreviatingWithTildeInPath
+                    + String(path.dropFirst("~/.codex".count))
+            }
+            return String(format: L10n.shared["card_always_saved"], destination)
         }
         return String(format: L10n.shared["card_always_session"], displayName(tool))
     }
@@ -2125,6 +2134,10 @@ private struct ApprovalBar: View {
                 .onTapGesture { handleCardClick() }
             }
 
+            if let pending = appState.pendingPermission(forSession: sessionId),
+               appState.failedRuleRequestID == pending.id || pending.event.rawJSON["_codeisland_save_failed"] as? Bool == true {
+                Text(L10n.shared["rule_save_failed"]).font(.system(size: type.secondary)).foregroundStyle(.orange)
+            }
             actionRow(type)
         }
         .padding(.horizontal, 14)
@@ -2176,7 +2189,7 @@ private struct ApprovalBar: View {
 
     private func alwaysLink(_ type: NotchCardTypography, lineLimit: Int) -> some View {
         NotchCardTextLink(
-            label: ApprovalCopy.alwaysLink(tool: tool, scope: alwaysScope),
+            label: ApprovalCopy.alwaysLink(tool: tool, scope: alwaysScope, event: appState.pendingPermission(forSession: sessionId)?.event),
             fontSize: type.link,
             hint: CardShortcutHint.text(for: .approveAlways),
             help: ApprovalHints.always(scope: alwaysScope),
@@ -4440,7 +4453,7 @@ private struct SessionCard: View {
                 style: .link,
                 fontSize: buttonFontSize,
                 enabled: enabled,
-                help: queuedHint ?? ApprovalHints.always(savesRule: CodexPermissionRules.isCodexEvent(event)),
+                help: queuedHint ?? ApprovalCopy.alwaysLink(tool: tool, scope: ApprovalAlwaysScope(savesRule: CodexPermissionRules.isCodexEvent(event), tool: tool), event: event),
                 action: { appState.approvePermission(always: true, expectedSessionId: sessionId) }
             )
             Spacer(minLength: 8)

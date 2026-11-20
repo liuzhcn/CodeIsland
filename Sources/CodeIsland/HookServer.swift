@@ -738,10 +738,53 @@ class HookServer {
         return (data, nil)
     }
 
+    /// Match remote POSIX paths without asking the Mac filesystem to resolve them.
+    nonisolated static func linkedCodexRoot(hostID: String, cwd: String, projects: [[String: Any]]) -> String? {
+        guard !hostID.isEmpty, cwd.hasPrefix("/"), !cwd.split(separator: "/").contains("..") else { return nil }
+        return projects.compactMap { project -> String? in
+            guard project["hostId"] as? String == hostID,
+                  let path = project["remotePath"] as? String, path.hasPrefix("/"),
+                  !path.split(separator: "/").contains("..") else { return nil }
+            let root = "/" + path.split(separator: "/").filter { $0 != "." }.joined(separator: "/")
+            let prefix = root == "/" ? "/" : root + "/"
+            return cwd.utf8.elementsEqual(root.utf8) || cwd.utf8.starts(with: prefix.utf8) ? root : nil
+        }.max { $0.utf8.count < $1.utf8.count }
+    }
+
+    private func linkedCodexRoot(for raw: [String: Any]) -> String? {
+        guard let hostID = raw["_remote_host_id"] as? String,
+              RemoteManager.shared.hosts.contains(where: { $0.id == hostID }),
+              let cwd = raw["cwd"] as? String else { return nil }
+        // Manually added CodeIsland SSH hosts may have a different ID from
+        // the same connection in Codex. Only use an explicitly paired ID.
+        let pairs = UserDefaults.standard.dictionary(forKey: "codexProjectHostIDs") as? [String: String]
+        let stateURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/.codex-global-state.json")
+        guard let data = try? Data(contentsOf: stateURL),
+              let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let projects = state["remote-projects"] as? [[String: Any]] else { return nil }
+        return Self.linkedCodexRoot(hostID: pairs?[hostID] ?? hostID, cwd: cwd, projects: projects)
+    }
+
     private func processRequest(data: Data, connection: NWConnection) {
-        if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let trace = raw["_diagnostic_id"] as? String {
-            log.notice("hook_trace received trace=\(String(trace.prefix(64)), privacy: .public) session=\(String((raw["session_id"] as? String ?? "").prefix(160)), privacy: .public) event=\(String((raw["hook_event_name"] as? String ?? "").prefix(80)), privacy: .public)")
+        if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if raw["_codeisland_query"] as? String == "linkedCodexRoot" {
+                let result = linkedCodexRoot(for: raw).map { ["root": $0] } ?? [:]
+                let reply = (try? JSONEncoder().encode(result)) ?? Data("{}".utf8)
+                sendResponse(connection: connection, data: reply)
+                return
+            }
+            // Recheck at delivery, before sub-session and auto-approval rules.
+            // This also covers remote hooks installed by earlier releases.
+            if raw["_source"] as? String == "codex", raw["_remote_host_id"] != nil,
+               Self.rawEventName(from: raw).map(EventNormalizer.normalize) == "PermissionRequest",
+               linkedCodexRoot(for: raw) == nil {
+                sendResponse(connection: connection, data: Data("{}".utf8))
+                return
+            }
+            if let trace = raw["_diagnostic_id"] as? String {
+                log.notice("hook_trace received trace=\(String(trace.prefix(64)), privacy: .public) session=\(String((raw["session_id"] as? String ?? "").prefix(160)), privacy: .public) event=\(String((raw["hook_event_name"] as? String ?? "").prefix(80)), privacy: .public)")
+            }
         }
 
         // Sub-session pre-filter (#123, #151): plugin, Codex, or Cursor Task hooks

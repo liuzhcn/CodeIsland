@@ -25,6 +25,7 @@ with tempfile.TemporaryDirectory() as directory:
     # Exercise main without opening a socket or executing the displayed command.
     path.write_text(json.dumps(auto) + '\n')
     hook.SOURCE = 'codex'
+    hook._linked_codex_project = lambda _: True
     hook._get_tty = lambda: None
     hook._codex_title = lambda _: None
     sent = []

@@ -1,5 +1,17 @@
 # Changelog
 
+## [v1.0.40] - 2026-11-21
+
+### English
+
+- CodeIsland forwards Codex approvals to this Mac for linked remote projects and their subdirectories. Other projects use the originating Codex approval flow.
+- For linked projects, Always Allow saves the rule on the executing host. The approval card shows the destination, and remote MCP tool approvals are read back after saving.
+
+### 中文
+
+- 只有本机已关联的远程项目及其子目录会把 Codex 审批转发到这台 Mac。其他项目由发起请求的 Codex 处理。
+- 在已关联项目中点击「始终允许」，规则会保存到执行任务的主机。审批卡会显示保存位置，远程 MCP 工具规则写入后会读回核对。
+
 ## [v1.0.39] - 2026-10-22
 
 ### English

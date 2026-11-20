@@ -35,7 +35,7 @@ private struct RemoteCommandResult: Sendable {
 }
 
 enum RemoteInstaller {
-    private static let remoteHookVersion = "0.3.1"
+    private static let remoteHookVersion = "0.3.3"
     private static let remoteOpencodePluginVersion = "v4"
 
     static func installAll(host: RemoteHost, remoteSocketPath: String) async -> RemoteInstallResult {
@@ -105,15 +105,32 @@ enum RemoteInstaller {
     }
 
     private static func uploadRemoteHook(source: String, host: RemoteHost) async -> RemoteCommandResult {
-        let encoded = Data(source.utf8).base64EncodedString()
+        var files = [(String, Data)]()
+        for name in ["codex-event-transport", "codex-approval"] {
+            guard let url = Bundle.appModule.url(forResource: name, withExtension: "py", subdirectory: "Resources"),
+                  let data = try? Data(contentsOf: url) else {
+                return RemoteCommandResult(stdout: "", stderr: "Missing " + name, exitCode: -1)
+            }
+            files.append((name + ".py", data))
+        }
+        // Publish the entry point last so live hooks always see complete helpers.
+        files.append(("codeisland-remote-hook.py", Data(source.utf8)))
+        let entries = files.map { "('\($0.0)','\($0.1.base64EncodedString())')" }.joined(separator: ",")
         let py = """
-import base64, os, pathlib
+import base64, os, pathlib, tempfile
 
-target = pathlib.Path.home() / ".codeisland" / "codeisland-remote-hook.py"
-target.parent.mkdir(parents=True, exist_ok=True)
-target.write_bytes(base64.b64decode('''\(encoded)'''))
-os.chmod(target, 0o755)
-print(target)
+directory = pathlib.Path.home() / ".codeisland"
+directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+for name, encoded in [\(entries)]:
+    with tempfile.NamedTemporaryFile(dir=directory, delete=False) as tmp:
+        try:
+            tmp.write(base64.b64decode(encoded))
+            tmp.flush()
+            os.fchmod(tmp.fileno(), 0o755)
+            os.replace(tmp.name, directory / name)
+        finally:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 """
         return await runSSH(host: host, command: "python3 - <<'PY'\n\(py)\nPY", timeout: 25)
     }

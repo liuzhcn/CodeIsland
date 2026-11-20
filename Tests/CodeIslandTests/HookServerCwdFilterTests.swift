@@ -7,6 +7,23 @@ import XCTest
 /// without spinning up the whole socket / SettingsManager singleton.
 final class HookServerCwdFilterTests: XCTestCase {
 
+    func testLinkedCodexRootsUseHostAndPathComponents() {
+        let projects = [["hostId": "a", "remotePath": "/projects/work/"],
+                        ["hostId": "a", "remotePath": "/projects/work/nested"],
+                        ["hostId": "b", "remotePath": "/projects/elsewhere"]]
+        func root(_ cwd: String, _ host: String = "a") -> String? {
+            HookServer.linkedCodexRoot(hostID: host, cwd: cwd, projects: projects)
+        }
+        XCTAssertEqual(root("/projects/work"), "/projects/work")
+        XCTAssertEqual(root("/projects/work/nested/src"), "/projects/work/nested")
+        XCTAssertNil(root("/projects/work-old"))
+        XCTAssertNil(root("/projects/work/../remote-only"))
+        XCTAssertNil(root("/projects/work", "b"))
+        XCTAssertNil(root("/projects/work", ""))
+        XCTAssertNil(root("work"))
+        XCTAssertNil(root("/projects/elsewhere"))
+    }
+
     func testEmptyPatternsCSVNeverMatches() {
         XCTAssertFalse(HookServer.cwdMatchesAnyPattern("/Users/me/proj", patternsCSV: ""))
         XCTAssertFalse(HookServer.cwdMatchesAnyPattern("", patternsCSV: ""))
