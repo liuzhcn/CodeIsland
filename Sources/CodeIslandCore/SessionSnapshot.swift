@@ -752,36 +752,22 @@ public struct SessionSnapshot: Sendable {
     }
 
     public var codexDesktopURL: URL? {
-        var state: [String: Any] = [:]
-        if source == "codex", let remoteHostId,
-           !remoteHostId.hasPrefix("remote-ssh-codex-managed:"),
-           let data = try? Data(contentsOf: URL(fileURLWithPath: NSHomeDirectory() + "/.codex/.codex-global-state.json")),
-           let stored = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            state = stored
+        guard source == "codex", let id = providerSessionId, UUID(uuidString: id) != nil else { return nil }
+        let state = if let remoteHostId, !remoteHostId.hasPrefix(CodexDesktopHostStore.managedHostPrefix) {
+            CodexDesktopHostStore.state(in: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex"))
+        } else {
+            [String: Any]()
         }
         return codexDesktopURL(state: state)
     }
 
     public func codexDesktopURL(state: [String: Any]) -> URL? {
-        let memberships = state["thread-project-membership-host-ids"] as? [String: String]
-        var hostId = remoteHostId?.hasPrefix("remote-ssh-codex-managed:") == true
-            ? remoteHostId : (isRemote ? providerSessionId.flatMap { memberships?[$0] } : nil)
-        // Codex migrates some threads out of the legacy membership map.
-        // Recover only an exact thread match on one unambiguous managed host.
-        if hostId == nil, isRemote, let id = providerSessionId,
-           let migrated = state["app-server-migrated-pinned-thread-ids-by-host"] as? [String: [String]] {
-            let hosts = Set(migrated.compactMap { key, ids -> String? in
-                guard ids.contains(id), key.hasPrefix("remote-ssh-codex-managed:"),
-                      let separator = key.range(of: ":/") else { return nil }
-                return String(key[..<separator.lowerBound])
-            })
-            if hosts.count == 1 { hostId = hosts.first }
-        }
-        guard source == "codex",
-              termBundleId == "com.openai.codex" || hostId?.hasPrefix("remote-ssh-codex-managed:") == true,
-              let id = providerSessionId, UUID(uuidString: id) != nil else { return nil }
+        guard source == "codex", let id = providerSessionId, UUID(uuidString: id) != nil else { return nil }
+        let hostId = remoteHostId?.hasPrefix(CodexDesktopHostStore.managedHostPrefix) == true
+            ? remoteHostId : (isRemote ? CodexDesktopHostStore.hostID(for: id, state: state) : nil)
+        guard termBundleId == "com.openai.codex" || hostId != nil else { return nil }
         var url = URLComponents(string: "codex://threads/" + id)
-        if let hostId, hostId.hasPrefix("remote-ssh-codex-managed:") {
+        if let hostId {
             url?.queryItems = [URLQueryItem(name: "hostId", value: hostId)]
         }
         return url?.url

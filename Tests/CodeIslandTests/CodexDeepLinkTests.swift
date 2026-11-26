@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import CodeIsland
 @testable import CodeIslandCore
 
@@ -96,6 +97,42 @@ final class CodexDeepLinkTests: XCTestCase {
             host + ":/home/leo/.codex": [id],
             "remote-ssh-codex-managed:other:/home/leo/.codex": [id]
         ]]))
+    }
+
+    func testRemoteLinkUsesCurrentSQLiteSettingsAndFallsBackToLegacyJSON() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let id = "00000000-0000-4000-8000-000000000001"
+        let migratedID = "00000000-0000-4000-8000-000000000002"
+        let legacyHost = "remote-ssh-codex-managed:legacy"
+        let currentHost = "remote-ssh-codex-managed:current"
+        let legacy = ["thread-project-membership-host-ids": [id: legacyHost]]
+        try JSONSerialization.data(withJSONObject: legacy)
+            .write(to: directory.appendingPathComponent(".codex-global-state.json"))
+
+        var remote = SessionSnapshot()
+        remote.source = "codex"
+        remote.providerSessionId = id
+        remote.remoteHostId = "codeisland-ssh-host"
+        XCTAssertEqual(remote.codexDesktopURL(state: CodexDesktopHostStore.state(in: directory))?.query,
+                       "hostId=" + legacyHost)
+
+        let database = directory.appendingPathComponent(".codex-global-state.sqlite")
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_open(database.path, &db), SQLITE_OK)
+        let sql = """
+            CREATE TABLE settings (scope TEXT, key TEXT, value TEXT, PRIMARY KEY (scope, key));
+            INSERT INTO settings VALUES
+              ('global', 'thread-project-membership-host-ids', '{"\(id)":"\(currentHost)"}'),
+              ('global', 'electron-owner-value:app-server-migrated-pinned-thread-ids-by-host:test', '{"\(currentHost):/home/test/.codex":["\(migratedID)"]}');
+            """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        let state = CodexDesktopHostStore.state(in: directory)
+        XCTAssertEqual(remote.codexDesktopURL(state: state)?.query, "hostId=" + currentHost)
+        remote.providerSessionId = migratedID
+        XCTAssertEqual(remote.codexDesktopURL(state: state)?.query, "hostId=" + currentHost)
     }
 
 }

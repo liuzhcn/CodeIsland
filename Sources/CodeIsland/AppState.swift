@@ -3618,15 +3618,14 @@ final class AppState {
         // Restore valid cards before applying the global count/time policy.
         for p in persisted {
             guard let source = SessionSnapshot.normalizedSupportedSource(p.source) else { continue }
+            let liveDesktopProcess = source == "codex" && p.remoteHostId == nil && p.termBundleId == nil
+                && Self.isLiveCodexDesktopProcess(pid: p.cliPid, startTime: p.cliStartTime)
             let restoredSessionId = p.remoteHostId != nil ? p.sessionId : Self.canonicalRestoredCodexSessionId(
                 sessionId: p.sessionId,
                 source: source,
                 providerSessionId: p.providerSessionId,
                 termBundleId: p.termBundleId,
-                executablePath: p.cliPid.flatMap { pid in
-                    Self.isLiveProcess(ProcessIdentity(pid: pid, startTime: p.cliStartTime))
-                        ? Self.executablePath(for: pid) : nil
-                }
+                isDesktopProcess: liveDesktopProcess
             )
             guard sessions[restoredSessionId] == nil else { continue }
             var snapshot = SessionSnapshot(startTime: p.startTime)
@@ -3653,6 +3652,9 @@ final class AppState {
             snapshot.tmuxEnv = p.tmuxEnv
             snapshot.termBundleId = restoredSessionId.hasPrefix(Self.codexAppSessionPrefix)
                 ? Self.codexAppBundleId : p.termBundleId
+            if restoredSessionId.hasPrefix(Self.codexAppSessionPrefix), snapshot.providerSessionId == nil {
+                snapshot.providerSessionId = String(restoredSessionId.dropFirst(Self.codexAppSessionPrefix.count))
+            }
             snapshot.cmuxSurfaceId = p.cmuxSurfaceId
             snapshot.cmuxWorkspaceId = p.cmuxWorkspaceId
             snapshot.zellijPaneId = p.zellijPaneId
@@ -7352,11 +7354,10 @@ final class AppState {
         source: String,
         providerSessionId: String?,
         termBundleId: String?,
-        executablePath: String? = nil
+        isDesktopProcess: Bool = false
     ) -> String {
         guard source == "codex",
-              termBundleId == codexAppBundleId
-                || executablePath.map(Self.isCodexExecutablePath) == true else {
+              termBundleId == codexAppBundleId || (termBundleId == nil && isDesktopProcess) else {
             return sessionId
         }
         if sessionId.hasPrefix(codexAppSessionPrefix) {
@@ -7444,6 +7445,17 @@ final class AppState {
         return processes
     }
 
+    nonisolated static func isCodexDesktopProcess(pid: pid_t, executablePath path: String) -> Bool {
+        isCodexExecutablePath(path) || (isBundledCodexCLIPath(path)
+            && bundledCodexProcessRole(pid: pid, executablePath: path) == .desktopHost)
+    }
+
+    nonisolated static func isLiveCodexDesktopProcess(pid: pid_t?, startTime: Date?) -> Bool {
+        guard let pid, isLiveProcess(ProcessIdentity(pid: pid, startTime: startTime)),
+              let path = executablePath(for: pid) else { return false }
+        return isCodexDesktopProcess(pid: pid, executablePath: path)
+    }
+
     private nonisolated static func bundledCodexProcessRole(pid: pid_t, executablePath path: String) -> CodexProcessRole? {
         let parent = parentPid(of: pid)
         // CodeIsland's own app-server client runs this binary too, from `/`;
@@ -7452,11 +7464,13 @@ final class AppState {
 
         var ancestry = [ProcessAncestor(pid: pid, executablePath: path, arguments: getProcessArgs(pid) ?? [])]
         if let parent, let parentPath = executablePath(for: parent) {
+            let bundleID = HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath)
+                .flatMap { Bundle(path: $0)?.bundleIdentifier }
             ancestry.append(ProcessAncestor(
                 pid: parent,
                 executablePath: parentPath,
-                bundleIdentifier: HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath)
-                    .flatMap { Bundle(path: $0)?.bundleIdentifier }
+                arguments: bundleID == codexAppBundleId ? (getProcessArgs(parent) ?? []) : [],
+                bundleIdentifier: bundleID
             ))
         }
         return CLIProcessResolver.codexBundledProcessRole(ancestry: ancestry)

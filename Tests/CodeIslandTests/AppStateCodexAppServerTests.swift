@@ -10,22 +10,18 @@ final class AppStateCodexAppServerTests: XCTestCase {
         ))
     }
 
-    func testBundledExecutableRequiresDesktopBundleToRestoreDesktopIdentity() {
-        let path = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
-        XCTAssertTrue(AppState.isBundledCodexCLIPath(path))
-        XCTAssertFalse(AppState.isCodexExecutablePath(path))
-        XCTAssertFalse(AppState.isCodexExecutablePath("/opt/homebrew/bin/codex"))
+    func testRestoreDesktopIdentityUsesLiveProcessWhenBundleIsMissing() {
         XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
             sessionId: "thread", source: "codex", providerSessionId: "thread",
-            termBundleId: nil, executablePath: path
+            termBundleId: nil, isDesktopProcess: false
         ), "thread")
         XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
             sessionId: "thread", source: "codex", providerSessionId: "thread",
-            termBundleId: "com.openai.codex", executablePath: path
+            termBundleId: nil, isDesktopProcess: true
         ), "codexapp:thread")
         XCTAssertEqual(AppState.canonicalRestoredCodexSessionId(
             sessionId: "thread", source: "codex", providerSessionId: "thread",
-            termBundleId: nil, executablePath: "/opt/homebrew/bin/codex"
+            termBundleId: "com.mitchellh.ghostty", isDesktopProcess: true
         ), "thread")
     }
 

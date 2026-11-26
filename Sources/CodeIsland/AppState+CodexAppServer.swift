@@ -31,10 +31,10 @@ extension AppState {
         let providerID = rawID.hasPrefix(Self.codexAppSessionPrefix)
             ? String(rawID.dropFirst(Self.codexAppSessionPrefix.count)) : rawID
         let bundle = event.rawJSON["_term_bundle"] as? String
-        let processPath = (event.rawJSON["_ppid"] as? Int)
-            .flatMap { $0 > 1 ? Self.executablePath(for: pid_t($0)) : nil }
-        let fromDesktop = bundle == Self.codexAppBundleId
-            || processPath.map(Self.isCodexExecutablePath) == true
+        let pid = (event.rawJSON["_ppid"] as? Int).flatMap(pid_t.init(exactly:))
+        let processPath = pid.flatMap { $0 > 1 ? Self.executablePath(for: $0) : nil }
+        let fromDesktop = bundle == Self.codexAppBundleId || (bundle == nil
+            && pid.flatMap { pid in processPath.map { Self.isCodexDesktopProcess(pid: pid, executablePath: $0) } } == true)
         // An explicit terminal owner must never be folded into a desktop chat,
         // even when it resumed the same provider UUID.
         let knownDesktop = bundle == nil && processPath == nil
@@ -55,13 +55,10 @@ extension AppState {
     func adoptLegacyCodexDesktopSession(threadID: String) {
         guard var legacy = sessions[threadID], legacy.source == "codex",
               !legacy.isRemote else { return }
-        let path = legacy.cliPid.flatMap { pid in
-            Self.isLiveProcess(ProcessIdentity(pid: pid, startTime: legacy.cliStartTime))
-                ? Self.executablePath(for: pid) : nil
-        }
         let canonicalID = Self.canonicalRestoredCodexSessionId(
             sessionId: threadID, source: legacy.source, providerSessionId: threadID,
-            termBundleId: legacy.termBundleId, executablePath: path
+            termBundleId: legacy.termBundleId, isDesktopProcess: legacy.termBundleId == nil
+                && Self.isLiveCodexDesktopProcess(pid: legacy.cliPid, startTime: legacy.cliStartTime)
         )
         guard canonicalID != threadID else { return }
         // Never resolve a live approval/question as a side effect of deduping.

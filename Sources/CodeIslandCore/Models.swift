@@ -255,23 +255,28 @@ public enum CLIProcessResolver {
     /// The binary cannot tell: it also runs Codex CLI from a terminal (ChatGPT's
     /// `codex-cli/bin/codex` launcher) and the app-server Claude Code's Codex
     /// plugin starts (#368), and its own outermost `.app` is ChatGPT.app every
-    /// time. So the nearest Codex process must run the `app-server` subcommand,
-    /// and its direct parent must be the app itself; `exec codex` in ChatGPT's
-    /// own terminal also leaves ChatGPT as the parent.
-    /// Bundled tool hosts share that outer bundle ID, so the parent must also
-    /// be an executable in the host app's own `Contents/MacOS` directory.
+    /// time. The nearest Codex process must run the `app-server` subcommand
+    /// and be a child of the main app or its Chromium Node utility. Other
+    /// bundled tools share the outer bundle ID but have different executables.
     public static func codexDesktopTermBundle(ancestry: [ProcessAncestor]) -> String? {
         guard let codexIndex = ancestry.firstIndex(where: {
             sourceMatchesExecutablePath($0.executablePath ?? "", source: "codex")
         }), isCodexAppServerInvocation(ancestry[codexIndex].arguments),
-              codexIndex + 1 < ancestry.count,
-              ancestry[codexIndex + 1].bundleIdentifier == "com.openai.codex",
-              let parentPath = ancestry[codexIndex + 1].executablePath,
-              let appPath = HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath),
-              URL(fileURLWithPath: parentPath).standardizedFileURL.deletingLastPathComponent().path
-                == URL(fileURLWithPath: appPath).standardizedFileURL.appendingPathComponent("Contents/MacOS").path else {
+              codexIndex + 1 < ancestry.count else {
             return nil
         }
+        let parent = ancestry[codexIndex + 1]
+        guard parent.bundleIdentifier == "com.openai.codex",
+              let parentPath = parent.executablePath,
+              let appPath = HostHarnessResolver.outermostAppBundlePath(forExecutable: parentPath) else { return nil }
+        let parentURL = URL(fileURLWithPath: parentPath).standardizedFileURL
+        let contents = URL(fileURLWithPath: appPath).standardizedFileURL.appendingPathComponent("Contents")
+        let isMainApp = parentURL.deletingLastPathComponent().path == contents.appendingPathComponent("MacOS").path
+        let isNodeUtility = parentURL.path.hasPrefix(contents.path + "/Frameworks/Codex Framework.framework/")
+            && parentURL.path.hasSuffix("/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)")
+            && parent.arguments.contains("--type=utility")
+            && parent.arguments.contains("--utility-sub-type=node.mojom.NodeService")
+        guard isMainApp || isNodeUtility else { return nil }
         return "com.openai.codex"
     }
 

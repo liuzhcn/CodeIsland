@@ -135,6 +135,27 @@ final class CLIProcessResolverTests: XCTestCase {
         XCTAssertEqual(CLIProcessResolver.codexBundledProcessRole(ancestry: chain), .session)
     }
 
+    func testDesktopAppServerLaunchedByChatGPTNodeUtility() {
+        let utilityPath = "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/158.0.8127.89/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)"
+        let nodeUtility = ProcessAncestor(
+            pid: 850,
+            executablePath: utilityPath,
+            arguments: [utilityPath, "--type=utility", "--utility-sub-type=node.mojom.NodeService"],
+            bundleIdentifier: "com.openai.codex"
+        )
+        let chain = [bundledCodex(desktopArguments), nodeUtility, chatGPT]
+        XCTAssertEqual(CLIProcessResolver.codexDesktopTermBundle(ancestry: chain), "com.openai.codex")
+        XCTAssertEqual(CLIProcessResolver.codexBundledProcessRole(ancestry: Array(chain.prefix(2))), .desktopHost)
+        XCTAssertNil(CLIProcessResolver.codexDesktopTermBundle(ancestry: [bundledCodex(["codex", "exec"]), nodeUtility]))
+
+        let otherUtility = ProcessAncestor(
+            pid: 851, executablePath: utilityPath,
+            arguments: [utilityPath, "--type=utility", "--utility-sub-type=network.mojom.NetworkService"],
+            bundleIdentifier: "com.openai.codex"
+        )
+        XCTAssertNil(CLIProcessResolver.codexDesktopTermBundle(ancestry: [bundledCodex(desktopArguments), otherUtility]))
+    }
+
     /// The same binary also runs Codex CLI from a terminal (ChatGPT's
     /// `codex-cli/bin/codex` launcher), from ChatGPT's own terminal, where
     /// `exec codex` leaves ChatGPT as the direct parent, and as the app-server
